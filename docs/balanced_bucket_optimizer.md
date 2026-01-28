@@ -176,49 +176,75 @@ python tools/balanced_bucket_optimizer.py -i ./dataset -o ./output_optimized -r 
 | `--quality` | 95 | JPEG quality (1-100) |
 | `--workers` | auto | Parallel workers (auto-detect CPU cores if not set) |
 | `--num_repeats` | 1 | Repeats for bucket size calculation |
-| `--no_crop` | False | **[RECOMMENDED]** Only resize, no cropping. Preserves full aspect ratio |
 
-## Aspect Ratio Preservation (--no_crop)
+### Resize Mode Options
+| Option | Description |
+|--------|-------------|
+| (default) | Crop from center to fit exact bucket dimensions |
+| `--resize` | Stretch/distort to exact bucket dimensions (guarantees bucket balance) |
+| `--no_crop` | Simple resize preserving AR (creates different output dimensions) |
 
-By default, the tool crops images to fit exact bucket dimensions. With `--no_crop`, images are simply resized while preserving their full aspect ratio.
+## Resize Modes Explained
 
-### Default (with crop)
+The tool offers 3 different resize modes. Choose based on your priority:
+
+### Comparison Table
+
+| Mode | Content | Aspect Ratio | Bucket Size | Use Case |
+|------|---------|--------------|-------------|----------|
+| **Default (crop)** | Partial (cropped) | Preserved | Exact match | When AR match is important |
+| **--resize** | Full (stretched) | Distorted | Exact match | When bucket balance is critical |
+| **--no_crop** | Full (preserved) | Preserved | Different | When content preservation is critical |
+
+### 1. Default Mode (Crop from Center)
 ```
 Image: 1920x1080 (AR=1.78) → Bucket: 1024x1024 (AR=1.0)
-Result: Crop sides to get 1080x1080, then resize to 1024x1024
-        → Image content is cropped from center
+Result: Crop center 1080x1080, then resize to 1024x1024
+        ✓ Exact bucket dimensions
+        ✓ Aspect ratio preserved (no distortion)
+        ✗ Content lost (sides cropped)
 ```
 
-### With --no_crop (simple resize)
+### 2. --resize Mode (Stretch to Fit)
 ```
-Image: 1920x1080 (AR=1.78) → Bucket max dimension: 1024
-Result: Resize so longest side = 1024
-        → 1920 × (1024/1920) = 1024
-        → 1080 × (1024/1920) = 576
-        → Round to 64: 1024x576
-        → NO content is lost, NO padding added
-        → Caption matches image exactly
+Image: 1920x1080 (AR=1.78) → Bucket: 1024x1024 (AR=1.0)
+Result: Stretch directly to 1024x1024
+        ✓ Exact bucket dimensions
+        ✓ Full content preserved
+        ✗ Aspect ratio distorted (image stretched)
 ```
 
-### Why not letterbox?
-Letterbox (adding padding) would:
-- Add black/white bars not described in caption
-- Model might learn to associate captions with borders
-- Affects training quality
+### 3. --no_crop Mode (Preserve AR)
+```
+Image: 1920x1080 (AR=1.78) → Bucket max: 1024
+Result: Resize to 1024x576 (keeping AR=1.78)
+        ✓ Aspect ratio preserved
+        ✓ Full content preserved
+        ✗ Different output dimensions (creates new buckets)
+```
 
-Simple resize preserves:
-- Full image content
-- Caption-image alignment
-- Clean training data
+## Usage Examples
 
-### Usage
 ```bash
-# Simple resize without cropping
+# Default: crop from center (recommended for most cases)
+python tools/balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --auto
+
+# Stretch to exact bucket (when bucket balance is critical)
+python tools/balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --auto --resize
+
+# Preserve AR (for analysis or when content is critical)
 python tools/balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --auto --no_crop
 ```
 
-### Note
-With `--no_crop`, output images will have different dimensions based on their original aspect ratio. When sd-scripts loads these images, it will create appropriate buckets automatically.
+## Recommendation
+
+| Scenario | Recommended Mode |
+|----------|------------------|
+| General training | Default (crop) |
+| Strict bucket balance needed | `--resize` |
+| Analysis/preview only | `--no_crop` |
+| Portrait/landscape mix with similar AR | Default (crop) |
+| Highly diverse AR dataset | Consider `--resize` |
 
 ## Understanding Metrics
 
