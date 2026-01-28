@@ -1316,8 +1316,8 @@ Output:
     parser.add_argument(
         "--output_dir", "-o",
         type=str,
-        required=True,
-        help="Folder output chua anh da xu ly + file caption (.txt). Chi chua anh, khong chua report"
+        default=None,
+        help="Folder output chua anh da xu ly. OPTIONAL neu chi dung --simulate, --analyze_only, hoac --dry_run"
     )
 
     parser.add_argument(
@@ -1463,7 +1463,15 @@ Output:
         print(f"Auto-detected CPU cores: {args.workers}")
 
     input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir)
+
+    # Check if output_dir is required
+    needs_output = not (args.simulate or args.analyze_only or args.dry_run)
+    if needs_output and args.output_dir is None:
+        print("Error: --output_dir is required when processing images")
+        print("Use --simulate, --analyze_only, or --dry_run if you only want to analyze")
+        sys.exit(1)
+
+    output_dir = Path(args.output_dir) if args.output_dir else None
 
     if not input_dir.exists():
         print(f"Error: Input directory does not exist: {input_dir}")
