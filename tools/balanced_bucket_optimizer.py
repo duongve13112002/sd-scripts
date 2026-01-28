@@ -1430,6 +1430,14 @@ Output:
     )
 
     parser.add_argument(
+        "--report_dir",
+        type=str,
+        default=None,
+        help="Folder luu file report (bucket_report.txt, bucket_config.json). "
+             "Mac dinh: thu muc hien tai (current working directory)"
+    )
+
+    parser.add_argument(
         "--analyze_only",
         action="store_true",
         help="Chi phan tich dataset, KHONG resize anh. Dung de xem truoc bucket distribution"
@@ -1665,8 +1673,10 @@ Output:
     print("PHASE 4: REPORT GENERATION")
     print("=" * 60)
 
-    # Report files saved to current working directory
-    report = generate_report(buckets, analysis, Path.cwd(), processing_stats)
+    # Report files saved to report_dir (default: current working directory)
+    report_dir = Path(args.report_dir) if args.report_dir else Path.cwd()
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report = generate_report(buckets, analysis, report_dir, processing_stats)
     print(report)
 
     print("\nDone!")
