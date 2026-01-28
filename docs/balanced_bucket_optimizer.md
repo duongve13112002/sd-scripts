@@ -96,6 +96,22 @@ python tools/balanced_bucket_optimizer.py \
     -o ./output \
     -r 1024 \
     --auto
+
+# Custom targets for small dataset (more lenient)
+python tools/balanced_bucket_optimizer.py \
+    -i ./dataset \
+    -r 1024 \
+    --auto --dry_run \
+    --target_max_imbalance 6.0 \
+    --target_min_bucket_size 20
+
+# Custom targets for large dataset (stricter)
+python tools/balanced_bucket_optimizer.py \
+    -i ./dataset \
+    -r 1024 \
+    --auto --dry_run \
+    --target_max_imbalance 3.0 \
+    --target_min_bucket_size 100
 ```
 
 Output:
@@ -185,15 +201,8 @@ python tools/balanced_bucket_optimizer.py -i ./dataset -o ./output_optimized -r 
 ### Auto Mode Options
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--target_max_imbalance` | 4.0 | Target max imbalance ratio when searching for optimal config |
-| `--target_min_bucket_size` | 50 | Target min images per bucket when searching for optimal config |
-
-**Why these defaults?**
-
-| Parameter | Default | Reasoning |
-|-----------|---------|-----------|
-| `target_max_imbalance` | 4.0 | <2x: ideal but hard to achieve, 2-4x: good, 4-8x: acceptable, >8x: unstable training |
-| `target_min_bucket_size` | 50 | <20: too few (overfit risk), 50-100: sufficient, >200: ideal |
+| `--target_max_imbalance` | 4.0 | Target maximum imbalance ratio for optimization |
+| `--target_min_bucket_size` | 50 | Target minimum images per bucket |
 
 ### Manual Mode Options
 | Option | Default | Description |
@@ -279,6 +288,59 @@ python tools/balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --auto -
 | Analysis/preview only | `--no_crop` |
 | Portrait/landscape mix with similar AR | Default (crop) |
 | Highly diverse AR dataset | Consider `--resize` |
+
+## Auto Mode Target Parameters
+
+### `--target_max_imbalance` (default: 4.0)
+
+Controls how much size difference is acceptable between the largest and smallest bucket.
+
+**Why 4.0 is the default:**
+- During training, larger buckets get sampled more frequently
+- If imbalance is too high (>10x), model becomes biased toward common aspect ratios
+- 4.0 is a balance point: allows flexibility while maintaining training stability
+
+**Recommended values:**
+
+| Value | Use Case |
+|-------|----------|
+| 2.0-3.0 | Strict balance, high-quality training |
+| 4.0 | Default, good for most datasets |
+| 5.0-6.0 | Small datasets, more lenient |
+| >6.0 | Not recommended |
+
+### `--target_min_bucket_size` (default: 50)
+
+Minimum number of images per bucket for the optimizer to consider acceptable.
+
+**Why 50 is the default:**
+- Buckets need enough samples for model to learn features of that aspect ratio
+- With <50 images, model may overfit or fail to generalize
+- 50 images ≈ 6-50 batches per epoch (typical batch size 1-8)
+
+**Recommended values:**
+
+| Dataset Size | Recommended Value |
+|--------------|-------------------|
+| Small (<1k images) | 20-30 |
+| Medium (1k-10k) | 50 (default) |
+| Large (10k-100k) | 100 |
+| Very Large (100k+) | 150-200 |
+
+**Example scenarios:**
+
+```bash
+# Small dataset with diverse AR (500 images)
+# Allow smaller buckets, more imbalance tolerance
+--target_max_imbalance 6.0 --target_min_bucket_size 20
+
+# Large production dataset (50k images)
+# Strict balance for best quality
+--target_max_imbalance 3.0 --target_min_bucket_size 100
+
+# Medium dataset, default is usually good
+# Just use --auto without extra params
+```
 
 ## Understanding Metrics
 

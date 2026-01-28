@@ -1527,17 +1527,21 @@ Output:
         "--target_max_imbalance",
         type=float,
         default=4.0,
-        help="[Auto] Ti le imbalance toi da muc tieu khi tim config toi uu. Default: 4.0. "
+        help="[Auto] Imbalance ratio toi da muc tieu (default: 4.0). "
              "Imbalance = max_bucket_size / min_bucket_size. "
-             "< 2x: ly tuong, 2-4x: tot, 4-8x: chap nhan, > 8x: ko on dinh"
+             "Giam xuong (vd: 3.0) de yeu cau bucket can bang hon, "
+             "tang len (vd: 6.0) de cho phep chenh lech nhieu hon. "
+             "Khuyen nghi: <3=tot, 3-5=chap nhan, >5=canh bao"
     )
 
     parser.add_argument(
         "--target_min_bucket_size",
         type=int,
         default=50,
-        help="[Auto] So anh toi thieu moi bucket khi tim config toi uu. Default: 50. "
-             "< 20: qua it (overfit), 50-100: du tot, > 200: ly tuong"
+        help="[Auto] So anh toi thieu moi bucket muc tieu (default: 50). "
+             "Bucket qua nho (<50) co the gay overfit hoac model khong hoc duoc. "
+             "Voi dataset nho, co the giam xuong 20-30. "
+             "Voi dataset lon (100k+), nen tang len 100-200"
     )
 
     # SD-Scripts simulation parameters
@@ -1750,7 +1754,9 @@ Output:
 
         print("\nSearching for optimal bucket configuration...")
         print("(Testing different bucket_reso_steps, min/max_bucket_reso combinations)")
-        print(f"Targets: max_imbalance={args.target_max_imbalance}x, min_bucket_size={args.target_min_bucket_size}")
+        print(f"\nTarget constraints:")
+        print(f"  - target_max_imbalance: {args.target_max_imbalance}")
+        print(f"  - target_min_bucket_size: {args.target_min_bucket_size}")
 
         optimization_result = auto_optimize_from_simulation(
             images,
