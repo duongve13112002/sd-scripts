@@ -153,6 +153,7 @@ python tools/balanced_bucket_optimizer.py -i ./dataset -o ./output_optimized -r 
 |--------|----------|-------------|
 | `-i, --input_dir` | Always | Input folder containing images |
 | `-o, --output_dir` | When processing | Output folder for processed images. **Optional** when using `--simulate`, `--analyze_only`, or `--dry_run` |
+| `--report_dir` | No | Folder to save analysis files (bucket_report.txt, bucket_config.json). Default: current directory |
 
 ### Resolution Settings
 | Option | Default | Description |
