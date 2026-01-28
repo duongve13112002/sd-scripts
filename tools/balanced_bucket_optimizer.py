@@ -1046,7 +1046,7 @@ def process_single_image(
                 img = img.crop(crop_box)
 
             # Resize
-            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
 
             # Save based on extension
             save_path = output_path
