@@ -893,7 +893,8 @@ def rebalance_buckets(
 def calculate_resize_dimensions(
     image: ImageInfo,
     bucket: Bucket,
-    preserve_ratio: bool = True
+    preserve_ratio: bool = True,
+    no_crop: bool = False
 ) -> Tuple[int, int, Tuple[int, int, int, int]]:
     """
     Calculate resize dimensions and crop box
@@ -902,6 +903,8 @@ def calculate_resize_dimensions(
         image: ImageInfo object
         bucket: Target Bucket
         preserve_ratio: Whether to preserve aspect ratio (with letterbox/crop)
+        no_crop: If True, only resize without any cropping (keep full image content)
+                 Output dimensions will match bucket area but preserve original aspect ratio
 
     Returns:
         (new_width, new_height, crop_box) where crop_box is (left, top, right, bottom)
@@ -910,7 +913,29 @@ def calculate_resize_dimensions(
         # Direct resize (may distort)
         return bucket.width, bucket.height, (0, 0, image.width, image.height)
 
-    # Calculate scaling to fit bucket while preserving ratio
+    # NO CROP mode: resize to bucket area while preserving exact aspect ratio
+    # This means the output may not match exact bucket dimensions
+    if no_crop:
+        # Calculate target pixel count from bucket
+        target_pixels = bucket.total_pixels
+        img_ar = image.aspect_ratio
+
+        # Calculate new dimensions preserving aspect ratio with ~same pixel count
+        # new_width * new_height = target_pixels
+        # new_width / new_height = img_ar
+        # => new_height = sqrt(target_pixels / img_ar)
+        # => new_width = new_height * img_ar
+        new_height = int(math.sqrt(target_pixels / img_ar))
+        new_width = int(new_height * img_ar)
+
+        # Round to nearest multiple of 64 for compatibility
+        new_width = max(64, (new_width // 64) * 64)
+        new_height = max(64, (new_height // 64) * 64)
+
+        # No crop needed - use full original image
+        return new_width, new_height, (0, 0, image.width, image.height)
+
+    # Standard mode: Calculate scaling to fit bucket while preserving ratio
     img_ar = image.aspect_ratio
     bucket_ar = bucket.aspect_ratio
 
@@ -951,7 +976,8 @@ def process_single_image(
     output_dir: Path,
     quality: int = 95,
     flat_output: bool = True,
-    keep_extension: bool = False
+    keep_extension: bool = False,
+    no_crop: bool = False
 ) -> Tuple[bool, str]:
     """
     Process a single image: resize and copy with captions
@@ -965,6 +991,7 @@ def process_single_image(
         flat_output: If True, save all images directly to output_dir (keep original filename)
                     If False, create bucket subdirectories
         keep_extension: If True, keep original extension; If False, convert to jpg
+        no_crop: If True, only resize without cropping (preserve full aspect ratio)
 
     Returns:
         (success, message)
@@ -990,7 +1017,7 @@ def process_single_image(
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Calculate resize dimensions
-        new_width, new_height, crop_box = calculate_resize_dimensions(image, bucket)
+        new_width, new_height, crop_box = calculate_resize_dimensions(image, bucket, no_crop=no_crop)
 
         # Open and process image
         with Image.open(image.path) as img:
@@ -1048,7 +1075,8 @@ def process_images(
     max_workers: int = 8,
     quality: int = 95,
     flat_output: bool = True,
-    keep_extension: bool = False
+    keep_extension: bool = False,
+    no_crop: bool = False
 ) -> Dict:
     """
     Process all images: resize and copy
@@ -1061,6 +1089,7 @@ def process_images(
         quality: JPEG quality
         flat_output: If True, save all images directly to output_dir
         keep_extension: If True, keep original file extension
+        no_crop: If True, only resize without cropping (preserve full aspect ratio)
 
     Returns:
         Processing statistics
@@ -1087,7 +1116,7 @@ def process_images(
         futures = {
             executor.submit(
                 process_single_image,
-                img, bucket, input_dir, output_dir, quality, flat_output, keep_extension
+                img, bucket, input_dir, output_dir, quality, flat_output, keep_extension, no_crop
             ): (img, bucket)
             for img, bucket in tasks
         }
@@ -1366,8 +1395,17 @@ Output:
     parser.add_argument(
         "--workers",
         type=int,
-        default=8,
-        help="So luong worker xu ly song song (default: 8). Tang len neu CPU nhieu core"
+        default=None,
+        help="So luong worker xu ly song song. Mac dinh: auto-detect (so CPU cores). "
+             "Set gia tri cu the neu muon gioi han, vd: --workers 4"
+    )
+
+    parser.add_argument(
+        "--no_crop",
+        action="store_true",
+        help="[KHUYEN NGHI] Chi resize anh, KHONG crop. Giu nguyen toan bo aspect ratio goc. "
+             "Kich thuoc output se co cung so pixel voi bucket nhung giu nguyen AR. "
+             "Vi du: Anh 1920x1080 (AR=1.78) se resize thanh ~1368x768 thay vi crop thanh 1024x1024"
     )
 
     parser.add_argument(
@@ -1396,6 +1434,12 @@ Output:
     )
 
     args = parser.parse_args()
+
+    # Auto-detect workers if not specified
+    if args.workers is None:
+        import multiprocessing
+        args.workers = multiprocessing.cpu_count()
+        print(f"Auto-detected CPU cores: {args.workers}")
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
@@ -1582,7 +1626,8 @@ Output:
         max_workers=args.workers,
         quality=args.quality,
         flat_output=not args.bucket_folders,
-        keep_extension=args.keep_extension
+        keep_extension=args.keep_extension,
+        no_crop=args.no_crop
     )
 
     # Phase 4: Generate report
