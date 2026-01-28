@@ -757,7 +757,7 @@ def process_images(
 def generate_report(
     buckets: List[Bucket],
     analysis: Dict,
-    output_dir: Path,
+    report_dir: Path,
     processing_stats: Dict
 ) -> str:
     """
@@ -766,7 +766,7 @@ def generate_report(
     Args:
         buckets: List of Bucket objects
         analysis: Dataset analysis results
-        output_dir: Output directory
+        report_dir: Directory to save report files (usually current working directory)
         processing_stats: Processing statistics
 
     Returns:
@@ -833,8 +833,8 @@ def generate_report(
 
     report = "\n".join(report_lines)
 
-    # Save report
-    report_path = output_dir / "bucket_report.txt"
+    # Save report to report_dir (current working directory)
+    report_path = report_dir / "bucket_report.txt"
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write(report)
 
@@ -854,7 +854,7 @@ def generate_report(
         "num_buckets": len(buckets)
     }
 
-    config_path = output_dir / "bucket_config.json"
+    config_path = report_dir / "bucket_config.json"
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2)
 
@@ -874,20 +874,25 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage (flat output, keeps original filenames)
-  python balanced_bucket_optimizer.py --input_dir ./data --output_dir ./output_process --base_resolution 1024
+  # Co ban: resize anh tu ./data vao ./output_process, giu ten file goc
+  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024
 
-  # Keep original file extension (png, webp, etc.)
-  python balanced_bucket_optimizer.py --input_dir ./data --output_dir ./output_process -r 1024 --keep_extension
+  # Giu extension goc (png, webp, ...) thay vi convert sang jpg
+  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --keep_extension
 
-  # Create separate folders for each bucket
-  python balanced_bucket_optimizer.py --input_dir ./data --output_dir ./output_process -r 1024 --bucket_folders
+  # Tao subfolder theo bucket (output/1024x1024/, output/1152x896/, ...)
+  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --bucket_folders
 
-  # With custom bucket count
-  python balanced_bucket_optimizer.py --input_dir ./data --output_dir ./output_process -r 1024 --num_buckets 8
+  # Chi dinh so bucket
+  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --num_buckets 8
 
-  # Analysis only (no resize)
-  python balanced_bucket_optimizer.py --input_dir ./data --output_dir ./output_process -r 1024 --analyze_only
+  # Phan tich truoc khi xu ly (xem bucket distribution)
+  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --analyze_only
+
+Output:
+  - output_dir/: Chi chua anh da resize + file caption (.txt)
+  - ./bucket_report.txt: Report chi tiet (luu tai thu muc hien tai)
+  - ./bucket_config.json: Config bucket de dung voi training
         """
     )
 
@@ -895,80 +900,84 @@ Examples:
         "--input_dir", "-i",
         type=str,
         required=True,
-        help="Input directory containing images"
+        help="Folder chua anh goc. Script se scan tat ca anh trong folder nay (bao gom subfolder)"
     )
 
     parser.add_argument(
         "--output_dir", "-o",
         type=str,
         required=True,
-        help="Output directory for processed images"
+        help="Folder output chua anh da xu ly + file caption (.txt). Chi chua anh, khong chua report"
     )
 
     parser.add_argument(
         "--base_resolution", "-r",
         type=int,
         default=1024,
-        help="Base resolution for buckets (default: 1024)"
+        help="Resolution co so (default: 1024). Bucket se duoc tao xung quanh resolution nay. "
+             "Vi du: 1024 -> buckets co the la 1024x1024, 1152x896, 896x1152, ..."
     )
 
     parser.add_argument(
         "--num_buckets", "-n",
         type=int,
         default=10,
-        help="Target number of buckets (default: 10)"
+        help="So luong bucket muc tieu (default: 10). Script se tu dong chia anh thanh N bucket "
+             "dua tren aspect ratio. Buckets tuong tu se duoc merge lai"
     )
 
     parser.add_argument(
         "--min_bucket_size",
         type=int,
         default=50,
-        help="Minimum images per bucket (default: 50)"
+        help="So anh toi thieu moi bucket (default: 50). Bucket nho hon se duoc merge voi bucket gan nhat"
     )
 
     parser.add_argument(
         "--max_imbalance",
         type=float,
         default=5.0,
-        help="Maximum imbalance ratio between buckets (default: 5.0)"
+        help="Ti le chenh lech toi da giua bucket lon nhat va nho nhat (default: 5.0). "
+             "Vi du: 5.0 nghia la bucket lon nhat khong duoc lon hon 5 lan bucket nho nhat"
     )
 
     parser.add_argument(
         "--quality",
         type=int,
         default=95,
-        help="JPEG output quality 1-100 (default: 95)"
+        help="Chat luong JPEG output 1-100 (default: 95). Chi ap dung khi khong dung --keep_extension"
     )
 
     parser.add_argument(
         "--workers",
         type=int,
         default=8,
-        help="Number of parallel workers (default: 8)"
+        help="So luong worker xu ly song song (default: 8). Tang len neu CPU nhieu core"
     )
 
     parser.add_argument(
         "--analyze_only",
         action="store_true",
-        help="Only analyze dataset, don't process images"
+        help="Chi phan tich dataset, KHONG resize anh. Dung de xem truoc bucket distribution"
     )
 
     parser.add_argument(
         "--dry_run",
         action="store_true",
-        help="Show what would be done without actually processing"
+        help="Xem truoc ket qua ma khong thuc su xu ly. Hien thi bucket assignments"
     )
 
     parser.add_argument(
         "--bucket_folders",
         action="store_true",
-        help="Create separate folders for each bucket (default: flat output with original filenames)"
+        help="Tao subfolder cho moi bucket (vd: output/1024x1024/, output/1152x896/). "
+             "Mac dinh: tat ca anh nam truc tiep trong output_dir"
     )
 
     parser.add_argument(
         "--keep_extension",
         action="store_true",
-        help="Keep original file extension instead of converting to JPEG"
+        help="Giu nguyen extension goc (png, webp, ...) thay vi convert sang JPEG"
     )
 
     args = parser.parse_args()
@@ -1040,7 +1049,8 @@ Examples:
     print("PHASE 4: REPORT GENERATION")
     print("=" * 60)
 
-    report = generate_report(buckets, analysis, output_dir, processing_stats)
+    # Report files saved to current working directory
+    report = generate_report(buckets, analysis, Path.cwd(), processing_stats)
     print(report)
 
     print("\nDone!")
