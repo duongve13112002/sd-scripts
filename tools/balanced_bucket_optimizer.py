@@ -363,70 +363,357 @@ def calculate_assignment_cost(
     return total_cost
 
 
-def auto_calculate_params(
-    images: List[ImageInfo],
-    analysis: Dict
-) -> Tuple[int, int, float]:
-    """
-    Automatically calculate optimal num_buckets, min_bucket_size, max_imbalance
-    based on dataset characteristics.
+# ============================================================================
+# SD-Scripts Bucket Simulation (for data-driven auto mode)
+# ============================================================================
 
-    Strategy:
-    - num_buckets: Based on aspect ratio diversity (std) and total images
-    - min_bucket_size: Based on total images (ensure enough samples per bucket)
-    - max_imbalance: Fixed at reasonable value
+def make_bucket_resolutions_sdscripts(
+    max_reso: Tuple[int, int],
+    min_size: int = 256,
+    max_size: int = 1024,
+    divisible: int = 64
+) -> List[Tuple[int, int]]:
+    """
+    Generate bucket resolutions exactly like sd-scripts does.
+    This is a copy of library/model_util.py:make_bucket_resolutions()
+
+    Args:
+        max_reso: (width, height) base resolution
+        min_size: Minimum bucket dimension
+        max_size: Maximum bucket dimension
+        divisible: Step size (bucket_reso_steps)
+
+    Returns:
+        List of (width, height) tuples for all possible buckets
+    """
+    max_width, max_height = max_reso
+    max_area = max_width * max_height
+
+    resos = set()
+
+    # Add square bucket
+    width = int(math.sqrt(max_area) // divisible) * divisible
+    resos.add((width, width))
+
+    # Generate all other buckets
+    width = min_size
+    while width <= max_size:
+        height = min(max_size, int((max_area // width) // divisible) * divisible)
+        if height >= min_size:
+            resos.add((width, height))
+            resos.add((height, width))
+        width += divisible
+
+    resos = list(resos)
+    resos.sort()
+    return resos
+
+
+def simulate_bucket_assignment(
+    images: List[ImageInfo],
+    base_resolution: int,
+    min_bucket_reso: int,
+    max_bucket_reso: int,
+    bucket_reso_steps: int,
+    no_upscale: bool = False
+) -> Dict[Tuple[int, int], List[ImageInfo]]:
+    """
+    Simulate bucket assignment exactly like sd-scripts BucketManager does.
 
     Args:
         images: List of ImageInfo objects
-        analysis: Dataset analysis results
+        base_resolution: Base resolution (e.g., 1024)
+        min_bucket_reso: Minimum bucket resolution
+        max_bucket_reso: Maximum bucket resolution
+        bucket_reso_steps: Resolution step size
+        no_upscale: If True, don't upscale images
 
     Returns:
-        (num_buckets, min_bucket_size, max_imbalance)
+        Dict mapping bucket resolution to list of images
+    """
+    max_reso = (base_resolution, base_resolution)
+    max_area = base_resolution * base_resolution
+
+    # Generate all possible bucket resolutions
+    predefined_resos = make_bucket_resolutions_sdscripts(
+        max_reso, min_bucket_reso, max_bucket_reso, bucket_reso_steps
+    )
+    predefined_resos_set = set(predefined_resos)
+
+    if HAS_NUMPY:
+        predefined_aspect_ratios = np.array([w / h for w, h in predefined_resos])
+    else:
+        predefined_aspect_ratios = [w / h for w, h in predefined_resos]
+
+    # Assign each image to a bucket
+    bucket_assignments = defaultdict(list)
+
+    for img in images:
+        aspect_ratio = img.aspect_ratio
+
+        if not no_upscale:
+            # Standard mode: find best matching bucket by aspect ratio
+            reso = (img.width, img.height)
+            if reso not in predefined_resos_set:
+                # Find bucket with closest aspect ratio
+                if HAS_NUMPY:
+                    ar_errors = predefined_aspect_ratios - aspect_ratio
+                    predefined_bucket_id = int(np.abs(ar_errors).argmin())
+                else:
+                    ar_errors = [abs(ar - aspect_ratio) for ar in predefined_aspect_ratios]
+                    predefined_bucket_id = ar_errors.index(min(ar_errors))
+                reso = predefined_resos[predefined_bucket_id]
+        else:
+            # No upscale mode: more complex logic
+            if img.total_pixels > max_area:
+                # Image too large, need to resize
+                resized_width = math.sqrt(max_area * aspect_ratio)
+                resized_height = max_area / resized_width
+
+                def round_to_steps(x):
+                    x = int(x + 0.5)
+                    return x - x % bucket_reso_steps
+
+                b_width_rounded = round_to_steps(resized_width)
+                b_height_in_wr = round_to_steps(b_width_rounded / aspect_ratio)
+                ar_width_rounded = b_width_rounded / b_height_in_wr if b_height_in_wr > 0 else 0
+
+                b_height_rounded = round_to_steps(resized_height)
+                b_width_in_hr = round_to_steps(b_height_rounded * aspect_ratio)
+                ar_height_rounded = b_width_in_hr / b_height_rounded if b_height_rounded > 0 else 0
+
+                if abs(ar_width_rounded - aspect_ratio) < abs(ar_height_rounded - aspect_ratio):
+                    reso = (b_width_rounded, int(b_width_rounded / aspect_ratio + 0.5))
+                else:
+                    reso = (int(b_height_rounded * aspect_ratio + 0.5), b_height_rounded)
+            else:
+                # Round to steps
+                bucket_width = img.width - img.width % bucket_reso_steps
+                bucket_height = img.height - img.height % bucket_reso_steps
+                reso = (bucket_width, bucket_height)
+
+        bucket_assignments[reso].append(img)
+
+    return dict(bucket_assignments)
+
+
+def analyze_bucket_distribution(
+    bucket_assignments: Dict[Tuple[int, int], List[ImageInfo]],
+    num_repeats: int = 1
+) -> Dict:
+    """
+    Analyze bucket distribution to find imbalance and issues.
+
+    Args:
+        bucket_assignments: Dict from simulate_bucket_assignment()
+        num_repeats: Number of repeats per image (for training)
+
+    Returns:
+        Analysis dict with statistics and recommendations
+    """
+    if not bucket_assignments:
+        return {"error": "No buckets found"}
+
+    # Calculate sizes (with repeats)
+    bucket_sizes = {
+        reso: len(images) * num_repeats
+        for reso, images in bucket_assignments.items()
+    }
+
+    sizes = list(bucket_sizes.values())
+    total_images = sum(len(imgs) for imgs in bucket_assignments.values())
+    total_with_repeats = sum(sizes)
+
+    # Basic statistics
+    min_size = min(sizes)
+    max_size = max(sizes)
+    avg_size = total_with_repeats / len(sizes)
+
+    if HAS_NUMPY:
+        std_size = float(np.std(sizes))
+        median_size = float(np.median(sizes))
+    else:
+        std_size = _std(sizes)
+        median_size = _median(sizes)
+
+    # Imbalance ratio
+    imbalance_ratio = max_size / min_size if min_size > 0 else float('inf')
+
+    # Coefficient of variation (CV) - normalized measure of dispersion
+    cv = std_size / avg_size if avg_size > 0 else 0
+
+    # Find problematic buckets
+    small_buckets = [(reso, count) for reso, count in bucket_sizes.items() if count < avg_size * 0.25]
+    large_buckets = [(reso, count) for reso, count in bucket_sizes.items() if count > avg_size * 2.0]
+
+    # Gini coefficient (measure of inequality)
+    sorted_sizes = sorted(sizes)
+    n = len(sorted_sizes)
+    cumsum = 0
+    for i, size in enumerate(sorted_sizes):
+        cumsum += (2 * (i + 1) - n - 1) * size
+    gini = cumsum / (n * sum(sorted_sizes)) if sum(sorted_sizes) > 0 else 0
+
+    # Recommendations
+    recommendations = []
+
+    if imbalance_ratio > 10:
+        recommendations.append(f"CRITICAL: Imbalance ratio {imbalance_ratio:.1f}x is very high. Training will be unstable.")
+    elif imbalance_ratio > 5:
+        recommendations.append(f"WARNING: Imbalance ratio {imbalance_ratio:.1f}x is high. Consider balancing buckets.")
+
+    if len(small_buckets) > 0:
+        recommendations.append(f"Found {len(small_buckets)} small buckets (<25% of avg). Consider merging them.")
+
+    if len(large_buckets) > 0:
+        recommendations.append(f"Found {len(large_buckets)} large buckets (>2x avg). Images are concentrated in few buckets.")
+
+    if gini > 0.4:
+        recommendations.append(f"High Gini coefficient ({gini:.2f}) indicates uneven distribution.")
+
+    if len(bucket_assignments) > total_images / 50:
+        recommendations.append(f"Too many buckets ({len(bucket_assignments)}) for {total_images} images. Consider increasing bucket_reso_steps.")
+
+    return {
+        "num_buckets": len(bucket_assignments),
+        "total_images": total_images,
+        "total_with_repeats": total_with_repeats,
+        "bucket_sizes": bucket_sizes,
+        "statistics": {
+            "min": min_size,
+            "max": max_size,
+            "avg": avg_size,
+            "std": std_size,
+            "median": median_size,
+            "imbalance_ratio": imbalance_ratio,
+            "cv": cv,
+            "gini": gini,
+        },
+        "problematic": {
+            "small_buckets": small_buckets,
+            "large_buckets": large_buckets,
+        },
+        "recommendations": recommendations,
+    }
+
+
+def auto_optimize_from_simulation(
+    images: List[ImageInfo],
+    base_resolution: int,
+    target_max_imbalance: float = 4.0,
+    target_min_bucket_size: int = 50
+) -> Dict:
+    """
+    Automatically find optimal bucket parameters by simulating different configurations.
+
+    This is DATA-DRIVEN: it actually simulates bucket creation and picks the best parameters.
+
+    Args:
+        images: List of ImageInfo objects
+        base_resolution: Base resolution
+        target_max_imbalance: Target maximum imbalance ratio
+        target_min_bucket_size: Target minimum bucket size
+
+    Returns:
+        Dict with optimal parameters and analysis
     """
     total_images = len(images)
-    ar_std = analysis['aspect_ratios']['std']
-    ar_range = analysis['aspect_ratios']['max'] - analysis['aspect_ratios']['min']
 
-    # Calculate num_buckets based on aspect ratio diversity
-    # More diverse AR -> more buckets needed
-    # But cap based on total images
-    if ar_std < 0.2:
-        # Very uniform aspect ratios -> few buckets
-        base_buckets = 3
-    elif ar_std < 0.4:
-        # Moderate diversity
-        base_buckets = 5
-    elif ar_std < 0.6:
-        # High diversity
-        base_buckets = 7
-    else:
-        # Very high diversity
-        base_buckets = 10
+    # Try different bucket_reso_steps values
+    step_candidates = [32, 64, 128, 256]
 
-    # Adjust based on total images (need enough images per bucket)
-    # Target: at least 100-500 images per bucket for good training
-    max_buckets_by_count = max(3, total_images // 500)
-    num_buckets = min(base_buckets, max_buckets_by_count)
+    # Try different min/max bucket resolutions
+    min_reso_candidates = [256, 512, 768]
+    max_reso_candidates = [1024, 1536, 2048, base_resolution * 2]
 
-    # Ensure at least 3 buckets if we have enough images
-    if total_images >= 1000:
-        num_buckets = max(3, num_buckets)
+    best_config = None
+    best_score = float('inf')
+    all_results = []
 
-    # Calculate min_bucket_size
-    # Target: each bucket should have enough images for training stability
-    if total_images < 1000:
-        min_bucket_size = max(20, total_images // (num_buckets * 2))
-    elif total_images < 10000:
-        min_bucket_size = 50
-    elif total_images < 50000:
-        min_bucket_size = 100
-    else:
-        min_bucket_size = 200
+    for steps in step_candidates:
+        for min_reso in min_reso_candidates:
+            for max_reso in max_reso_candidates:
+                if min_reso >= max_reso:
+                    continue
+                if max_reso < base_resolution:
+                    continue
 
-    # max_imbalance: keep reasonable
-    max_imbalance = 4.0
+                # Simulate bucket assignment
+                try:
+                    assignments = simulate_bucket_assignment(
+                        images, base_resolution, min_reso, max_reso, steps
+                    )
+                except Exception as e:
+                    continue
 
-    return num_buckets, min_bucket_size, max_imbalance
+                if not assignments:
+                    continue
+
+                # Analyze distribution
+                analysis = analyze_bucket_distribution(assignments)
+                stats = analysis['statistics']
+
+                # Score this configuration
+                # Lower score = better
+                score = 0
+
+                # Penalize high imbalance
+                if stats['imbalance_ratio'] > target_max_imbalance:
+                    score += (stats['imbalance_ratio'] - target_max_imbalance) * 10
+
+                # Penalize too few images in smallest bucket
+                if stats['min'] < target_min_bucket_size:
+                    score += (target_min_bucket_size - stats['min']) * 0.5
+
+                # Penalize high CV (coefficient of variation)
+                score += stats['cv'] * 5
+
+                # Penalize too many or too few buckets
+                ideal_buckets = max(3, min(10, total_images // 500))
+                bucket_diff = abs(analysis['num_buckets'] - ideal_buckets)
+                score += bucket_diff * 0.5
+
+                # Penalize high Gini
+                score += stats['gini'] * 3
+
+                result = {
+                    'bucket_reso_steps': steps,
+                    'min_bucket_reso': min_reso,
+                    'max_bucket_reso': max_reso,
+                    'num_buckets': analysis['num_buckets'],
+                    'imbalance_ratio': stats['imbalance_ratio'],
+                    'min_bucket_size': stats['min'],
+                    'cv': stats['cv'],
+                    'gini': stats['gini'],
+                    'score': score,
+                }
+                all_results.append(result)
+
+                if score < best_score:
+                    best_score = score
+                    best_config = result
+                    best_config['assignments'] = assignments
+                    best_config['analysis'] = analysis
+
+    if best_config is None:
+        # Fallback to defaults
+        return {
+            'bucket_reso_steps': 64,
+            'min_bucket_reso': 512,
+            'max_bucket_reso': base_resolution * 2,
+            'success': False,
+            'message': 'Could not find optimal configuration'
+        }
+
+    # Sort all results by score for reporting
+    all_results.sort(key=lambda x: x['score'])
+
+    return {
+        'optimal': best_config,
+        'top_5': all_results[:5],
+        'success': True,
+        'message': f"Found optimal config with score {best_score:.2f}"
+    }
 
 
 def find_optimal_buckets(
@@ -940,40 +1227,42 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Tu dong (khuyen nghi): Script tu tinh num_buckets, min_bucket_size
-  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024
+  # 1. SIMULATE: Xem bucket distribution nhu sd-scripts se tao
+  python balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --simulate
+  python balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --simulate --bucket_reso_steps 128
 
-  # Hoac dung flag --auto de ro rang hon
-  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --auto
+  # 2. AUTO MODE (KHUYEN NGHI): Tu dong tim config toi uu qua simulation
+  python balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --auto
 
-  # Chi dinh tham so thu cong
-  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 -n 8 --min_bucket_size 100
+  # 3. MANUAL: Chi dinh tham so thu cong
+  python balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 -n 8 --min_bucket_size 100
 
-  # Giu extension goc (png, webp, ...)
-  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --keep_extension
+  # 4. Ket hop cac options
+  python balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --auto --keep_extension
+  python balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --bucket_folders
 
-  # Tao subfolder theo bucket
-  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --bucket_folders
+  # 5. Phan tich truoc
+  python balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --analyze_only
 
-  # Phan tich truoc (xem bucket distribution)
-  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --analyze_only
+Workflow khuyen nghi:
+  1. Chay --simulate de xem bucket distribution hien tai
+  2. Neu imbalance ratio > 5x, chay --auto de tim config toi uu
+  3. Dung config toi uu de xu ly anh
+
+Auto mode (--auto):
+  - Script se simulate nhieu config khac nhau:
+    + bucket_reso_steps: 32, 64, 128, 256
+    + min_bucket_reso: 256, 512, 768
+    + max_bucket_reso: 1024, 1536, 2048, base*2
+  - Chon config co:
+    + Imbalance ratio thap
+    + Gini coefficient thap (phan phoi deu)
+    + Du anh moi bucket (min >= 50)
 
 Output:
-  - output_dir/: Anh da resize + file caption (.txt)
+  - output_dir/: Anh da resize + caption files
   - ./bucket_report.txt: Report chi tiet
   - ./bucket_config.json: Config bucket
-
-Auto mode logic:
-  - num_buckets: Dua tren aspect ratio diversity (std)
-    + std < 0.2 -> 3 buckets (uniform AR)
-    + std < 0.4 -> 5 buckets
-    + std < 0.6 -> 7 buckets
-    + std >= 0.6 -> 10 buckets (diverse AR)
-  - min_bucket_size: Dua tren tong so anh
-    + < 1000 images -> 20
-    + < 10000 images -> 50
-    + < 50000 images -> 100
-    + >= 50000 images -> 200
         """
     )
 
@@ -1026,8 +1315,45 @@ Auto mode logic:
     parser.add_argument(
         "--auto",
         action="store_true",
-        help="Tu dong tinh tat ca tham so (num_buckets, min_bucket_size, max_imbalance) "
-             "dua tren phan tich dataset. Khuyen nghi dung cho lan dau"
+        help="[DATA-DRIVEN] Tu dong tim tham so toi uu bang cach simulate bucket creation nhu sd-scripts. "
+             "Script se thu nhieu config va chon config tot nhat dua tren imbalance ratio, Gini coefficient, v.v."
+    )
+
+    # SD-Scripts simulation parameters
+    parser.add_argument(
+        "--bucket_reso_steps",
+        type=int,
+        default=64,
+        help="[Simulate] Buoc resolution (giong bucket_reso_steps cua sd-scripts). Default: 64. "
+             "Tang len (128, 256) de giam so bucket, giam xuong (32) de tang so bucket"
+    )
+
+    parser.add_argument(
+        "--min_bucket_reso",
+        type=int,
+        default=256,
+        help="[Simulate] Resolution toi thieu cho bucket (giong min_bucket_reso cua sd-scripts). Default: 256"
+    )
+
+    parser.add_argument(
+        "--max_bucket_reso",
+        type=int,
+        default=None,
+        help="[Simulate] Resolution toi da cho bucket. Default: base_resolution * 2"
+    )
+
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="[Debug] Chi hien thi bucket distribution nhu sd-scripts, KHONG xu ly anh. "
+             "Giup ban xem truoc cach sd-scripts se tao bucket voi dataset cua ban"
+    )
+
+    parser.add_argument(
+        "--num_repeats",
+        type=int,
+        default=1,
+        help="[Simulate] So lan lap anh (num_repeats) de tinh bucket size. Default: 1"
     )
 
     parser.add_argument(
@@ -1096,26 +1422,128 @@ Auto mode logic:
         print("Analysis complete. Use without --analyze_only to process images.")
         sys.exit(0)
 
-    # Phase 2: Find optimal buckets
-    print("\n" + "=" * 60)
-    print("PHASE 2: OPTIMAL BUCKET GENERATION")
-    print("=" * 60)
+    # Set max_bucket_reso default
+    max_bucket_reso = args.max_bucket_reso if args.max_bucket_reso else args.base_resolution * 2
 
-    # Determine parameters (auto or manual)
-    if args.auto or (args.num_buckets is None and args.min_bucket_size is None and args.max_imbalance is None):
-        # Auto mode: calculate all parameters automatically
-        auto_num_buckets, auto_min_bucket_size, auto_max_imbalance = auto_calculate_params(images, analysis)
+    # ========================================================================
+    # SIMULATE MODE: Show bucket distribution like sd-scripts
+    # ========================================================================
+    if args.simulate:
+        print("\n" + "=" * 60)
+        print("SD-SCRIPTS BUCKET SIMULATION")
+        print("=" * 60)
 
-        num_buckets = args.num_buckets if args.num_buckets is not None else auto_num_buckets
-        min_bucket_size = args.min_bucket_size if args.min_bucket_size is not None else auto_min_bucket_size
-        max_imbalance = args.max_imbalance if args.max_imbalance is not None else auto_max_imbalance
+        print(f"\nSimulation parameters:")
+        print(f"  - base_resolution: {args.base_resolution}")
+        print(f"  - bucket_reso_steps: {args.bucket_reso_steps}")
+        print(f"  - min_bucket_reso: {args.min_bucket_reso}")
+        print(f"  - max_bucket_reso: {max_bucket_reso}")
+        print(f"  - num_repeats: {args.num_repeats}")
 
-        print(f"[AUTO] Calculated parameters based on dataset analysis:")
-        print(f"  - num_buckets: {num_buckets}")
-        print(f"  - min_bucket_size: {min_bucket_size}")
-        print(f"  - max_imbalance: {max_imbalance}")
-    else:
-        # Manual mode with defaults
+        # Simulate bucket creation
+        bucket_assignments = simulate_bucket_assignment(
+            images,
+            args.base_resolution,
+            args.min_bucket_reso,
+            max_bucket_reso,
+            args.bucket_reso_steps
+        )
+
+        # Analyze distribution
+        dist_analysis = analyze_bucket_distribution(bucket_assignments, args.num_repeats)
+
+        # Print in sd-scripts style
+        print(f"\nmake buckets")
+        print(f"number of images (including repeats) / 各bucketの画像枚数（繰り返し回数を含む）")
+
+        sorted_buckets = sorted(bucket_assignments.items(), key=lambda x: (x[0][0], x[0][1]))
+        for i, (reso, imgs) in enumerate(sorted_buckets):
+            count = len(imgs) * args.num_repeats
+            print(f"bucket {i}: resolution {reso}, count: {count}")
+
+        # Print analysis
+        stats = dist_analysis['statistics']
+        print(f"\n--- Distribution Analysis ---")
+        print(f"Total buckets: {dist_analysis['num_buckets']}")
+        print(f"Total images: {dist_analysis['total_images']}")
+        print(f"Bucket sizes: min={stats['min']}, max={stats['max']}, avg={stats['avg']:.1f}")
+        print(f"Imbalance ratio: {stats['imbalance_ratio']:.2f}x")
+        print(f"Coefficient of variation: {stats['cv']:.3f}")
+        print(f"Gini coefficient: {stats['gini']:.3f}")
+
+        if dist_analysis['recommendations']:
+            print(f"\n--- Recommendations ---")
+            for rec in dist_analysis['recommendations']:
+                print(f"  * {rec}")
+
+        sys.exit(0)
+
+    # ========================================================================
+    # AUTO MODE: Data-driven optimization via simulation
+    # ========================================================================
+    if args.auto:
+        print("\n" + "=" * 60)
+        print("AUTO MODE: DATA-DRIVEN BUCKET OPTIMIZATION")
+        print("=" * 60)
+
+        print("\nSearching for optimal bucket configuration...")
+        print("(Testing different bucket_reso_steps, min/max_bucket_reso combinations)")
+
+        optimization_result = auto_optimize_from_simulation(
+            images,
+            args.base_resolution,
+            target_max_imbalance=4.0,
+            target_min_bucket_size=50
+        )
+
+        if optimization_result['success']:
+            optimal = optimization_result['optimal']
+            print(f"\n[OPTIMAL CONFIG FOUND] Score: {optimal['score']:.2f}")
+            print(f"  - bucket_reso_steps: {optimal['bucket_reso_steps']}")
+            print(f"  - min_bucket_reso: {optimal['min_bucket_reso']}")
+            print(f"  - max_bucket_reso: {optimal['max_bucket_reso']}")
+            print(f"  - Resulting buckets: {optimal['num_buckets']}")
+            print(f"  - Imbalance ratio: {optimal['imbalance_ratio']:.2f}x")
+            print(f"  - Min bucket size: {optimal['min_bucket_size']}")
+            print(f"  - Gini coefficient: {optimal['gini']:.3f}")
+
+            # Show top 5 alternatives
+            print(f"\nTop 5 configurations:")
+            for i, cfg in enumerate(optimization_result['top_5'][:5]):
+                print(f"  {i+1}. steps={cfg['bucket_reso_steps']}, min={cfg['min_bucket_reso']}, "
+                      f"max={cfg['max_bucket_reso']} -> {cfg['num_buckets']} buckets, "
+                      f"imbalance={cfg['imbalance_ratio']:.1f}x, score={cfg['score']:.2f}")
+
+            # Use the optimal assignments for processing
+            bucket_assignments = optimal['assignments']
+
+            # Convert to Bucket objects
+            buckets = []
+            for reso, imgs in bucket_assignments.items():
+                bucket = Bucket(width=reso[0], height=reso[1])
+                bucket.images = imgs
+                buckets.append(bucket)
+
+            # Print bucket summary
+            print(f"\nUsing {len(buckets)} optimized buckets:")
+            for bucket in sorted(buckets, key=lambda b: -b.size):
+                print(f"  {bucket.width}x{bucket.height} (AR={bucket.aspect_ratio:.3f}): {bucket.size} images")
+
+        else:
+            print(f"\n{optimization_result['message']}")
+            print("Falling back to default parameters...")
+            # Fall through to manual mode with defaults
+            args.auto = False
+
+    # ========================================================================
+    # MANUAL MODE: Use specified parameters
+    # ========================================================================
+    if not args.auto:
+        print("\n" + "=" * 60)
+        print("PHASE 2: OPTIMAL BUCKET GENERATION")
+        print("=" * 60)
+
+        # Use manual parameters with defaults
         num_buckets = args.num_buckets if args.num_buckets is not None else 10
         min_bucket_size = args.min_bucket_size if args.min_bucket_size is not None else 50
         max_imbalance = args.max_imbalance if args.max_imbalance is not None else 5.0
@@ -1125,18 +1553,18 @@ Auto mode logic:
         print(f"  - min_bucket_size: {min_bucket_size}")
         print(f"  - max_imbalance: {max_imbalance}")
 
-    buckets = find_optimal_buckets(
-        images,
-        base_resolution=args.base_resolution,
-        num_buckets=num_buckets,
-        min_bucket_size=min_bucket_size,
-        max_imbalance=max_imbalance
-    )
+        buckets = find_optimal_buckets(
+            images,
+            base_resolution=args.base_resolution,
+            num_buckets=num_buckets,
+            min_bucket_size=min_bucket_size,
+            max_imbalance=max_imbalance
+        )
 
-    # Print bucket summary
-    print(f"\nGenerated {len(buckets)} buckets:")
-    for bucket in sorted(buckets, key=lambda b: -b.size):
-        print(f"  {bucket.width}x{bucket.height} (AR={bucket.aspect_ratio:.3f}): {bucket.size} images")
+        # Print bucket summary
+        print(f"\nGenerated {len(buckets)} buckets:")
+        for bucket in sorted(buckets, key=lambda b: -b.size):
+            print(f"  {bucket.width}x{bucket.height} (AR={bucket.aspect_ratio:.3f}): {bucket.size} images")
 
     if args.dry_run:
         print("\nDry run complete. Use without --dry_run to process images.")
