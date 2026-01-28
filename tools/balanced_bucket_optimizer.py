@@ -596,7 +596,9 @@ def process_single_image(
     bucket: Bucket,
     input_dir: Path,
     output_dir: Path,
-    quality: int = 95
+    quality: int = 95,
+    flat_output: bool = True,
+    keep_extension: bool = False
 ) -> Tuple[bool, str]:
     """
     Process a single image: resize and copy with captions
@@ -607,18 +609,29 @@ def process_single_image(
         input_dir: Input directory root
         output_dir: Output directory root
         quality: JPEG quality (1-100)
+        flat_output: If True, save all images directly to output_dir (keep original filename)
+                    If False, create bucket subdirectories
+        keep_extension: If True, keep original extension; If False, convert to jpg
 
     Returns:
         (success, message)
     """
     try:
-        # Calculate output path (preserve relative structure)
-        rel_path = image.path.relative_to(input_dir)
-
-        # Create bucket subdirectory
-        bucket_name = f"{bucket.width}x{bucket.height}"
-        output_subdir = output_dir / bucket_name
-        output_path = output_subdir / rel_path
+        if flat_output:
+            # Flat structure: output_dir/filename.ext
+            if keep_extension:
+                output_path = output_dir / image.path.name
+            else:
+                output_path = output_dir / (image.path.stem + '.jpg')
+        else:
+            # Bucket subdirectory structure: output_dir/WxH/filename.ext
+            rel_path = image.path.relative_to(input_dir)
+            bucket_name = f"{bucket.width}x{bucket.height}"
+            output_subdir = output_dir / bucket_name
+            if keep_extension:
+                output_path = output_subdir / rel_path
+            else:
+                output_path = (output_subdir / rel_path).with_suffix('.jpg')
 
         # Create directories
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -646,9 +659,20 @@ def process_single_image(
             # Resize
             img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-            # Save
-            output_path = output_path.with_suffix('.jpg')
-            img.save(output_path, 'JPEG', quality=quality)
+            # Save based on extension
+            save_path = output_path
+            if keep_extension:
+                ext = image.path.suffix.lower()
+                if ext in ['.jpg', '.jpeg']:
+                    img.save(save_path, 'JPEG', quality=quality)
+                elif ext == '.png':
+                    img.save(save_path, 'PNG')
+                elif ext == '.webp':
+                    img.save(save_path, 'WEBP', quality=quality)
+                else:
+                    img.save(save_path, 'JPEG', quality=quality)
+            else:
+                img.save(save_path, 'JPEG', quality=quality)
 
         # Copy caption files
         caption_extensions = ['.txt', '.caption', '.tags']
@@ -669,7 +693,9 @@ def process_images(
     input_dir: Path,
     output_dir: Path,
     max_workers: int = 8,
-    quality: int = 95
+    quality: int = 95,
+    flat_output: bool = True,
+    keep_extension: bool = False
 ) -> Dict:
     """
     Process all images: resize and copy
@@ -680,6 +706,8 @@ def process_images(
         output_dir: Output directory root
         max_workers: Number of parallel workers
         quality: JPEG quality
+        flat_output: If True, save all images directly to output_dir
+        keep_extension: If True, keep original file extension
 
     Returns:
         Processing statistics
@@ -706,7 +734,7 @@ def process_images(
         futures = {
             executor.submit(
                 process_single_image,
-                img, bucket, input_dir, output_dir, quality
+                img, bucket, input_dir, output_dir, quality, flat_output, keep_extension
             ): (img, bucket)
             for img, bucket in tasks
         }
@@ -846,14 +874,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage
-  python balanced_bucket_optimizer.py --input_dir ./images --output_dir ./output --base_resolution 1024
+  # Basic usage (flat output, keeps original filenames)
+  python balanced_bucket_optimizer.py --input_dir ./data --output_dir ./output_process --base_resolution 1024
+
+  # Keep original file extension (png, webp, etc.)
+  python balanced_bucket_optimizer.py --input_dir ./data --output_dir ./output_process -r 1024 --keep_extension
+
+  # Create separate folders for each bucket
+  python balanced_bucket_optimizer.py --input_dir ./data --output_dir ./output_process -r 1024 --bucket_folders
 
   # With custom bucket count
-  python balanced_bucket_optimizer.py --input_dir ./images --output_dir ./output --base_resolution 1024 --num_buckets 8
+  python balanced_bucket_optimizer.py --input_dir ./data --output_dir ./output_process -r 1024 --num_buckets 8
 
   # Analysis only (no resize)
-  python balanced_bucket_optimizer.py --input_dir ./images --output_dir ./output --base_resolution 1024 --analyze_only
+  python balanced_bucket_optimizer.py --input_dir ./data --output_dir ./output_process -r 1024 --analyze_only
         """
     )
 
@@ -925,6 +959,18 @@ Examples:
         help="Show what would be done without actually processing"
     )
 
+    parser.add_argument(
+        "--bucket_folders",
+        action="store_true",
+        help="Create separate folders for each bucket (default: flat output with original filenames)"
+    )
+
+    parser.add_argument(
+        "--keep_extension",
+        action="store_true",
+        help="Keep original file extension instead of converting to JPEG"
+    )
+
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
@@ -984,7 +1030,9 @@ Examples:
         input_dir,
         output_dir,
         max_workers=args.workers,
-        quality=args.quality
+        quality=args.quality,
+        flat_output=not args.bucket_folders,
+        keep_extension=args.keep_extension
     )
 
     # Phase 4: Generate report
