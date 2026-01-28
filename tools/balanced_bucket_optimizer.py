@@ -913,22 +913,25 @@ def calculate_resize_dimensions(
         # Direct resize (may distort)
         return bucket.width, bucket.height, (0, 0, image.width, image.height)
 
-    # NO CROP mode: resize to bucket area while preserving exact aspect ratio
-    # This means the output may not match exact bucket dimensions
+    # NO CROP mode: simple resize keeping aspect ratio
+    # Resize so longest side fits within bucket's max dimension
+    # This preserves full image content without any cropping or padding
     if no_crop:
-        # Calculate target pixel count from bucket
-        target_pixels = bucket.total_pixels
-        img_ar = image.aspect_ratio
+        # Use the larger bucket dimension as max size
+        max_bucket_dim = max(bucket.width, bucket.height)
 
-        # Calculate new dimensions preserving aspect ratio with ~same pixel count
-        # new_width * new_height = target_pixels
-        # new_width / new_height = img_ar
-        # => new_height = sqrt(target_pixels / img_ar)
-        # => new_width = new_height * img_ar
-        new_height = int(math.sqrt(target_pixels / img_ar))
-        new_width = int(new_height * img_ar)
+        # Calculate scale to fit longest side within max dimension
+        if image.width >= image.height:
+            # Landscape or square - fit width
+            scale = max_bucket_dim / image.width
+        else:
+            # Portrait - fit height
+            scale = max_bucket_dim / image.height
 
-        # Round to nearest multiple of 64 for compatibility
+        new_width = int(image.width * scale)
+        new_height = int(image.height * scale)
+
+        # Round to nearest multiple of 64 for compatibility with sd-scripts
         new_width = max(64, (new_width // 64) * 64)
         new_height = max(64, (new_height // 64) * 64)
 
@@ -1403,9 +1406,10 @@ Output:
     parser.add_argument(
         "--no_crop",
         action="store_true",
-        help="[KHUYEN NGHI] Chi resize anh, KHONG crop. Giu nguyen toan bo aspect ratio goc. "
-             "Kich thuoc output se co cung so pixel voi bucket nhung giu nguyen AR. "
-             "Vi du: Anh 1920x1080 (AR=1.78) se resize thanh ~1368x768 thay vi crop thanh 1024x1024"
+        help="Chi resize anh, KHONG crop/padding. Giu nguyen toan bo aspect ratio goc. "
+             "Resize sao cho canh dai nhat = bucket max dimension, sau do round ve boi so 64. "
+             "Vi du: Anh 1920x1080 + bucket 1024 → 1024x576. "
+             "Luu y: Output dimensions se khac nhau tuy theo AR goc cua moi anh"
     )
 
     parser.add_argument(
