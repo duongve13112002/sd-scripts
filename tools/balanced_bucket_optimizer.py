@@ -980,7 +980,8 @@ def process_single_image(
     quality: int = 95,
     flat_output: bool = True,
     keep_extension: bool = False,
-    no_crop: bool = False
+    no_crop: bool = False,
+    force_resize: bool = False
 ) -> Tuple[bool, str]:
     """
     Process a single image: resize and copy with captions
@@ -995,6 +996,7 @@ def process_single_image(
                     If False, create bucket subdirectories
         keep_extension: If True, keep original extension; If False, convert to jpg
         no_crop: If True, only resize without cropping (preserve full aspect ratio)
+        force_resize: If True, resize directly to bucket dimensions (may distort aspect ratio)
 
     Returns:
         (success, message)
@@ -1020,7 +1022,11 @@ def process_single_image(
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Calculate resize dimensions
-        new_width, new_height, crop_box = calculate_resize_dimensions(image, bucket, no_crop=no_crop)
+        new_width, new_height, crop_box = calculate_resize_dimensions(
+            image, bucket,
+            preserve_ratio=not force_resize,
+            no_crop=no_crop
+        )
 
         # Open and process image
         with Image.open(image.path) as img:
@@ -1079,7 +1085,8 @@ def process_images(
     quality: int = 95,
     flat_output: bool = True,
     keep_extension: bool = False,
-    no_crop: bool = False
+    no_crop: bool = False,
+    force_resize: bool = False
 ) -> Dict:
     """
     Process all images: resize and copy
@@ -1093,6 +1100,7 @@ def process_images(
         flat_output: If True, save all images directly to output_dir
         keep_extension: If True, keep original file extension
         no_crop: If True, only resize without cropping (preserve full aspect ratio)
+        force_resize: If True, resize directly to bucket dimensions (may distort aspect ratio)
 
     Returns:
         Processing statistics
@@ -1119,7 +1127,7 @@ def process_images(
         futures = {
             executor.submit(
                 process_single_image,
-                img, bucket, input_dir, output_dir, quality, flat_output, keep_extension, no_crop
+                img, bucket, input_dir, output_dir, quality, flat_output, keep_extension, no_crop, force_resize
             ): (img, bucket)
             for img, bucket in tasks
         }
@@ -1413,6 +1421,15 @@ Output:
     )
 
     parser.add_argument(
+        "--resize",
+        action="store_true",
+        help="Resize anh TRUC TIEP ve bucket dimensions, BO QUA aspect ratio. "
+             "Anh se bi stretch/distort nhung GIU DUNG bucket size. "
+             "Vi du: Anh 1920x1080 + bucket 1024x1024 → 1024x1024 (stretched). "
+             "Dung khi can dam bao bucket balance tuyet doi"
+    )
+
+    parser.add_argument(
         "--analyze_only",
         action="store_true",
         help="Chi phan tich dataset, KHONG resize anh. Dung de xem truoc bucket distribution"
@@ -1631,7 +1648,8 @@ Output:
         quality=args.quality,
         flat_output=not args.bucket_folders,
         keep_extension=args.keep_extension,
-        no_crop=args.no_crop
+        no_crop=args.no_crop,
+        force_resize=args.resize
     )
 
     # Phase 4: Generate report
