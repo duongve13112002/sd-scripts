@@ -1523,6 +1523,23 @@ Output:
              "Script se thu nhieu config va chon config tot nhat dua tren imbalance ratio, Gini coefficient, v.v."
     )
 
+    parser.add_argument(
+        "--target_max_imbalance",
+        type=float,
+        default=4.0,
+        help="[Auto] Ti le imbalance toi da muc tieu khi tim config toi uu. Default: 4.0. "
+             "Imbalance = max_bucket_size / min_bucket_size. "
+             "< 2x: ly tuong, 2-4x: tot, 4-8x: chap nhan, > 8x: ko on dinh"
+    )
+
+    parser.add_argument(
+        "--target_min_bucket_size",
+        type=int,
+        default=50,
+        help="[Auto] So anh toi thieu moi bucket khi tim config toi uu. Default: 50. "
+             "< 20: qua it (overfit), 50-100: du tot, > 200: ly tuong"
+    )
+
     # SD-Scripts simulation parameters
     parser.add_argument(
         "--bucket_reso_steps",
@@ -1733,12 +1750,13 @@ Output:
 
         print("\nSearching for optimal bucket configuration...")
         print("(Testing different bucket_reso_steps, min/max_bucket_reso combinations)")
+        print(f"Targets: max_imbalance={args.target_max_imbalance}x, min_bucket_size={args.target_min_bucket_size}")
 
         optimization_result = auto_optimize_from_simulation(
             images,
             args.base_resolution,
-            target_max_imbalance=4.0,
-            target_min_bucket_size=50
+            target_max_imbalance=args.target_max_imbalance,
+            target_min_bucket_size=args.target_min_bucket_size
         )
 
         if optimization_result['success']:

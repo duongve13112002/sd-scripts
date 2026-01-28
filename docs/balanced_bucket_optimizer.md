@@ -37,7 +37,18 @@ No additional dependencies required. Uses standard Python libraries.
 Optional for better performance:
 ```bash
 pip install numpy tqdm
+
+# For 3-5x faster image processing (highly recommended)
+pip install opencv-python
+# or headless version (no GUI)
+pip install opencv-python-headless
 ```
+
+**Performance comparison:**
+| Backend | Speed | Notes |
+|---------|-------|-------|
+| PIL (fallback) | ~24 it/s | Always available |
+| OpenCV | ~80-120 it/s | 3-5x faster, auto-detected |
 
 ## Usage
 
@@ -170,6 +181,19 @@ python tools/balanced_bucket_optimizer.py -i ./dataset -o ./output_optimized -r 
 | `--auto` | Auto-optimize parameters via simulation |
 | `--analyze_only` | Only show aspect ratio analysis |
 | `--dry_run` | Show what would be done without processing |
+
+### Auto Mode Options
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--target_max_imbalance` | 4.0 | Target max imbalance ratio when searching for optimal config |
+| `--target_min_bucket_size` | 50 | Target min images per bucket when searching for optimal config |
+
+**Why these defaults?**
+
+| Parameter | Default | Reasoning |
+|-----------|---------|-----------|
+| `target_max_imbalance` | 4.0 | <2x: ideal but hard to achieve, 2-4x: good, 4-8x: acceptable, >8x: unstable training |
+| `target_min_bucket_size` | 50 | <20: too few (overfit risk), 50-100: sufficient, >200: ideal |
 
 ### Manual Mode Options
 | Option | Default | Description |
@@ -319,8 +343,10 @@ The auto mode is **data-driven**: it simulates bucket creation exactly like sd-s
 │  STEP 4: Score configuration (lower = better)                   │
 ├─────────────────────────────────────────────────────────────────┤
 │  score = 0                                                      │
-│  if imbalance > 4: score += (imbalance - 4) × 10               │
-│  if min_size < 50: score += (50 - min_size) × 0.5              │
+│  if imbalance > target_max_imbalance:                          │
+│       score += (imbalance - target_max_imbalance) × 10         │
+│  if min_size < target_min_bucket_size:                         │
+│       score += (target_min_bucket_size - min_size) × 0.5       │
 │  score += cv × 5                                                │
 │  score += gini × 3                                              │
 │  score += |buckets - ideal| × 0.5                              │
@@ -334,15 +360,16 @@ The auto mode is **data-driven**: it simulates bucket creation exactly like sd-s
 ### Scoring Formula
 
 ```python
+# target_max_imbalance and target_min_bucket_size are configurable via CLI
 score = 0
 
 # Penalize high imbalance (most important)
-if imbalance > 4.0:
-    score += (imbalance - 4.0) * 10
+if imbalance > target_max_imbalance:  # default: 4.0
+    score += (imbalance - target_max_imbalance) * 10
 
-# Penalize small buckets (< 50 images)
-if min_bucket_size < 50:
-    score += (50 - min_bucket_size) * 0.5
+# Penalize small buckets
+if min_bucket_size < target_min_bucket_size:  # default: 50
+    score += (target_min_bucket_size - min_bucket_size) * 0.5
 
 # Penalize high CV (coefficient of variation)
 score += cv * 5
@@ -353,6 +380,15 @@ score += abs(num_buckets - ideal) * 0.5
 
 # Penalize high Gini (inequality)
 score += gini * 3
+```
+
+**Customize targets for your use case:**
+```bash
+# Stricter balance (for smaller datasets)
+--target_max_imbalance 2.0 --target_min_bucket_size 100
+
+# More lenient (for very large/diverse datasets)
+--target_max_imbalance 6.0 --target_min_bucket_size 30
 ```
 
 ### Example Optimization
