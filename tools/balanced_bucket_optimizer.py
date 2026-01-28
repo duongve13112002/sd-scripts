@@ -44,6 +44,14 @@ except ImportError:
     HAS_NUMPY = False
     print("Note: numpy not found, using pure Python (slower)")
 
+# OpenCV import with fallback to PIL
+try:
+    import cv2
+    HAS_OPENCV = True
+except ImportError:
+    HAS_OPENCV = False
+    print("Note: OpenCV not found, using PIL (slower)")
+
 from PIL import Image
 
 # Optional tqdm import with fallback
@@ -141,10 +149,19 @@ def scan_image_folder(input_dir: Path, max_workers: int = 8) -> List[ImageInfo]:
 
     def process_image(path: Path) -> Optional[ImageInfo]:
         try:
-            with Image.open(path) as img:
-                width, height = img.size
-                if width > 0 and height > 0:
-                    return ImageInfo(path=path, width=width, height=height)
+            if HAS_OPENCV:
+                # OpenCV is faster for reading image dimensions
+                img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    height, width = img.shape[:2]
+                    if width > 0 and height > 0:
+                        return ImageInfo(path=path, width=width, height=height)
+            else:
+                # Fallback to PIL
+                with Image.open(path) as img:
+                    width, height = img.size
+                    if width > 0 and height > 0:
+                        return ImageInfo(path=path, width=width, height=height)
         except Exception as e:
             print(f"Warning: Could not read {path}: {e}")
         return None
@@ -972,7 +989,7 @@ def calculate_resize_dimensions(
             return scaled_width, bucket.height, (0, 0, image.width, image.height)
 
 
-def process_single_image(
+def process_single_image_opencv(
     image: ImageInfo,
     bucket: Bucket,
     input_dir: Path,
@@ -984,7 +1001,7 @@ def process_single_image(
     force_resize: bool = False
 ) -> Tuple[bool, str]:
     """
-    Process a single image: resize and copy with captions
+    Process a single image using OpenCV (faster than PIL)
 
     Args:
         image: ImageInfo object
@@ -1003,13 +1020,11 @@ def process_single_image(
     """
     try:
         if flat_output:
-            # Flat structure: output_dir/filename.ext
             if keep_extension:
                 output_path = output_dir / image.path.name
             else:
                 output_path = output_dir / (image.path.stem + '.jpg')
         else:
-            # Bucket subdirectory structure: output_dir/WxH/filename.ext
             rel_path = image.path.relative_to(input_dir)
             bucket_name = f"{bucket.width}x{bucket.height}"
             output_subdir = output_dir / bucket_name
@@ -1018,7 +1033,6 @@ def process_single_image(
             else:
                 output_path = (output_subdir / rel_path).with_suffix('.jpg')
 
-        # Create directories
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Calculate resize dimensions
@@ -1028,7 +1042,113 @@ def process_single_image(
             no_crop=no_crop
         )
 
-        # Open and process image
+        # Read image with OpenCV (BGR format)
+        img = cv2.imread(str(image.path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return False, f"Could not read: {image.path}"
+
+        # Handle alpha channel (RGBA -> RGB with white background)
+        if len(img.shape) == 3 and img.shape[2] == 4:
+            # BGRA image - blend with white background
+            alpha = img[:, :, 3:4] / 255.0
+            bgr = img[:, :, :3]
+            white_bg = np.ones_like(bgr, dtype=np.uint8) * 255
+            img = (bgr * alpha + white_bg * (1 - alpha)).astype(np.uint8)
+        elif len(img.shape) == 2:
+            # Grayscale -> BGR
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+        # Crop if needed (numpy slicing is very fast)
+        left, top, right, bottom = crop_box
+        if crop_box != (0, 0, image.width, image.height):
+            img = img[top:bottom, left:right]
+
+        # Resize with INTER_CUBIC (equivalent to PIL BICUBIC)
+        img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+
+        # Save based on extension
+        save_path = str(output_path)
+        if keep_extension:
+            ext = image.path.suffix.lower()
+            if ext in ['.jpg', '.jpeg']:
+                cv2.imwrite(save_path, img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            elif ext == '.png':
+                cv2.imwrite(save_path, img, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+            elif ext == '.webp':
+                cv2.imwrite(save_path, img, [cv2.IMWRITE_WEBP_QUALITY, quality])
+            else:
+                cv2.imwrite(save_path, img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        else:
+            cv2.imwrite(save_path, img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+
+        # Copy caption files
+        caption_extensions = ['.txt', '.caption', '.tags']
+        for ext in caption_extensions:
+            caption_path = image.path.with_suffix(ext)
+            if caption_path.exists():
+                output_caption = output_path.with_suffix(ext)
+                shutil.copy2(caption_path, output_caption)
+
+        return True, f"Processed: {image.path.name}"
+
+    except Exception as e:
+        return False, f"Error processing {image.path}: {e}"
+
+
+def process_single_image_pil(
+    image: ImageInfo,
+    bucket: Bucket,
+    input_dir: Path,
+    output_dir: Path,
+    quality: int = 95,
+    flat_output: bool = True,
+    keep_extension: bool = False,
+    no_crop: bool = False,
+    force_resize: bool = False
+) -> Tuple[bool, str]:
+    """
+    Process a single image using PIL (fallback when OpenCV not available)
+
+    Args:
+        image: ImageInfo object
+        bucket: Target Bucket
+        input_dir: Input directory root
+        output_dir: Output directory root
+        quality: JPEG quality (1-100)
+        flat_output: If True, save all images directly to output_dir (keep original filename)
+                    If False, create bucket subdirectories
+        keep_extension: If True, keep original extension; If False, convert to jpg
+        no_crop: If True, only resize without cropping (preserve full aspect ratio)
+        force_resize: If True, resize directly to bucket dimensions (may distort aspect ratio)
+
+    Returns:
+        (success, message)
+    """
+    try:
+        if flat_output:
+            if keep_extension:
+                output_path = output_dir / image.path.name
+            else:
+                output_path = output_dir / (image.path.stem + '.jpg')
+        else:
+            rel_path = image.path.relative_to(input_dir)
+            bucket_name = f"{bucket.width}x{bucket.height}"
+            output_subdir = output_dir / bucket_name
+            if keep_extension:
+                output_path = output_subdir / rel_path
+            else:
+                output_path = (output_subdir / rel_path).with_suffix('.jpg')
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Calculate resize dimensions
+        new_width, new_height, crop_box = calculate_resize_dimensions(
+            image, bucket,
+            preserve_ratio=not force_resize,
+            no_crop=no_crop
+        )
+
+        # Open and process image with PIL
         with Image.open(image.path) as img:
             # Convert to RGB if needed
             if img.mode in ('RGBA', 'LA', 'P'):
@@ -1077,6 +1197,48 @@ def process_single_image(
         return False, f"Error processing {image.path}: {e}"
 
 
+def process_single_image(
+    image: ImageInfo,
+    bucket: Bucket,
+    input_dir: Path,
+    output_dir: Path,
+    quality: int = 95,
+    flat_output: bool = True,
+    keep_extension: bool = False,
+    no_crop: bool = False,
+    force_resize: bool = False
+) -> Tuple[bool, str]:
+    """
+    Process a single image: resize and copy with captions
+    Automatically uses OpenCV if available (3-5x faster), falls back to PIL
+
+    Args:
+        image: ImageInfo object
+        bucket: Target Bucket
+        input_dir: Input directory root
+        output_dir: Output directory root
+        quality: JPEG quality (1-100)
+        flat_output: If True, save all images directly to output_dir (keep original filename)
+                    If False, create bucket subdirectories
+        keep_extension: If True, keep original extension; If False, convert to jpg
+        no_crop: If True, only resize without cropping (preserve full aspect ratio)
+        force_resize: If True, resize directly to bucket dimensions (may distort aspect ratio)
+
+    Returns:
+        (success, message)
+    """
+    if HAS_OPENCV:
+        return process_single_image_opencv(
+            image, bucket, input_dir, output_dir, quality,
+            flat_output, keep_extension, no_crop, force_resize
+        )
+    else:
+        return process_single_image_pil(
+            image, bucket, input_dir, output_dir, quality,
+            flat_output, keep_extension, no_crop, force_resize
+        )
+
+
 def process_images(
     buckets: List[Bucket],
     input_dir: Path,
@@ -1105,7 +1267,9 @@ def process_images(
     Returns:
         Processing statistics
     """
+    backend = "OpenCV (fast)" if HAS_OPENCV else "PIL (fallback)"
     print(f"\nProcessing images to {output_dir}...")
+    print(f"Using image backend: {backend}")
 
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
