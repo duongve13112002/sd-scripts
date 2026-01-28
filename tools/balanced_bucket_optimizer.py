@@ -363,6 +363,72 @@ def calculate_assignment_cost(
     return total_cost
 
 
+def auto_calculate_params(
+    images: List[ImageInfo],
+    analysis: Dict
+) -> Tuple[int, int, float]:
+    """
+    Automatically calculate optimal num_buckets, min_bucket_size, max_imbalance
+    based on dataset characteristics.
+
+    Strategy:
+    - num_buckets: Based on aspect ratio diversity (std) and total images
+    - min_bucket_size: Based on total images (ensure enough samples per bucket)
+    - max_imbalance: Fixed at reasonable value
+
+    Args:
+        images: List of ImageInfo objects
+        analysis: Dataset analysis results
+
+    Returns:
+        (num_buckets, min_bucket_size, max_imbalance)
+    """
+    total_images = len(images)
+    ar_std = analysis['aspect_ratios']['std']
+    ar_range = analysis['aspect_ratios']['max'] - analysis['aspect_ratios']['min']
+
+    # Calculate num_buckets based on aspect ratio diversity
+    # More diverse AR -> more buckets needed
+    # But cap based on total images
+    if ar_std < 0.2:
+        # Very uniform aspect ratios -> few buckets
+        base_buckets = 3
+    elif ar_std < 0.4:
+        # Moderate diversity
+        base_buckets = 5
+    elif ar_std < 0.6:
+        # High diversity
+        base_buckets = 7
+    else:
+        # Very high diversity
+        base_buckets = 10
+
+    # Adjust based on total images (need enough images per bucket)
+    # Target: at least 100-500 images per bucket for good training
+    max_buckets_by_count = max(3, total_images // 500)
+    num_buckets = min(base_buckets, max_buckets_by_count)
+
+    # Ensure at least 3 buckets if we have enough images
+    if total_images >= 1000:
+        num_buckets = max(3, num_buckets)
+
+    # Calculate min_bucket_size
+    # Target: each bucket should have enough images for training stability
+    if total_images < 1000:
+        min_bucket_size = max(20, total_images // (num_buckets * 2))
+    elif total_images < 10000:
+        min_bucket_size = 50
+    elif total_images < 50000:
+        min_bucket_size = 100
+    else:
+        min_bucket_size = 200
+
+    # max_imbalance: keep reasonable
+    max_imbalance = 4.0
+
+    return num_buckets, min_bucket_size, max_imbalance
+
+
 def find_optimal_buckets(
     images: List[ImageInfo],
     base_resolution: int,
@@ -874,25 +940,40 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Co ban: resize anh tu ./data vao ./output_process, giu ten file goc
+  # Tu dong (khuyen nghi): Script tu tinh num_buckets, min_bucket_size
   python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024
 
-  # Giu extension goc (png, webp, ...) thay vi convert sang jpg
+  # Hoac dung flag --auto de ro rang hon
+  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --auto
+
+  # Chi dinh tham so thu cong
+  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 -n 8 --min_bucket_size 100
+
+  # Giu extension goc (png, webp, ...)
   python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --keep_extension
 
-  # Tao subfolder theo bucket (output/1024x1024/, output/1152x896/, ...)
+  # Tao subfolder theo bucket
   python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --bucket_folders
 
-  # Chi dinh so bucket
-  python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --num_buckets 8
-
-  # Phan tich truoc khi xu ly (xem bucket distribution)
+  # Phan tich truoc (xem bucket distribution)
   python balanced_bucket_optimizer.py -i ./data -o ./output_process -r 1024 --analyze_only
 
 Output:
-  - output_dir/: Chi chua anh da resize + file caption (.txt)
-  - ./bucket_report.txt: Report chi tiet (luu tai thu muc hien tai)
-  - ./bucket_config.json: Config bucket de dung voi training
+  - output_dir/: Anh da resize + file caption (.txt)
+  - ./bucket_report.txt: Report chi tiet
+  - ./bucket_config.json: Config bucket
+
+Auto mode logic:
+  - num_buckets: Dua tren aspect ratio diversity (std)
+    + std < 0.2 -> 3 buckets (uniform AR)
+    + std < 0.4 -> 5 buckets
+    + std < 0.6 -> 7 buckets
+    + std >= 0.6 -> 10 buckets (diverse AR)
+  - min_bucket_size: Dua tren tong so anh
+    + < 1000 images -> 20
+    + < 10000 images -> 50
+    + < 50000 images -> 100
+    + >= 50000 images -> 200
         """
     )
 
@@ -921,24 +1002,32 @@ Output:
     parser.add_argument(
         "--num_buckets", "-n",
         type=int,
-        default=10,
-        help="So luong bucket muc tieu (default: 10). Script se tu dong chia anh thanh N bucket "
-             "dua tren aspect ratio. Buckets tuong tu se duoc merge lai"
+        default=None,
+        help="So luong bucket muc tieu. Neu khong set, script se tu dong tinh dua tren dataset. "
+             "Script se chia anh thanh N bucket dua tren aspect ratio"
     )
 
     parser.add_argument(
         "--min_bucket_size",
         type=int,
-        default=50,
-        help="So anh toi thieu moi bucket (default: 50). Bucket nho hon se duoc merge voi bucket gan nhat"
+        default=None,
+        help="So anh toi thieu moi bucket. Neu khong set, script se tu dong tinh. "
+             "Bucket nho hon se duoc merge voi bucket gan nhat"
     )
 
     parser.add_argument(
         "--max_imbalance",
         type=float,
-        default=5.0,
-        help="Ti le chenh lech toi da giua bucket lon nhat va nho nhat (default: 5.0). "
-             "Vi du: 5.0 nghia la bucket lon nhat khong duoc lon hon 5 lan bucket nho nhat"
+        default=None,
+        help="Ti le chenh lech toi da giua bucket lon nhat va nho nhat. Neu khong set, mac dinh 4.0. "
+             "Vi du: 4.0 nghia la bucket lon nhat khong duoc lon hon 4 lan bucket nho nhat"
+    )
+
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Tu dong tinh tat ca tham so (num_buckets, min_bucket_size, max_imbalance) "
+             "dua tren phan tich dataset. Khuyen nghi dung cho lan dau"
     )
 
     parser.add_argument(
@@ -1012,12 +1101,36 @@ Output:
     print("PHASE 2: OPTIMAL BUCKET GENERATION")
     print("=" * 60)
 
+    # Determine parameters (auto or manual)
+    if args.auto or (args.num_buckets is None and args.min_bucket_size is None and args.max_imbalance is None):
+        # Auto mode: calculate all parameters automatically
+        auto_num_buckets, auto_min_bucket_size, auto_max_imbalance = auto_calculate_params(images, analysis)
+
+        num_buckets = args.num_buckets if args.num_buckets is not None else auto_num_buckets
+        min_bucket_size = args.min_bucket_size if args.min_bucket_size is not None else auto_min_bucket_size
+        max_imbalance = args.max_imbalance if args.max_imbalance is not None else auto_max_imbalance
+
+        print(f"[AUTO] Calculated parameters based on dataset analysis:")
+        print(f"  - num_buckets: {num_buckets}")
+        print(f"  - min_bucket_size: {min_bucket_size}")
+        print(f"  - max_imbalance: {max_imbalance}")
+    else:
+        # Manual mode with defaults
+        num_buckets = args.num_buckets if args.num_buckets is not None else 10
+        min_bucket_size = args.min_bucket_size if args.min_bucket_size is not None else 50
+        max_imbalance = args.max_imbalance if args.max_imbalance is not None else 5.0
+
+        print(f"Using parameters:")
+        print(f"  - num_buckets: {num_buckets}")
+        print(f"  - min_bucket_size: {min_bucket_size}")
+        print(f"  - max_imbalance: {max_imbalance}")
+
     buckets = find_optimal_buckets(
         images,
         base_resolution=args.base_resolution,
-        num_buckets=args.num_buckets,
-        min_bucket_size=args.min_bucket_size,
-        max_imbalance=args.max_imbalance
+        num_buckets=num_buckets,
+        min_bucket_size=min_bucket_size,
+        max_imbalance=max_imbalance
     )
 
     # Print bucket summary
