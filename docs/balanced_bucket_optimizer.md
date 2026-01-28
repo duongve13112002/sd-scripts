@@ -180,7 +180,7 @@ python tools/balanced_bucket_optimizer.py -i ./dataset -o ./output_optimized -r 
 
 ## Aspect Ratio Preservation (--no_crop)
 
-By default, the tool crops images to fit exact bucket dimensions. With `--no_crop`, images are only resized while preserving their full aspect ratio.
+By default, the tool crops images to fit exact bucket dimensions. With `--no_crop`, images are simply resized while preserving their full aspect ratio.
 
 ### Default (with crop)
 ```
@@ -189,24 +189,36 @@ Result: Crop sides to get 1080x1080, then resize to 1024x1024
         → Image content is cropped from center
 ```
 
-### With --no_crop (recommended for training)
+### With --no_crop (simple resize)
 ```
-Image: 1920x1080 (AR=1.78) → Bucket area: 1024x1024 = 1,048,576 pixels
-Result: Calculate new dimensions preserving AR=1.78 with same pixel count
-        → new_height = sqrt(1048576 / 1.78) ≈ 768
-        → new_width = 768 × 1.78 ≈ 1366
-        → Round to 64: 1344x768
-        → NO content is lost, full image is preserved
+Image: 1920x1080 (AR=1.78) → Bucket max dimension: 1024
+Result: Resize so longest side = 1024
+        → 1920 × (1024/1920) = 1024
+        → 1080 × (1024/1920) = 576
+        → Round to 64: 1024x576
+        → NO content is lost, NO padding added
+        → Caption matches image exactly
 ```
+
+### Why not letterbox?
+Letterbox (adding padding) would:
+- Add black/white bars not described in caption
+- Model might learn to associate captions with borders
+- Affects training quality
+
+Simple resize preserves:
+- Full image content
+- Caption-image alignment
+- Clean training data
 
 ### Usage
 ```bash
-# Resize without cropping - preserves full image content
+# Simple resize without cropping
 python tools/balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --auto --no_crop
-
-# With bucket folders for organization
-python tools/balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --auto --no_crop --bucket_folders
 ```
+
+### Note
+With `--no_crop`, output images will have different dimensions based on their original aspect ratio. When sd-scripts loads these images, it will create appropriate buckets automatically.
 
 ## Understanding Metrics
 
