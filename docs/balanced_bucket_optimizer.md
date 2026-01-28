@@ -174,8 +174,39 @@ python tools/balanced_bucket_optimizer.py -i ./dataset -o ./output_optimized -r 
 | `--bucket_folders` | False | Create subfolder per bucket |
 | `--keep_extension` | False | Keep original extension (vs convert to jpg) |
 | `--quality` | 95 | JPEG quality (1-100) |
-| `--workers` | 8 | Parallel workers |
+| `--workers` | auto | Parallel workers (auto-detect CPU cores if not set) |
 | `--num_repeats` | 1 | Repeats for bucket size calculation |
+| `--no_crop` | False | **[RECOMMENDED]** Only resize, no cropping. Preserves full aspect ratio |
+
+## Aspect Ratio Preservation (--no_crop)
+
+By default, the tool crops images to fit exact bucket dimensions. With `--no_crop`, images are only resized while preserving their full aspect ratio.
+
+### Default (with crop)
+```
+Image: 1920x1080 (AR=1.78) → Bucket: 1024x1024 (AR=1.0)
+Result: Crop sides to get 1080x1080, then resize to 1024x1024
+        → Image content is cropped from center
+```
+
+### With --no_crop (recommended for training)
+```
+Image: 1920x1080 (AR=1.78) → Bucket area: 1024x1024 = 1,048,576 pixels
+Result: Calculate new dimensions preserving AR=1.78 with same pixel count
+        → new_height = sqrt(1048576 / 1.78) ≈ 768
+        → new_width = 768 × 1.78 ≈ 1366
+        → Round to 64: 1344x768
+        → NO content is lost, full image is preserved
+```
+
+### Usage
+```bash
+# Resize without cropping - preserves full image content
+python tools/balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --auto --no_crop
+
+# With bucket folders for organization
+python tools/balanced_bucket_optimizer.py -i ./data -o ./output -r 1024 --auto --no_crop --bucket_folders
+```
 
 ## Understanding Metrics
 
@@ -203,35 +234,89 @@ CV = std_deviation / mean
 - **0.3-0.5**: Moderate variation
 - **> 0.5**: High variation
 
-## Auto Mode Scoring
+## Auto Mode Mechanism
 
-The auto mode tests combinations of:
-- `bucket_reso_steps`: 32, 64, 128, 256
-- `min_bucket_reso`: 256, 512, 768
-- `max_bucket_reso`: 1024, 1536, 2048, base*2
+The auto mode is **data-driven**: it simulates bucket creation exactly like sd-scripts does, then scores each configuration to find the best one.
 
-Each configuration is scored (lower = better):
+### Step-by-Step Process
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 1: Generate configuration grid                            │
+├─────────────────────────────────────────────────────────────────┤
+│  bucket_reso_steps: [32, 64, 128, 256]                          │
+│  min_bucket_reso:   [256, 512, 768]                             │
+│  max_bucket_reso:   [1024, 1536, 2048, base*2]                  │
+│  → ~30 valid configurations to test                             │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 2: Simulate bucket creation for each config               │
+├─────────────────────────────────────────────────────────────────┤
+│  For each image:                                                │
+│  1. Calculate aspect ratio = width / height                     │
+│  2. Find bucket with closest aspect ratio                       │
+│  3. Assign image to that bucket                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 3: Calculate metrics                                      │
+├─────────────────────────────────────────────────────────────────┤
+│  - Imbalance ratio = max_bucket_size / min_bucket_size          │
+│  - Gini coefficient (inequality measure)                        │
+│  - CV = standard deviation / mean                               │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 4: Score configuration (lower = better)                   │
+├─────────────────────────────────────────────────────────────────┤
+│  score = 0                                                      │
+│  if imbalance > 4: score += (imbalance - 4) × 10               │
+│  if min_size < 50: score += (50 - min_size) × 0.5              │
+│  score += cv × 5                                                │
+│  score += gini × 3                                              │
+│  score += |buckets - ideal| × 0.5                              │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 5: Select config with LOWEST score                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Scoring Formula
+
 ```python
 score = 0
 
-# Penalize high imbalance
+# Penalize high imbalance (most important)
 if imbalance > 4.0:
     score += (imbalance - 4.0) * 10
 
-# Penalize small buckets
+# Penalize small buckets (< 50 images)
 if min_bucket_size < 50:
     score += (50 - min_bucket_size) * 0.5
 
-# Penalize high CV
+# Penalize high CV (coefficient of variation)
 score += cv * 5
 
 # Penalize wrong bucket count
 ideal = total_images // 500
 score += abs(num_buckets - ideal) * 0.5
 
-# Penalize high Gini
+# Penalize high Gini (inequality)
 score += gini * 3
 ```
+
+### Example Optimization
+
+| Config | Steps | Min | Max | Buckets | Imbalance | Score |
+|--------|-------|-----|------|---------|-----------|-------|
+| A | 64 | 256 | 2048 | 47 | 15.2x | 156.7 |
+| B | 128 | 512 | 1536 | 12 | 3.8x | 8.4 |
+| **C** | **128** | **768** | **1536** | **6** | **2.1x** | **3.2** ✓ |
+| D | 256 | 768 | 1024 | 3 | 1.8x | 5.1 |
+
+Config C is selected with the lowest score.
 
 ## Examples
 
