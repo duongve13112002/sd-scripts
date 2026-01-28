@@ -43,12 +43,13 @@ pip install numpy tqdm
 
 ### 1. Simulate Mode - Preview Bucket Distribution
 
-See how sd-scripts will create buckets with your current config:
+See how sd-scripts will create buckets with your current config.
+**Note: `--output_dir` is optional for this mode.**
 
 ```bash
+# No output_dir needed - just analyze
 python tools/balanced_bucket_optimizer.py \
     -i ./dataset \
-    -o ./output \
     -r 1024 \
     --simulate
 ```
@@ -68,9 +69,17 @@ Gini coefficient: 0.304   <- High = uneven
 
 ### 2. Auto Mode - Find Optimal Configuration (Recommended)
 
-Let the tool find the best parameters automatically:
+Let the tool find the best parameters automatically.
+**Use `--dry_run` to only find params without processing.**
 
 ```bash
+# Find optimal params only (no processing)
+python tools/balanced_bucket_optimizer.py \
+    -i ./dataset \
+    -r 1024 \
+    --auto --dry_run
+
+# Find params AND process images
 python tools/balanced_bucket_optimizer.py \
     -i ./dataset \
     -o ./output \
@@ -139,11 +148,11 @@ python tools/balanced_bucket_optimizer.py -i ./dataset -o ./output_optimized -r 
 
 ## Command Line Options
 
-### Required
-| Option | Description |
-|--------|-------------|
-| `-i, --input_dir` | Input folder containing images |
-| `-o, --output_dir` | Output folder for processed images |
+### Input/Output
+| Option | Required | Description |
+|--------|----------|-------------|
+| `-i, --input_dir` | Always | Input folder containing images |
+| `-o, --output_dir` | When processing | Output folder for processed images. **Optional** when using `--simulate`, `--analyze_only`, or `--dry_run` |
 
 ### Resolution Settings
 | Option | Default | Description |
