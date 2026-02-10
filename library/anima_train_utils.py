@@ -146,11 +146,15 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
 
     # EMA arguments
     parser.add_argument(
+        "--ema",
+        action="store_true",
+        help="Enable Exponential Moving Average. Requires --ema_decay to be set.",
+    )
+    parser.add_argument(
         "--ema_decay",
         type=float,
-        default=None,
-        help="EMA decay rate. None=disabled. Typical values: 0.999, 0.9999. "
-        "When enabled, saves both training model and EMA model.",
+        default=0.9999,
+        help="EMA decay rate. Typical values: 0.999, 0.9999. (default: 0.9999)",
     )
     parser.add_argument(
         "--ema_device",

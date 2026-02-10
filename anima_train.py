@@ -550,7 +550,7 @@ def train(args):
 
     # Initialize EMA
     ema = None
-    if getattr(args, 'ema_decay', None) is not None and train_dit:
+    if getattr(args, 'ema', False) and train_dit:
         ema_device_str = getattr(args, 'ema_device', 'gpu')
         ema_device = accelerator.device if ema_device_str == "gpu" else torch.device("cpu")
 
