@@ -114,11 +114,11 @@ accelerate launch --num_cpu_threads_per_process 1 anima_train_network.py \
   --network_module=networks.lora_anima \
   --network_dim=8 \
   --network_alpha=8 \
-  --learning_rate=1e-4 \
+  --learning_rate=1e-5 \
   --optimizer_type="AdamW8bit" \
   --lr_scheduler="constant" \
   --timestep_sample_method="logit_normal" \
-  --discrete_flow_shift=3.0 \
+  --discrete_flow_shift=1.0 \
   --max_train_epochs=10 \
   --save_every_n_epochs=1 \
   --mixed_precision="bf16" \
@@ -132,7 +132,7 @@ accelerate launch --num_cpu_threads_per_process 1 anima_train_network.py \
 
 <details>
 <summary>日本語</summary>
-
+s
 学習は、ターミナルから`anima_train_network.py`を実行することで開始します。基本的なコマンドラインの構造は`train_network.py`と同様ですが、Anima特有の引数を指定する必要があります。
 
 コマンドラインの例は英語のドキュメントを参照してください。
@@ -162,7 +162,7 @@ Besides the arguments explained in the [train_network.py guide](train_network.md
 * `--timestep_sample_method=<choice>`
   - Timestep sampling method. Choose from `logit_normal` (default) or `uniform`.
 * `--discrete_flow_shift=<float>`
-  - Shift for the timestep distribution in Rectified Flow training. Default `3.0`. The shift formula is `t_shifted = (t * shift) / (1 + (shift - 1) * t)`.
+  - Shift for the timestep distribution in Rectified Flow training. Default `1.0`. The shift formula is `t_shifted = (t * shift) / (1 + (shift - 1) * t)`.
 * `--sigmoid_scale=<float>`
   - Scale factor for `logit_normal` timestep sampling. Default `1.0`.
 * `--qwen3_max_token_length=<integer>`
@@ -223,7 +223,7 @@ Anima supports 6 independent learning rate groups. Set to `0` to freeze a compon
 #### Anima 学習パラメータ
 
 * `--timestep_sample_method` - タイムステップのサンプリング方法。`logit_normal`（デフォルト）または`uniform`。
-* `--discrete_flow_shift` - Rectified Flow学習のタイムステップ分布シフト。デフォルト`3.0`。
+* `--discrete_flow_shift` - Rectified Flow学習のタイムステップ分布シフト。デフォルト`1.0`。
 * `--sigmoid_scale` - logit_normalタイムステップサンプリングのスケール係数。デフォルト`1.0`。
 * `--qwen3_max_token_length` - Qwen3トークナイザーの最大トークン長。デフォルト`512`。
 * `--t5_max_token_length` - T5トークナイザーの最大トークン長。デフォルト`512`。
@@ -438,7 +438,7 @@ The `--timestep_sample_method` option specifies how timesteps (0-1) are sampled:
 
 #### Discrete Flow Shift
 
-The `--discrete_flow_shift` option (default `3.0`) shifts the timestep distribution toward higher noise levels. The formula is:
+The `--discrete_flow_shift` option (default `1.0`) shifts the timestep distribution toward higher noise levels. The formula is:
 
 ```
 t_shifted = (t * shift) / (1 + (shift - 1) * t)
@@ -470,7 +470,7 @@ Use `--caption_dropout_rate` for embedding-level caption dropout. This is handle
 
 #### 離散フローシフト
 
-`--discrete_flow_shift`（デフォルト`3.0`）はタイムステップ分布を高ノイズ側にシフトします。
+`--discrete_flow_shift`（デフォルト`1.0`）はタイムステップ分布を高ノイズ側にシフトします。
 
 #### 損失の重み付け
 
