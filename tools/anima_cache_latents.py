@@ -1,6 +1,6 @@
 # Cache Anima (WanVAE) latents to disk
 # Usage:
-#   python anima_cache_latents.py --vae_path /path/to/wan_vae.safetensors \
+#   python anima_cache_latents.py --qwen3_path /path/to/qwen3.safetensors --vae_path /path/to/wan_vae.safetensors \
 #       --dataset_config config.toml --vae_batch_size 4 --no_half_vae
 #
 # Multi-GPU:
@@ -42,16 +42,7 @@ def cache_to_disk(args: argparse.Namespace) -> None:
     # is NOT actually used during VAE latent caching — only loaded as a
     # lightweight dependency so the dataset can initialize properly)
     logger.info("Loading tokenizers (lightweight, for dataset init only)...")
-    qwen3_path = getattr(args, 'qwen3_path', None)
-    if qwen3_path:
-        qwen3_tokenizer = anima_utils.load_qwen3_tokenizer(qwen3_path)
-    else:
-        # Fallback: load from bundled config (no model weights needed)
-        config_dir = os.path.join(os.path.dirname(__file__), 'configs', 'qwen3_06b')
-        from transformers import AutoTokenizer
-        qwen3_tokenizer = AutoTokenizer.from_pretrained(config_dir, local_files_only=True)
-        if qwen3_tokenizer.pad_token is None:
-            qwen3_tokenizer.pad_token = qwen3_tokenizer.eos_token
+    qwen3_tokenizer = anima_utils.load_qwen3_tokenizer(args.qwen3_path)
 
     t5_tokenizer = anima_utils.load_t5_tokenizer(getattr(args, 't5_tokenizer_path', None))
 
@@ -140,6 +131,11 @@ def cache_to_disk(args: argparse.Namespace) -> None:
 
     accelerator.wait_for_everyone()
     accelerator.print("Finished caching latents to disk.")
+
+    # Clean shutdown to avoid "destroy_process_group() was not called" warning
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def setup_parser() -> argparse.ArgumentParser:
