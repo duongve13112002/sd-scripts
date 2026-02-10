@@ -110,7 +110,8 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         "--discrete_flow_shift",
         type=float,
         default=1.0,
-        help="Timestep distribution shift for rectified flow training (default: 1.0)",
+        help="Timestep distribution shift for rectified flow training (default: 1.0, no shift). "
+        "Cosmos-Predict2/Anima does not use shift. Values > 1 push timesteps toward higher noise.",
     )
     parser.add_argument(
         "--timestep_sample_method",
@@ -141,6 +142,44 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="Use Flash Attention for DiT self/cross-attention (requires flash-attn package). "
         "Falls back to PyTorch SDPA if flash-attn is not installed.",
+    )
+
+    # EMA arguments
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=None,
+        help="EMA decay rate. None=disabled. Typical values: 0.999, 0.9999. "
+        "When enabled, saves both training model and EMA model.",
+    )
+    parser.add_argument(
+        "--ema_device",
+        type=str,
+        default="gpu",
+        choices=["gpu", "cpu"],
+        help="Device for EMA shadow parameters. 'cpu' saves GPU VRAM but slower update. (default: gpu)",
+    )
+    parser.add_argument(
+        "--ema_use_num_updates",
+        action="store_true",
+        help="Use warmup schedule for EMA decay: min(decay, (1+num_updates)/(10+num_updates))",
+    )
+    parser.add_argument(
+        "--ema_use_feedback",
+        action="store_true",
+        help="Feed back EMA decay to training parameters (experimental)",
+    )
+    parser.add_argument(
+        "--ema_param_multiplier",
+        type=float,
+        default=1.0,
+        help="Multiply parameters each EMA update step (default: 1.0, no effect)",
+    )
+    parser.add_argument(
+        "--ema_resume_path",
+        type=str,
+        default=None,
+        help="Path to EMA model safetensors file to resume EMA state from a previous run",
     )
 
 
@@ -231,6 +270,7 @@ def compute_loss_weighting_for_anima(weighting_scheme: str, sigmas: torch.Tensor
 
 
 # Parameter groups (6 groups with separate LRs)
+
 def get_anima_param_groups(
     dit,
     base_lr: float,
@@ -320,12 +360,65 @@ def get_anima_param_groups(
 
 
 # Save functions
+
+def _get_ema_filename(ckpt_file):
+    """Get EMA filename by adding ema_ prefix to the basename of a checkpoint file."""
+    dirpath = os.path.dirname(ckpt_file)
+    basename = os.path.basename(ckpt_file)
+    return os.path.join(dirpath, f"ema_{basename}")
+
+
+def _remove_old_ema_file(old_ckpt_file):
+    """Remove old EMA file corresponding to an old checkpoint file (for save_last_n cleanup)."""
+    if old_ckpt_file is None:
+        return
+    old_ema_file = _get_ema_filename(old_ckpt_file)
+    if os.path.exists(old_ema_file):
+        logger.info(f"removing old EMA checkpoint: {old_ema_file}")
+        os.remove(old_ema_file)
+
+
+def _save_ema_model(ema, dit, ckpt_file, save_dtype):
+    """Save EMA model as standard format with ema_ prefix.
+
+    Builds the EMA state dict directly from shadow params without modifying model
+    parameters, which avoids race conditions with DDP workers during stepwise save.
+    The saved file has identical format to the normal model (with net. prefix).
+
+    NOTE: This runs only on main process. We do NOT use ema.copy_to() which would
+    call broadcast and deadlock since workers are not in this code path.
+    """
+    if ema.shadow_params is None:
+        logger.warning("EMA shadow_params is None (worker process?), skipping EMA save")
+        return
+
+    # Build EMA filename: add ema_ prefix to basename
+    ema_file = _get_ema_filename(ckpt_file)
+
+    # Build EMA state dict by replacing trainable param values with shadow params.
+    # Non-trainable params and buffers keep their original values from the model.
+    dit_sd = dit.state_dict()
+
+    # Map trainable param names to shadow param index
+    trainable_idx = 0
+    for name, p in dit.named_parameters():
+        if p.requires_grad:
+            # Replace with EMA shadow param value
+            dit_sd[name] = ema.shadow_params[trainable_idx].data.to(p.device)
+            trainable_idx += 1
+
+    anima_utils.save_anima_model(ema_file, dit_sd, save_dtype)
+    logger.info(f"EMA model saved: {ema_file}")
+    del dit_sd
+
+
 def save_anima_model_on_train_end(
     args: argparse.Namespace,
     save_dtype: torch.dtype,
     epoch: int,
     global_step: int,
     dit: anima_models.MiniTrainDIT,
+    ema=None,
 ):
     """Save Anima model at the end of training."""
     def sd_saver(ckpt_file, epoch_no, global_step):
@@ -335,6 +428,10 @@ def save_anima_model_on_train_end(
         dit_sd = dit.state_dict()
         # Save with 'net.' prefix for ComfyUI compatibility
         anima_utils.save_anima_model(ckpt_file, dit_sd, save_dtype)
+
+        # Save EMA model alongside
+        if ema is not None:
+            _save_ema_model(ema, dit, ckpt_file, save_dtype)
 
     train_util.save_sd_model_on_train_end_common(args, True, True, epoch, global_step, sd_saver, None)
 
@@ -348,6 +445,7 @@ def save_anima_model_on_epoch_end_or_stepwise(
     num_train_epochs: int,
     global_step: int,
     dit: anima_models.MiniTrainDIT,
+    ema=None,
 ):
     """Save Anima model at epoch end or specific steps."""
     def sd_saver(ckpt_file, epoch_no, global_step):
@@ -356,6 +454,23 @@ def save_anima_model_on_epoch_end_or_stepwise(
         )
         dit_sd = dit.state_dict()
         anima_utils.save_anima_model(ckpt_file, dit_sd, save_dtype)
+
+        # Save EMA model alongside and clean up old EMA files
+        if ema is not None:
+            _save_ema_model(ema, dit, ckpt_file, save_dtype)
+
+            # Clean up old EMA files (train_util only cleans normal model files)
+            ext = ".safetensors"
+            if on_epoch_end:
+                remove_no = train_util.get_remove_epoch_no(args, epoch_no)
+                if remove_no is not None:
+                    old_ckpt_name = train_util.get_epoch_ckpt_name(args, ext, remove_no)
+                    _remove_old_ema_file(os.path.join(args.output_dir, old_ckpt_name))
+            else:
+                remove_no = train_util.get_remove_step_no(args, global_step)
+                if remove_no is not None:
+                    old_ckpt_name = train_util.get_step_ckpt_name(args, ext, remove_no)
+                    _remove_old_ema_file(os.path.join(args.output_dir, old_ckpt_name))
 
     train_util.save_sd_model_on_epoch_end_or_stepwise_common(
         args,
@@ -372,6 +487,7 @@ def save_anima_model_on_epoch_end_or_stepwise(
 
 
 # Sampling (Euler discrete for rectified flow)
+
 def do_sample(
     height: int,
     width: int,
