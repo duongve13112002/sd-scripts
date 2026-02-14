@@ -225,7 +225,62 @@ For LoRA training, use `network_reg_lrs` in `--network_args` instead. See [Secti
   - Chunk size for Qwen-Image VAE processing. Reduces VRAM usage at the cost of speed. Default is no chunking.
 * `--vae_disable_cache`
   - Disable internal caching in Qwen-Image VAE to reduce VRAM usage.
-  
+
+#### EMA (Exponential Moving Average) / EMA (指数移動平均)
+
+EMA maintains a shadow copy of the model parameters, averaging them over training steps. This produces smoother, more stable weights that often generalize better than the final training checkpoint. EMA is supported for both full fine-tuning (`anima_train.py`) and LoRA training (`anima_train_network.py`).
+
+* `--ema`
+  - Enable EMA. When enabled, an EMA model is saved alongside each regular checkpoint with an `ema_` prefix on the filename (e.g., `ema_anima-000010.safetensors`). The EMA model has the same format as the regular model and can be used directly for inference.
+* `--ema_decay=<float>` (default: `0.9999`)
+  - Decay rate for EMA. Higher values produce smoother weights but adapt more slowly to new training data. Typical values range from `0.999` to `0.99999`.
+* `--ema_device=<choice>` (default: `cuda`)
+  - Device to store EMA shadow parameters. Choose `cuda` or `cpu`. Using `cpu` significantly reduces GPU VRAM usage (shadow params use the same amount of memory as the model) but makes EMA updates slower due to CPU-GPU data transfer.
+* `--ema_use_num_updates`
+  - Automatically adjust the EMA decay based on the number of update steps. The effective decay is calculated as `min(decay, (1 + num_updates) / (10 + num_updates))`. This makes the EMA warm up faster in early training steps.
+* `--ema_sample`
+  - Enable dual sampling: generate sample images with both training weights and EMA weights side by side. EMA sample images are saved with a `_ema` suffix (e.g., `image_0000_000010_ema.png`). EMA sampling is skipped at step 0 since EMA hasn't accumulated meaningful averages yet. This option works with the existing `--sample_every_n_steps`, `--sample_every_n_epochs`, and `--sample_prompts` arguments.
+* `--ema_resume_path=<path>` *[Optional]*
+  - Path to a previously saved EMA model (`.safetensors`) to resume EMA from. For full fine-tuning, the file should be a saved EMA DiT model. For LoRA training, the file should be a saved EMA LoRA file.
+* `--ema_use_feedback` *[Experimental]*
+  - Feed back EMA parameters into the training model after each update. This is an experimental feature and is **not compatible with multi-GPU DDP training** (it modifies parameters only on the main process, causing parameter desynchronization across GPUs).
+* `--ema_param_multiplier=<float>` (default: `1.0`) *[Experimental]*
+  - Multiply shadow parameters by this value after each EMA update. This is an experimental feature and is **not compatible with multi-GPU DDP training** when set to a value other than `1.0`.
+
+**Example — LoRA training with EMA:**
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 anima_train_network.py \
+  --pretrained_model_name_or_path="<path to Anima DiT model>" \
+  --qwen3="<path to Qwen3-0.6B model>" \
+  --vae="<path to Qwen-Image VAE model>" \
+  --dataset_config="my_anima_dataset_config.toml" \
+  --output_dir="<output directory>" \
+  --output_name="my_anima_lora" \
+  --save_model_as=safetensors \
+  --network_module=networks.lora_anima \
+  --network_dim=8 \
+  --learning_rate=1e-4 \
+  --optimizer_type="AdamW8bit" \
+  --max_train_epochs=10 \
+  --save_every_n_epochs=1 \
+  --mixed_precision="bf16" \
+  --gradient_checkpointing \
+  --cache_latents \
+  --cache_text_encoder_outputs \
+  --ema \
+  --ema_decay=0.9999 \
+  --ema_device=cuda \
+  --ema_sample \
+  --sample_every_n_epochs=1 \
+  --sample_prompts="<path to prompt file>"
+```
+
+**Notes:**
+* When `--ema_device=cpu` is used, EMA shadow parameters are stored in system RAM instead of GPU VRAM. This is useful for large models where VRAM is limited, but EMA updates will be slower.
+* For multi-GPU training, `--ema_use_feedback` and `--ema_param_multiplier` (when not `1.0`) are not supported and will raise an error. Other EMA features work correctly with multi-GPU DDP.
+* The EMA model file uses the same format as the regular model. For LoRA, the EMA LoRA file can be loaded the same way as a regular LoRA file.
+
 #### Incompatible or Unsupported Options / 非互換・非サポートの引数
 
 * `--v2`, `--v_parameterization`, `--clip_skip` - Options for Stable Diffusion v1/v2 that are not used for Anima training.
@@ -277,6 +332,24 @@ LoRA学習の場合は、`--network_args`の`network_reg_lrs`を使用してく�
 * `--cache_latents`, `--cache_latents_to_disk` - Qwen-Image VAEの出力をキャッシュ。
 * `--vae_chunk_size` - Qwen-Image VAEのチャンク処理サイズ。メモリ使用量を削減しますが速度が低下します。デフォルトはチャンク処理なし。
 * `--vae_disable_cache` - Qwen-Image VAEの内部キャッシュを無効化してメモリ使用量を削減します。
+
+#### EMA (指数移動平均)
+
+EMAはモデルパラメータのシャドウコピーを維持し、学習ステップにわたって平均化します。これにより、最終的な学習チェックポイントよりも滑らかで安定した重みが得られ、汎化性能が向上することがあります。EMAはフルファインチューニング（`anima_train.py`）とLoRA学習（`anima_train_network.py`）の両方でサポートされています。
+
+* `--ema` - EMAを有効にします。有効にすると、通常のチェックポイントと並行して`ema_`プレフィックス付きのEMAモデルが保存されます（例: `ema_anima-000010.safetensors`）。EMAモデルは通常のモデルと同じフォーマットで、そのまま推論に使用できます。
+* `--ema_decay` - EMAの減衰率。デフォルト`0.9999`。高い値ほど滑らかな重みになりますが、新しい学習データへの適応が遅くなります。
+* `--ema_device` - EMAシャドウパラメータを保存するデバイス。`cuda`（デフォルト）または`cpu`。`cpu`を使用するとGPU VRAMを大幅に節約できますが、更新速度が遅くなります。
+* `--ema_use_num_updates` - 更新ステップ数に基づいてEMA減衰率を自動調整します。早期の学習ステップでEMAのウォームアップを速くします。
+* `--ema_sample` - デュアルサンプリングを有効にします。学習重みとEMA重みの両方でサンプル画像を生成します。EMAサンプル画像は`_ema`サフィックス付きで保存されます。ステップ0ではEMAがまだ十分に蓄積されていないためスキップされます。
+* `--ema_resume_path` - 以前保存したEMAモデルからEMAを再開するためのパス。
+* `--ema_use_feedback` *[実験的]* - EMAパラメータを学習モデルにフィードバックします。**マルチGPU DDP学習とは互換性がありません。**
+* `--ema_param_multiplier` *[実験的]* - 各EMA更新後にシャドウパラメータにこの値を乗算します。デフォルト`1.0`。`1.0`以外の場合、**マルチGPU DDP学習とは互換性がありません。**
+
+**注意:**
+* `--ema_device=cpu`を使用すると、EMAシャドウパラメータがGPU VRAMではなくシステムRAMに保存されます。大規模モデルでVRAMが限られている場合に有用です。
+* マルチGPU学習では、`--ema_use_feedback`および`--ema_param_multiplier`（`1.0`以外）はサポートされておらず、エラーが発生します。
+* EMAモデルファイルは通常のモデルと同じフォーマットです。LoRAの場合、EMA LoRAファイルは通常のLoRAファイルと同じ方法で読み込めます。
 
 #### 非互換・非サポートの引数
 
