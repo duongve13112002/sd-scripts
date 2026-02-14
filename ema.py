@@ -524,7 +524,7 @@ class ExponentialMovingAverage:
             return {}  # Workers return empty dict
         
         if self.shadow_params is None:
-            return []
+            return {}
 
         return {
             "decay": self.decay,
