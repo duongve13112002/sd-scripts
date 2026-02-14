@@ -304,6 +304,83 @@ def train(args):
         _, _, optimizer = train_util.get_optimizer(args, trainable_params=param_groups)
         optimizer_train_fn, optimizer_eval_fn = train_util.get_optimizer_train_eval_fn(optimizer, args)
 
+    # Initialize EMA (Exponential Moving Average)
+    ema = None
+    if getattr(args, 'ema', False) and train_dit:
+        from library.ema import ExponentialMovingAverage
+
+        ema_device_str = getattr(args, 'ema_device', 'cuda')
+        ema_device = accelerator.device if ema_device_str == "cuda" else torch.device("cpu")
+
+        # Get trainable params from unwrapped model (consistent ordering)
+        unwrapped_dit = accelerator.unwrap_model(dit)
+        ema_params = [p for p in unwrapped_dit.parameters() if p.requires_grad]
+
+        ema_use_feedback = getattr(args, 'ema_use_feedback', False)
+        ema_param_multiplier = getattr(args, 'ema_param_multiplier', 1.0)
+
+        # Validate: use_feedback and param_multiplier modify params on main only,
+        # causing DDP param desync in multi-GPU training
+        if accelerator.num_processes > 1:
+            if ema_use_feedback:
+                raise ValueError(
+                    "--ema_use_feedback is not compatible with multi-GPU DDP training. "
+                    "It modifies parameters only on the main process, causing param desync across GPUs."
+                )
+            if ema_param_multiplier != 1.0:
+                raise ValueError(
+                    "--ema_param_multiplier != 1.0 is not compatible with multi-GPU DDP training. "
+                    "It modifies parameters only on the main process, causing param desync across GPUs."
+                )
+
+        ema = ExponentialMovingAverage(
+            parameters=ema_params,
+            decay=args.ema_decay,
+            use_num_updates=getattr(args, 'ema_use_num_updates', False),
+            use_feedback=ema_use_feedback,
+            param_multiplier=ema_param_multiplier,
+            device=ema_device,
+            accelerator=accelerator,
+        )
+
+        # Resume EMA from saved model file (only load on main process to save memory)
+        ema_resume_path = getattr(args, 'ema_resume_path', None)
+        if ema_resume_path is not None and accelerator.is_main_process:
+            from safetensors.torch import load_file as load_safetensors
+            accelerator.print(f"Loading EMA weights from {ema_resume_path}")
+            ema_sd = load_safetensors(ema_resume_path, device="cpu")
+
+            # Strip 'net.' prefix (ComfyUI format) and match to model params
+            ema_sd_clean = {}
+            for k, v in ema_sd.items():
+                clean_key = k[4:] if k.startswith("net.") else k
+                ema_sd_clean[clean_key] = v
+
+            # Map state dict values to shadow params in parameter order
+            param_name_to_idx = {}
+            trainable_idx = 0
+            for name, p in unwrapped_dit.named_parameters():
+                if p.requires_grad:
+                    param_name_to_idx[name] = trainable_idx
+                    trainable_idx += 1
+
+            loaded_count = 0
+            for name, idx in param_name_to_idx.items():
+                if name in ema_sd_clean:
+                    ema.shadow_params[idx] = ema_sd_clean[name].to(ema_device)
+                    loaded_count += 1
+                else:
+                    accelerator.print(f"  Warning: EMA key not found: {name}")
+            accelerator.print(f"Loaded EMA weights: {loaded_count}/{len(param_name_to_idx)} params")
+
+            del ema_sd, ema_sd_clean
+            clean_memory_on_device(accelerator.device)
+
+        accelerator.print(
+            f"EMA enabled: decay={args.ema_decay}, device={ema_device_str}, "
+            f"params={sum(p.numel() for p in ema_params):,}"
+        )
+
     # prepare dataloader
     train_dataset_group.set_current_strategies()
 
@@ -458,6 +535,7 @@ def train(args):
         tokenize_strategy,
         text_encoding_strategy,
         sample_prompts_te_outputs,
+        ema=ema,
     )
     optimizer_train_fn()
     if len(accelerator.trackers) > 0:
@@ -604,6 +682,10 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
 
+                # Update EMA after optimizer step
+                if ema is not None:
+                    ema.update()
+
                 optimizer_eval_fn()
                 anima_train_utils.sample_images(
                     accelerator,
@@ -616,6 +698,7 @@ def train(args):
                     tokenize_strategy,
                     text_encoding_strategy,
                     sample_prompts_te_outputs,
+                    ema=ema,
                 )
 
                 # Save at specific steps
@@ -631,6 +714,7 @@ def train(args):
                             num_train_epochs,
                             global_step,
                             accelerator.unwrap_model(dit) if train_dit else None,
+                            ema=ema,
                         )
                 optimizer_train_fn()
 
@@ -671,6 +755,7 @@ def train(args):
                     num_train_epochs,
                     global_step,
                     accelerator.unwrap_model(dit) if train_dit else None,
+                    ema=ema,
                 )
 
         anima_train_utils.sample_images(
@@ -684,6 +769,7 @@ def train(args):
             tokenize_strategy,
             text_encoding_strategy,
             sample_prompts_te_outputs,
+            ema=ema,
         )
 
     # End training
@@ -705,6 +791,7 @@ def train(args):
             epoch,
             global_step,
             dit,
+            ema=ema,
         )
         logger.info("model saved.")
 

@@ -136,6 +136,54 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         + " / VAEのメモリ使用量を減らすために内部のキャッシュ機構を無効にします。エンコード/デコードも速くなりますが、公式の動作とは異なります。",
     )
 
+    # EMA (Exponential Moving Average) arguments
+    parser.add_argument(
+        "--ema",
+        action="store_true",
+        help="Enable Exponential Moving Average for model weights.",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.9999,
+        help="EMA decay rate. Typical values: 0.999, 0.9999. (default: 0.9999)",
+    )
+    parser.add_argument(
+        "--ema_device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help="Device for EMA shadow parameters. 'cpu' saves GPU VRAM but slower update. (default: cuda)",
+    )
+    parser.add_argument(
+        "--ema_use_num_updates",
+        action="store_true",
+        help="Use warmup schedule for EMA decay: min(decay, (1+num_updates)/(10+num_updates))",
+    )
+    parser.add_argument(
+        "--ema_use_feedback",
+        action="store_true",
+        help="Feed back EMA decay to training parameters (experimental, single-GPU only)",
+    )
+    parser.add_argument(
+        "--ema_param_multiplier",
+        type=float,
+        default=1.0,
+        help="Multiply parameters each EMA update step (experimental, single-GPU only). (default: 1.0, no effect)",
+    )
+    parser.add_argument(
+        "--ema_resume_path",
+        type=str,
+        default=None,
+        help="Path to EMA model safetensors file to resume EMA state from a previous run",
+    )
+    parser.add_argument(
+        "--ema_sample",
+        action="store_true",
+        help="Also sample images using EMA weights during training (in addition to training weights). "
+        "EMA samples are saved with '_ema' suffix. Requires --ema.",
+    )
+
 
 # Loss weighting
 
@@ -246,6 +294,60 @@ def get_anima_param_groups(
     return param_groups
 
 
+# EMA helper functions
+
+
+def _get_ema_filename(ckpt_file: str) -> str:
+    """Get EMA filename by adding ema_ prefix to the basename of a checkpoint file."""
+    dirpath = os.path.dirname(ckpt_file)
+    basename = os.path.basename(ckpt_file)
+    return os.path.join(dirpath, f"ema_{basename}")
+
+
+def _remove_old_ema_file(old_ckpt_file):
+    """Remove old EMA file corresponding to an old checkpoint file (for save_last_n cleanup)."""
+    if old_ckpt_file is None:
+        return
+    old_ema_file = _get_ema_filename(old_ckpt_file)
+    if os.path.exists(old_ema_file):
+        logger.info(f"removing old EMA checkpoint: {old_ema_file}")
+        os.remove(old_ema_file)
+
+
+def _save_ema_model(ema, dit, ckpt_file, sai_metadata, save_dtype):
+    """Save EMA model as standard format with ema_ prefix.
+
+    Builds the EMA state dict directly from shadow params without modifying model
+    parameters, which avoids race conditions with DDP workers during stepwise save.
+    The saved file has identical format to the normal model (with net. prefix).
+
+    NOTE: This runs only on main process. We do NOT use ema.copy_to() which would
+    call broadcast and deadlock since workers are not in this code path.
+    """
+    if ema.shadow_params is None:
+        logger.warning("EMA shadow_params is None (worker process?), skipping EMA save")
+        return
+
+    # Build EMA filename: add ema_ prefix to basename
+    ema_file = _get_ema_filename(ckpt_file)
+
+    # Build EMA state dict by replacing trainable param values with shadow params.
+    # Non-trainable params and buffers keep their original values from the model.
+    dit_sd = dit.state_dict()
+
+    # Map trainable param names to shadow param index
+    trainable_idx = 0
+    for name, p in dit.named_parameters():
+        if p.requires_grad:
+            # Replace with EMA shadow param value
+            dit_sd[name] = ema.shadow_params[trainable_idx].data.to(p.device)
+            trainable_idx += 1
+
+    anima_utils.save_anima_model(ema_file, dit_sd, sai_metadata, save_dtype)
+    logger.info(f"EMA model saved: {ema_file}")
+    del dit_sd
+
+
 # Save functions
 def save_anima_model_on_train_end(
     args: argparse.Namespace,
@@ -253,6 +355,7 @@ def save_anima_model_on_train_end(
     epoch: int,
     global_step: int,
     dit: anima_models.Anima,
+    ema=None,
 ):
     """Save Anima model at the end of training."""
 
@@ -263,6 +366,10 @@ def save_anima_model_on_train_end(
         dit_sd = dit.state_dict()
         # Save with 'net.' prefix for ComfyUI compatibility
         anima_utils.save_anima_model(ckpt_file, dit_sd, sai_metadata, save_dtype)
+
+        # Save EMA model alongside
+        if ema is not None:
+            _save_ema_model(ema, dit, ckpt_file, sai_metadata, save_dtype)
 
     train_util.save_sd_model_on_train_end_common(args, True, True, epoch, global_step, sd_saver, None)
 
@@ -276,6 +383,7 @@ def save_anima_model_on_epoch_end_or_stepwise(
     num_train_epochs: int,
     global_step: int,
     dit: anima_models.Anima,
+    ema=None,
 ):
     """Save Anima model at epoch end or specific steps."""
 
@@ -285,6 +393,23 @@ def save_anima_model_on_epoch_end_or_stepwise(
         ).to_metadata_dict()
         dit_sd = dit.state_dict()
         anima_utils.save_anima_model(ckpt_file, dit_sd, sai_metadata, save_dtype)
+
+        # Save EMA model alongside and clean up old EMA files
+        if ema is not None:
+            _save_ema_model(ema, dit, ckpt_file, sai_metadata, save_dtype)
+
+            # Clean up old EMA files (train_util only cleans normal model files)
+            ext = ".safetensors"
+            if on_epoch_end:
+                remove_no = train_util.get_remove_epoch_no(args, epoch_no)
+                if remove_no is not None:
+                    old_ckpt_name = train_util.get_epoch_ckpt_name(args, ext, remove_no)
+                    _remove_old_ema_file(os.path.join(args.output_dir, old_ckpt_name))
+            else:
+                remove_no = train_util.get_remove_step_no(args, global_step)
+                if remove_no is not None:
+                    old_ckpt_name = train_util.get_step_ckpt_name(args, ext, remove_no)
+                    _remove_old_ema_file(os.path.join(args.output_dir, old_ckpt_name))
 
     train_util.save_sd_model_on_epoch_end_or_stepwise_common(
         args,
@@ -393,10 +518,14 @@ def sample_images(
     text_encoding_strategy,
     sample_prompts_te_outputs=None,
     prompt_replacement=None,
+    ema=None,
+    filename_suffix="",
 ):
     """Generate sample images during training.
 
     This is a simplified sampler for Anima - it generates images using the current model state.
+    If ema is provided and --ema_sample is enabled, also generates EMA samples with '_ema' suffix.
+    EMA sampling is skipped at step 0 (EMA hasn't accumulated yet).
     """
     if steps == 0:
         if not args.sample_at_first:
@@ -435,6 +564,7 @@ def sample_images(
     except Exception:
         pass
 
+    # Sample with training weights
     with torch.no_grad(), accelerator.autocast():
         for prompt_dict in prompts:
             dit.prepare_block_swap_before_forward()
@@ -452,7 +582,33 @@ def sample_images(
                 steps,
                 sample_prompts_te_outputs,
                 prompt_replacement,
+                filename_suffix=filename_suffix,
             )
+
+    # Sample with EMA weights (if enabled and not step 0)
+    if ema is not None and getattr(args, 'ema_sample', False) and steps != 0:
+        logger.info(f"Generating EMA sample images at step {steps}")
+        ema_suffix = filename_suffix + "_ema"
+        with ema.average_parameters():
+            with torch.no_grad(), accelerator.autocast():
+                for prompt_dict in prompts:
+                    dit.prepare_block_swap_before_forward()
+                    _sample_image_inference(
+                        accelerator,
+                        args,
+                        dit,
+                        text_encoder,
+                        vae,
+                        tokenize_strategy,
+                        text_encoding_strategy,
+                        save_dir,
+                        prompt_dict,
+                        epoch,
+                        steps,
+                        sample_prompts_te_outputs,
+                        prompt_replacement,
+                        filename_suffix=ema_suffix,
+                    )
 
     # Restore RNG state
     torch.set_rng_state(rng_state)
@@ -477,8 +633,9 @@ def _sample_image_inference(
     steps,
     sample_prompts_te_outputs,
     prompt_replacement,
+    filename_suffix="",
 ):
-    """Generate a single sample image."""
+    """Generate a single sample image. filename_suffix is appended to the output filename (e.g. '_ema')."""
     prompt = prompt_dict.get("prompt", "")
     negative_prompt = prompt_dict.get("negative_prompt", "")
     sample_steps = prompt_dict.get("sample_steps", 30)
@@ -604,7 +761,7 @@ def _sample_image_inference(
     num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
     seed_suffix = "" if seed is None else f"_{seed}"
     i = prompt_dict.get("enum", 0)
-    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
+    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}{filename_suffix}.png"
     image.save(os.path.join(save_dir, img_filename))
 
     # Log to wandb if enabled

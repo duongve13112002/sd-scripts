@@ -237,6 +237,23 @@ class NetworkTrainer:
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoder, unet):
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizers[0], text_encoder, unet)
 
+    # EMA (Exponential Moving Average) hooks — override in subclass to enable
+    def create_ema(self, args, accelerator, unet, network):
+        """Create EMA instance. Override in subclass to enable EMA. Return None to disable."""
+        return None
+
+    def save_ema_network(self, ema, ckpt_file, network, save_dtype, metadata):
+        """Save EMA version of network weights. Override in subclass."""
+        pass
+
+    def remove_ema_network(self, old_ckpt_file):
+        """Remove old EMA network file during checkpoint cleanup. Override in subclass."""
+        pass
+
+    def sample_ema_images(self, ema, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoder, unet):
+        """Sample images using EMA weights. Override in subclass."""
+        pass
+
     # region SD/SDXL
 
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
@@ -1292,6 +1309,9 @@ class NetworkTrainer:
         else:
             on_step_start_for_network = lambda *args, **kwargs: None
 
+        # Create EMA if subclass supports it
+        ema = self.create_ema(args, accelerator, unet, network)
+
         # function for saving/removing
         def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
             os.makedirs(args.output_dir, exist_ok=True)
@@ -1310,11 +1330,18 @@ class NetworkTrainer:
             if args.huggingface_repo_id is not None:
                 huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
+            # Save EMA network if available
+            if ema is not None:
+                self.save_ema_network(ema, ckpt_file, unwrapped_nw, save_dtype, metadata_to_save)
+
         def remove_model(old_ckpt_name):
             old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
             if os.path.exists(old_ckpt_file):
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
+            # Also remove EMA file if exists
+            if ema is not None:
+                self.remove_ema_network(old_ckpt_file)
 
         # if text_encoder is not needed for training, delete it to save memory.
         # TODO this can be automated after SDXL sample prompt cache is implemented
@@ -1487,10 +1514,17 @@ class NetworkTrainer:
                     progress_bar.update(1)
                     global_step += 1
 
+                    # Update EMA after optimizer step
+                    if ema is not None:
+                        ema.update()
+
                     optimizer_eval_fn()
                     self.sample_images(
                         accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
                     )
+                    # EMA sampling (subclass handles the logic)
+                    if ema is not None:
+                        self.sample_ema_images(ema, accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
                     progress_bar.unpause()
 
                     # 指定ステップごとにモデルを保存
@@ -1705,6 +1739,8 @@ class NetworkTrainer:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
             self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+            if ema is not None:
+                self.sample_ema_images(ema, accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
             progress_bar.unpause()
             optimizer_train_fn()
 

@@ -419,6 +419,157 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             # prepare for next forward: because backward pass is not called, we need to prepare it here
             accelerator.unwrap_model(unet).prepare_block_swap_before_forward()
 
+    # ==================== EMA overrides ====================
+
+    def create_ema(self, args, accelerator, unet, network):
+        """Create EMA for LoRA network's trainable parameters."""
+        if not getattr(args, 'ema', False):
+            return None
+
+        from library.ema import ExponentialMovingAverage
+
+        ema_device_str = getattr(args, 'ema_device', 'cuda')
+        ema_device = accelerator.device if ema_device_str == "cuda" else torch.device("cpu")
+
+        # Get trainable params from unwrapped network (LoRA weights)
+        unwrapped_nw = accelerator.unwrap_model(network)
+        ema_params = [p for p in unwrapped_nw.parameters() if p.requires_grad]
+
+        if len(ema_params) == 0:
+            logger.warning("No trainable parameters found in network, skipping EMA creation")
+            return None
+
+        ema_use_feedback = getattr(args, 'ema_use_feedback', False)
+        ema_param_multiplier = getattr(args, 'ema_param_multiplier', 1.0)
+
+        # Validate multi-GPU compatibility
+        if accelerator.num_processes > 1:
+            if ema_use_feedback:
+                raise ValueError(
+                    "--ema_use_feedback is not compatible with multi-GPU DDP training. "
+                    "It modifies parameters only on the main process, causing param desync across GPUs."
+                )
+            if ema_param_multiplier != 1.0:
+                raise ValueError(
+                    "--ema_param_multiplier != 1.0 is not compatible with multi-GPU DDP training. "
+                    "It modifies parameters only on the main process, causing param desync across GPUs."
+                )
+
+        ema = ExponentialMovingAverage(
+            parameters=ema_params,
+            decay=args.ema_decay,
+            use_num_updates=getattr(args, 'ema_use_num_updates', False),
+            use_feedback=ema_use_feedback,
+            param_multiplier=ema_param_multiplier,
+            device=ema_device,
+            accelerator=accelerator,
+        )
+
+        # Resume EMA from saved LoRA file
+        ema_resume_path = getattr(args, 'ema_resume_path', None)
+        if ema_resume_path is not None and accelerator.is_main_process:
+            from safetensors.torch import load_file as load_safetensors
+            accelerator.print(f"Loading EMA LoRA weights from {ema_resume_path}")
+            ema_sd = load_safetensors(ema_resume_path, device="cpu")
+
+            # Map state dict values to shadow params in parameter order
+            param_name_to_idx = {}
+            trainable_idx = 0
+            for name, p in unwrapped_nw.named_parameters():
+                if p.requires_grad:
+                    param_name_to_idx[name] = trainable_idx
+                    trainable_idx += 1
+
+            loaded_count = 0
+            for name, idx in param_name_to_idx.items():
+                if name in ema_sd:
+                    ema.shadow_params[idx] = ema_sd[name].to(ema_device)
+                    loaded_count += 1
+                else:
+                    accelerator.print(f"  Warning: EMA key not found: {name}")
+            accelerator.print(f"Loaded EMA LoRA weights: {loaded_count}/{len(param_name_to_idx)} params")
+
+            del ema_sd
+            clean_memory_on_device(accelerator.device)
+
+        accelerator.print(
+            f"EMA enabled for LoRA: decay={args.ema_decay}, device={ema_device_str}, "
+            f"params={sum(p.numel() for p in ema_params):,}"
+        )
+
+        return ema
+
+    def save_ema_network(self, ema, ckpt_file, network, save_dtype, metadata):
+        """Save EMA version of LoRA network weights.
+
+        Temporarily swaps network's trainable params with EMA shadow params,
+        saves using network's own save_weights method (same format), then restores.
+        """
+        if ema is None or ema.shadow_params is None:
+            return
+
+        ema_file = anima_train_utils._get_ema_filename(ckpt_file)
+
+        # Temporarily replace trainable params with EMA shadow values
+        original_params = []
+        trainable_idx = 0
+        for name, p in network.named_parameters():
+            if p.requires_grad:
+                original_params.append(p.data.clone())
+                p.data.copy_(ema.shadow_params[trainable_idx].data.to(p.device))
+                trainable_idx += 1
+
+        # Save using the network's standard save method (same format as normal LoRA)
+        try:
+            network.save_weights(ema_file, save_dtype, metadata)
+            logger.info(f"EMA LoRA saved: {ema_file}")
+        finally:
+            # Restore original params (always, even if save fails)
+            trainable_idx = 0
+            for name, p in network.named_parameters():
+                if p.requires_grad:
+                    p.data.copy_(original_params[trainable_idx])
+                    trainable_idx += 1
+            del original_params
+
+    def remove_ema_network(self, old_ckpt_file):
+        """Remove old EMA LoRA file."""
+        anima_train_utils._remove_old_ema_file(old_ckpt_file)
+
+    def sample_ema_images(self, ema, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoder, unet):
+        """Sample images using EMA weights for LoRA network."""
+        if ema is None or not getattr(args, 'ema_sample', False):
+            return
+        # Skip at step 0 (EMA hasn't accumulated yet)
+        if global_step == 0:
+            return
+
+        logger.info(f"Generating EMA sample images at step {global_step}")
+        text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+        te = self.get_models_for_text_encoding(args, accelerator, text_encoders)
+        qwen3_te = te[0] if te is not None else None
+
+        text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
+        tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+
+        # Use EMA weights for sampling
+        with ema.average_parameters():
+            anima_train_utils.sample_images(
+                accelerator,
+                args,
+                epoch,
+                global_step,
+                unet,
+                vae,
+                qwen3_te,
+                tokenize_strategy,
+                text_encoding_strategy,
+                self.sample_prompts_te_outputs,
+                filename_suffix="_ema",
+            )
+
+    # ==================== End EMA overrides ====================
+
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
