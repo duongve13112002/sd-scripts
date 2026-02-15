@@ -213,6 +213,22 @@ def train(args):
                                 tokenize_strategy, [qwen3_text_encoder], tokens_and_masks
                             )
 
+        # Pre-compute unconditional embeddings for guidance loss (before freeing text encoder)
+        if getattr(args, 'do_guidance_loss', False):
+            logger.info("Pre-computing unconditional (empty prompt) embeddings for guidance loss...")
+            with accelerator.autocast(), torch.no_grad():
+                uncond_tokens = tokenize_strategy.tokenize("")
+                uncond_te_outputs = text_encoding_strategy.encode_tokens(
+                    tokenize_strategy, [qwen3_text_encoder], uncond_tokens
+                )
+                # uncond_te_outputs = [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask]
+                # Move to CPU to save VRAM, will be moved to device during training
+                uncond_prompt_embeds = uncond_te_outputs[0].cpu()
+                uncond_attn_mask = uncond_te_outputs[1].cpu()
+                uncond_t5_input_ids = uncond_te_outputs[2].cpu()
+                uncond_t5_attn_mask = uncond_te_outputs[3].cpu()
+            logger.info("Unconditional embeddings cached for guidance loss.")
+
         accelerator.wait_for_everyone()
 
         # free text encoder memory
@@ -451,6 +467,20 @@ def train(args):
     if not cache_latents and vae is not None:
         vae.to(accelerator.device, dtype=weight_dtype)
 
+    # Pre-compute unconditional embeddings for guidance loss (non-cached text encoder path)
+    if getattr(args, 'do_guidance_loss', False) and not args.cache_text_encoder_outputs:
+        logger.info("Pre-computing unconditional (empty prompt) embeddings for guidance loss...")
+        with accelerator.autocast(), torch.no_grad():
+            uncond_tokens = tokenize_strategy.tokenize("")
+            uncond_te_outputs = text_encoding_strategy.encode_tokens(
+                tokenize_strategy, [qwen3_text_encoder], uncond_tokens
+            )
+            uncond_prompt_embeds = uncond_te_outputs[0].cpu()
+            uncond_attn_mask = uncond_te_outputs[1].cpu()
+            uncond_t5_input_ids = uncond_te_outputs[2].cpu()
+            uncond_t5_attn_mask = uncond_te_outputs[3].cpu()
+        logger.info("Unconditional embeddings cached for guidance loss.")
+
     if args.full_fp16:
         train_util.patch_accelerator_for_fp16_training(accelerator)
 
@@ -641,6 +671,58 @@ def train(args):
 
                 # Compute loss (rectified flow: target = noise - latents)
                 target = noise - latents
+
+                # Guidance Loss: modify target with CFG-guided unconditional prediction
+                if getattr(args, 'do_guidance_loss', False):
+                    with torch.no_grad():
+                        # Expand unconditional embeddings to match batch size
+                        batch_size = noisy_model_input.shape[0]
+                        uc_embeds = uncond_prompt_embeds.repeat(batch_size, 1, 1).to(accelerator.device, dtype=dit_weight_dtype)
+                        uc_mask = uncond_attn_mask.repeat(batch_size, 1).to(accelerator.device)
+                        uc_t5_ids = uncond_t5_input_ids.repeat(batch_size, 1).to(accelerator.device, dtype=torch.long)
+                        uc_t5_mask = uncond_t5_attn_mask.repeat(batch_size, 1).to(accelerator.device)
+
+                        # Reset block swap state for second forward pass
+                        if is_swapping_blocks:
+                            accelerator.unwrap_model(dit).prepare_block_swap_before_forward()
+
+                        # Forward pass with empty prompt (unconditional prediction)
+                        with accelerator.autocast():
+                            uncond_pred = dit(
+                                noisy_model_input,
+                                timesteps,
+                                uc_embeds,
+                                padding_mask=padding_mask,
+                                source_attention_mask=uc_mask,
+                                t5_input_ids=uc_t5_ids,
+                                t5_attn_mask=uc_t5_mask,
+                            )
+                        uncond_pred = uncond_pred.squeeze(2)
+
+                        # CFG-Zero*: auto-reduce CFG at high noise levels
+                        if getattr(args, 'guidance_loss_cfg_zero', False):
+                            positive_flat = target.view(batch_size, -1)
+                            negative_flat = uncond_pred.view(batch_size, -1)
+                            dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
+                            squared_norm = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
+                            alpha = (dot_product / squared_norm).view(batch_size, 1, 1, 1)
+                        else:
+                            alpha = 1.0
+
+                        # Apply CFG to target
+                        guidance_scale = getattr(args, 'guidance_loss_scale', 1.0)
+                        uncond_pred = uncond_pred * alpha
+                        target = uncond_pred + guidance_scale * (target - uncond_pred)
+
+                        # Reset block swap state for backward pass of main forward
+                        if is_swapping_blocks:
+                            accelerator.unwrap_model(dit).prepare_block_swap_before_forward()
+
+                # Differential Guidance: amplify target in regions where model is most wrong
+                if getattr(args, 'do_differential_guidance', False):
+                    with torch.no_grad():
+                        diff_scale = getattr(args, 'differential_guidance_scale', 3.0)
+                        target = model_pred + diff_scale * (target - model_pred)
 
                 # Weighting
                 weighting = anima_train_utils.compute_loss_weighting_for_anima(

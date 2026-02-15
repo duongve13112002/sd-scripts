@@ -204,6 +204,22 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                                 )
                 self.sample_prompts_te_outputs = sample_prompts_te_outputs
 
+            # Pre-compute unconditional embeddings for guidance loss (before freeing text encoder)
+            if getattr(args, 'do_guidance_loss', False):
+                logger.info("Pre-computing unconditional embeddings for guidance loss...")
+                tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+                text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
+                with accelerator.autocast(), torch.no_grad():
+                    uncond_tokens = tokenize_strategy.tokenize("")
+                    uncond_te_outputs = text_encoding_strategy.encode_tokens(
+                        tokenize_strategy, text_encoders, uncond_tokens
+                    )
+                    self._uncond_prompt_embeds = uncond_te_outputs[0].cpu()
+                    self._uncond_attn_mask = uncond_te_outputs[1].cpu()
+                    self._uncond_t5_input_ids = uncond_te_outputs[2].cpu()
+                    self._uncond_t5_attn_mask = uncond_te_outputs[3].cpu()
+                logger.info("Unconditional embeddings cached for guidance loss.")
+
             accelerator.wait_for_everyone()
 
             # move text encoder back to cpu
@@ -218,6 +234,22 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         else:
             # move text encoder to device for encoding during training/validation
             text_encoders[0].to(accelerator.device)
+
+            # Pre-compute unconditional embeddings for guidance loss (non-cached path)
+            if getattr(args, 'do_guidance_loss', False):
+                logger.info("Pre-computing unconditional embeddings for guidance loss...")
+                tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+                text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
+                with accelerator.autocast(), torch.no_grad():
+                    uncond_tokens = tokenize_strategy.tokenize("")
+                    uncond_te_outputs = text_encoding_strategy.encode_tokens(
+                        tokenize_strategy, text_encoders, uncond_tokens
+                    )
+                    self._uncond_prompt_embeds = uncond_te_outputs[0].cpu()
+                    self._uncond_attn_mask = uncond_te_outputs[1].cpu()
+                    self._uncond_t5_input_ids = uncond_te_outputs[2].cpu()
+                    self._uncond_t5_attn_mask = uncond_te_outputs[3].cpu()
+                logger.info("Unconditional embeddings cached for guidance loss.")
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]  # compatibility
@@ -316,6 +348,57 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         # Rectified flow target: noise - latents
         target = noise - latents
+
+        # Guidance Loss: modify target with CFG-guided unconditional prediction
+        if getattr(args, 'do_guidance_loss', False) and hasattr(self, '_uncond_prompt_embeds'):
+            with torch.no_grad():
+                batch_size = noisy_model_input.shape[0]
+                uc_embeds = self._uncond_prompt_embeds.repeat(batch_size, 1, 1).to(accelerator.device, dtype=weight_dtype)
+                uc_mask = self._uncond_attn_mask.repeat(batch_size, 1).to(accelerator.device)
+                uc_t5_ids = self._uncond_t5_input_ids.repeat(batch_size, 1).to(accelerator.device, dtype=torch.long)
+                uc_t5_mask = self._uncond_t5_attn_mask.repeat(batch_size, 1).to(accelerator.device)
+
+                # Reset block swap state for second forward pass
+                if hasattr(anima, 'prepare_block_swap_before_forward'):
+                    anima.prepare_block_swap_before_forward()
+
+                # Forward pass with empty prompt (unconditional prediction)
+                with accelerator.autocast():
+                    uncond_pred = anima(
+                        noisy_model_input,
+                        timesteps,
+                        uc_embeds,
+                        padding_mask=padding_mask,
+                        target_input_ids=uc_t5_ids,
+                        target_attention_mask=uc_t5_mask,
+                        source_attention_mask=uc_mask,
+                    )
+                uncond_pred = uncond_pred.squeeze(2)
+
+                # CFG-Zero*: auto-reduce CFG at high noise levels
+                if getattr(args, 'guidance_loss_cfg_zero', False):
+                    positive_flat = target.view(batch_size, -1)
+                    negative_flat = uncond_pred.view(batch_size, -1)
+                    dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
+                    squared_norm = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
+                    alpha = (dot_product / squared_norm).view(batch_size, 1, 1, 1)
+                else:
+                    alpha = 1.0
+
+                # Apply CFG to target
+                guidance_scale = getattr(args, 'guidance_loss_scale', 1.0)
+                uncond_pred = uncond_pred * alpha
+                target = uncond_pred + guidance_scale * (target - uncond_pred)
+
+                # Reset block swap state for backward pass of main forward
+                if hasattr(anima, 'prepare_block_swap_before_forward'):
+                    anima.prepare_block_swap_before_forward()
+
+        # Differential Guidance: amplify target in regions where model is most wrong
+        if getattr(args, 'do_differential_guidance', False):
+            with torch.no_grad():
+                diff_scale = getattr(args, 'differential_guidance_scale', 3.0)
+                target = model_pred + diff_scale * (target - model_pred)
 
         # Loss weighting
         weighting = anima_train_utils.compute_loss_weighting_for_anima(weighting_scheme=args.weighting_scheme, sigmas=sigmas)

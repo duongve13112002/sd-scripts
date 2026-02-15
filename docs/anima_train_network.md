@@ -281,6 +281,37 @@ accelerate launch --num_cpu_threads_per_process 1 anima_train_network.py \
 * For multi-GPU training, `--ema_use_feedback` and `--ema_param_multiplier` (when not `1.0`) are not supported and will raise an error. Other EMA features work correctly with multi-GPU DDP.
 * The EMA model file uses the same format as the regular model. For LoRA, the EMA LoRA file can be loaded the same way as a regular LoRA file.
 
+#### Guidance Loss (Guidance Distillation) / ガイダンスロス（ガイダンス蒸留）
+
+Guidance Loss bakes the effect of Classifier-Free Guidance (CFG) directly into the model during training. Instead of needing CFG at inference time, the model learns to produce guided outputs on its own. This requires an extra unconditional forward pass per training step, which roughly doubles the compute cost.
+
+**How it works:** For each training step, the model runs an additional forward pass with an empty prompt to get the unconditional prediction. The training target is then modified using the CFG formula: `target = uncond_pred + scale * (target - uncond_pred)`. The model learns to match this CFG-modified target directly.
+
+* `--do_guidance_loss`
+  - Enable guidance loss. Requires pre-computing empty prompt embeddings before training (done automatically). Roughly doubles compute per step due to the extra forward pass.
+* `--guidance_loss_scale=<float>` (default: `1.0`)
+  - CFG scale for the guidance loss target computation. Higher values produce stronger guidance baked into the model. A value of `1.0` means no CFG effect (target is unchanged). Typical values: `1.0` to `5.0`.
+* `--guidance_loss_cfg_zero`
+  - Use CFG-Zero\* for guidance loss. Automatically reduces the CFG effect at high noise levels (early timesteps) by computing a projection coefficient `alpha = dot(target, uncond_pred) / ||uncond_pred||^2`. This prevents artifacts that can occur when applying strong CFG at high noise levels.
+
+#### Differential Guidance / ディファレンシャルガイダンス
+
+Differential Guidance amplifies the training loss in regions where the model's prediction differs most from the ground truth. It acts as an adaptive per-pixel gradient scaling, pushing the model harder where it is most wrong.
+
+**How it works:** The target is extrapolated beyond the ground truth using the formula: `target = model_pred + scale * (target - model_pred)`. This amplifies the error by `scale^2` in the loss. Areas where the model already predicts well are barely affected, while areas with large errors receive much stronger gradients.
+
+* `--do_differential_guidance`
+  - Enable differential guidance. No extra forward pass needed (uses the existing model prediction).
+* `--differential_guidance_scale=<float>` (default: `3.0`)
+  - Scale factor for differential guidance. Higher values amplify the loss more where the model is wrong. The effective loss is scaled by approximately `scale^2` (e.g., scale=3.0 means ~9x loss amplification for large errors). Typical values: `1.0` to `5.0`.
+
+**Combining Guidance Loss and Differential Guidance:** Both features can be used together. When combined, Guidance Loss is applied first (modifying the target with CFG), then Differential Guidance amplifies the error relative to that CFG-modified target. This means the model learns to produce CFG-guided outputs while receiving stronger gradients where it struggles most.
+
+**Notes:**
+* Guidance Loss is compatible with `--blocks_to_swap` (block swap state is automatically reset for the extra forward pass).
+* Differential Guidance adds no extra compute cost since it only modifies the target tensor.
+* Both features work with both full fine-tuning (`anima_train.py`) and LoRA training (`anima_train_network.py`).
+
 #### Incompatible or Unsupported Options / 非互換・非サポートの引数
 
 * `--v2`, `--v_parameterization`, `--clip_skip` - Options for Stable Diffusion v1/v2 that are not used for Anima training.
@@ -350,6 +381,32 @@ EMAはモデルパラメータのシャドウコピーを維持し、学習ス�
 * `--ema_device=cpu`を使用すると、EMAシャドウパラメータがGPU VRAMではなくシステムRAMに保存されます。大規模モデルでVRAMが限られている場合に有用です。
 * マルチGPU学習では、`--ema_use_feedback`および`--ema_param_multiplier`（`1.0`以外）はサポートされておらず、エラーが発生します。
 * EMAモデルファイルは通常のモデルと同じフォーマットです。LoRAの場合、EMA LoRAファイルは通常のLoRAファイルと同じ方法で読み込めます。
+
+#### ガイダンスロス（ガイダンス蒸留）
+
+ガイダンスロスは、Classifier-Free Guidance (CFG) の効果を学習中にモデルに直接組み込みます。推論時にCFGを使用する必要がなくなり、モデルがガイダンスされた出力を単独で生成できるようになります。各学習ステップで追加の無条件フォワードパスが必要なため、計算コストはおよそ2倍になります。
+
+**仕組み:** 各学習ステップで、空プロンプトによる追加のフォワードパスを実行して無条件予測を取得します。学習ターゲットはCFGの式で修正されます：`target = uncond_pred + scale * (target - uncond_pred)`。モデルはこのCFG修正済みターゲットに直接マッチするよう学習します。
+
+* `--do_guidance_loss` - ガイダンスロスを有効にします。空プロンプトの埋め込みを事前に計算する必要があります（自動で行われます）。追加のフォワードパスにより、ステップあたりの計算量がおよそ2倍になります。
+* `--guidance_loss_scale` - ガイダンスロスのターゲット計算に使用するCFGスケール。デフォルト`1.0`。高い値ほど強いガイダンスがモデルに組み込まれます。`1.0`ではCFG効果なし（ターゲット変更なし）。
+* `--guidance_loss_cfg_zero` - ガイダンスロスにCFG-Zero\*を使用します。高ノイズレベル（早期タイムステップ）でCFG効果を自動的に低減し、強いCFGによるアーティファクトを防止します。
+
+#### ディファレンシャルガイダンス
+
+ディファレンシャルガイダンスは、モデルの予測がグラウンドトゥルースと最も異なる領域で学習損失を増幅します。適応的なピクセル単位の勾配スケーリングとして機能し、モデルが最も間違っている箇所をより強く修正します。
+
+**仕組み:** ターゲットはグラウンドトゥルースを超えて外挿されます：`target = model_pred + scale * (target - model_pred)`。これにより、損失は`scale^2`倍に増幅されます。モデルが既に正確に予測している領域はほとんど影響を受けず、大きな誤差がある領域にはより強い勾配が適用されます。
+
+* `--do_differential_guidance` - ディファレンシャルガイダンスを有効にします。追加のフォワードパスは不要です。
+* `--differential_guidance_scale` - ディファレンシャルガイダンスのスケール係数。デフォルト`3.0`。高い値ほど、モデルが間違っている箇所の損失をより増幅します。実効的な損失はおよそ`scale^2`倍にスケールされます。
+
+**ガイダンスロスとディファレンシャルガイダンスの併用:** 両機能は同時に使用できます。併用時は、最初にガイダンスロスが適用され（CFGでターゲットを修正）、次にディファレンシャルガイダンスがそのCFG修正済みターゲットに対する誤差を増幅します。
+
+**注意:**
+* ガイダンスロスは`--blocks_to_swap`と互換性があります（追加のフォワードパスのためにブロックスワップ状態が自動的にリセットされます）。
+* ディファレンシャルガイダンスはターゲットテンソルを修正するだけなので、追加の計算コストはありません。
+* 両機能ともフルファインチューニング（`anima_train.py`）とLoRA学習（`anima_train_network.py`）の両方で動作します。
 
 #### 非互換・非サポートの引数
 

@@ -184,6 +184,41 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         "EMA samples are saved with '_ema' suffix. Requires --ema.",
     )
 
+    # Guidance Loss (guidance distillation) arguments
+    parser.add_argument(
+        "--do_guidance_loss",
+        action="store_true",
+        help="Enable guidance loss (guidance distillation). Bakes CFG effect into the model by training "
+        "with CFG-modified targets. Requires an extra forward pass per step (doubles compute).",
+    )
+    parser.add_argument(
+        "--guidance_loss_scale",
+        type=float,
+        default=1.0,
+        help="CFG scale for guidance loss target computation. (default: 1.0)",
+    )
+    parser.add_argument(
+        "--guidance_loss_cfg_zero",
+        action="store_true",
+        help="Use CFG-Zero* for guidance loss. Automatically reduces CFG effect at high noise levels "
+        "to prevent artifacts. Based on the CFG-Zero* paper.",
+    )
+
+    # Differential Guidance arguments
+    parser.add_argument(
+        "--do_differential_guidance",
+        action="store_true",
+        help="Enable differential guidance. Amplifies loss in regions where the model prediction "
+        "differs most from ground truth, producing adaptive per-pixel gradient scaling.",
+    )
+    parser.add_argument(
+        "--differential_guidance_scale",
+        type=float,
+        default=3.0,
+        help="Scale factor for differential guidance. Higher values amplify the loss more "
+        "where the model is wrong. Effective loss is scaled by scale^2. (default: 3.0)",
+    )
+
 
 # Loss weighting
 
