@@ -118,8 +118,7 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                 return False
             if "t5_out" not in npz:
                 return False
-            if "txt_ids" not in npz:
-                return False
+            # txt_ids is no longer required (always zeros, reconstructed on-the-fly)
             if "t5_attn_mask" not in npz:
                 return False
             if "apply_t5_attn_mask" not in npz:
@@ -137,10 +136,17 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         data = np.load(npz_path)
         l_pooled = data["l_pooled"]
         t5_out = data["t5_out"]
-        txt_ids = data["txt_ids"]
         t5_attn_mask = data["t5_attn_mask"]
         # apply_t5_attn_mask should be same as self.apply_t5_attn_mask
-        return [l_pooled, t5_out, txt_ids, t5_attn_mask]
+
+        # trim t5 output to actual token length for efficiency (handles old full-length caches too)
+        actual_len = int(t5_attn_mask.sum())
+        if actual_len > 0 and actual_len < t5_out.shape[0]:
+            t5_out = t5_out[:actual_len]
+            t5_attn_mask = t5_attn_mask[:actual_len]
+
+        # txt_ids are always zeros, return None to reconstruct on-the-fly during training
+        return [l_pooled, t5_out, None, t5_attn_mask]
 
     def cache_batch_outputs(
         self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, infos: List
@@ -165,33 +171,36 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             l_pooled = l_pooled.float()
         if t5_out.dtype == torch.bfloat16:
             t5_out = t5_out.float()
-        if txt_ids.dtype == torch.bfloat16:
-            txt_ids = txt_ids.float()
+        # txt_ids are always zeros and can be reconstructed, skip converting/caching them
 
         l_pooled = l_pooled.cpu().numpy()
         t5_out = t5_out.cpu().numpy()
-        txt_ids = txt_ids.cpu().numpy()
         t5_attn_mask = tokens_and_masks[2].cpu().numpy()
 
         for i, info in enumerate(infos):
             l_pooled_i = l_pooled[i]
             t5_out_i = t5_out[i]
-            txt_ids_i = txt_ids[i]
             t5_attn_mask_i = t5_attn_mask[i]
             apply_t5_attn_mask_i = self.apply_t5_attn_mask
 
+            # trim t5 output to actual token length to reduce disk/memory usage and attention compute
+            actual_len = int(t5_attn_mask_i.sum())
+            if actual_len > 0 and actual_len < t5_out_i.shape[0]:
+                t5_out_i = t5_out_i[:actual_len]
+                t5_attn_mask_i = t5_attn_mask_i[:actual_len]
+
             if self.cache_to_disk:
+                # txt_ids are always zeros, skip saving to reduce cache size
                 np.savez(
                     info.text_encoder_outputs_npz,
                     l_pooled=l_pooled_i,
                     t5_out=t5_out_i,
-                    txt_ids=txt_ids_i,
                     t5_attn_mask=t5_attn_mask_i,
                     apply_t5_attn_mask=apply_t5_attn_mask_i,
                 )
             else:
-                # it's fine that attn mask is not None. it's overwritten before calling the model if necessary
-                info.text_encoder_outputs = (l_pooled_i, t5_out_i, txt_ids_i, t5_attn_mask_i)
+                # txt_ids=None: reconstructed as zeros on-the-fly during training
+                info.text_encoder_outputs = (l_pooled_i, t5_out_i, None, t5_attn_mask_i)
 
 
 class FluxLatentsCachingStrategy(LatentsCachingStrategy):

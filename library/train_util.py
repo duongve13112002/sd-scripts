@@ -1758,6 +1758,10 @@ class BaseDataset(torch.utils.data.Dataset):
             result = []
             for i in range(len(tensors_list[0])):
                 tensors = [x[i] for x in tensors_list]
+                if tensors[0] is None:
+                    # all elements are None (e.g. txt_ids removed from cache)
+                    result.append(None)
+                    continue
                 if tensors[0].ndim == 0:
                     # scalar value: e.g. ocr mask
                     result.append(torch.stack([converter(x[i]) for x in tensors_list]))

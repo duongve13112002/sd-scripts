@@ -357,6 +357,11 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         # Predict the noise residual
         l_pooled, t5_out, txt_ids, t5_attn_mask = text_encoder_conds
+
+        # txt_ids are always zeros; reconstruct on-the-fly when not provided (trimmed cache optimization)
+        if txt_ids is None:
+            txt_ids = torch.zeros(t5_out.shape[0], t5_out.shape[1], 3, device=accelerator.device)
+
         if not args.apply_t5_attn_mask:
             t5_attn_mask = None
 
