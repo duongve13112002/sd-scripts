@@ -2,6 +2,7 @@ import argparse
 import datetime
 import gc
 from importlib.util import find_spec
+import math
 import random
 import os
 import time
@@ -110,6 +111,20 @@ def parse_args() -> argparse.Namespace:
         "--lycoris", action="store_true", help=f"use lycoris for inference{'' if lycoris_available else ' (not available)'}"
     )
 
+    # Tiled diffusion
+    parser.add_argument(
+        "--tiled_diffusion", action="store_true",
+        help="Enable MultiDiffusion-style tiled generation for VRAM reduction at high resolutions",
+    )
+    parser.add_argument(
+        "--tile_size", type=int, default=128,
+        help="Tile size in latent space (default 128 = 1024px). Must be even.",
+    )
+    parser.add_argument(
+        "--tile_overlap", type=int, default=16,
+        help="Overlap between tiles in latent space (default 16 = 128px). Must be even and < tile_size.",
+    )
+
     # arguments for batch and interactive modes
     parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: read prompts from console")
@@ -129,6 +144,14 @@ def parse_args() -> argparse.Namespace:
 
     if args.attn_mode == "sdpa":
         args.attn_mode = "torch"  # backward compatibility
+
+    if args.tiled_diffusion:
+        if args.tile_size % 2 != 0:
+            raise ValueError(f"--tile_size must be even (patch_spatial=2 requires it), got {args.tile_size}")
+        if args.tile_overlap % 2 != 0:
+            raise ValueError(f"--tile_overlap must be even (patch_spatial=2 requires it), got {args.tile_overlap}")
+        if args.tile_overlap >= args.tile_size:
+            raise ValueError(f"--tile_overlap ({args.tile_overlap}) must be less than --tile_size ({args.tile_size})")
 
     return args
 
@@ -501,6 +524,177 @@ def generate(
     return generate_body(args, anima, context, context_null, device, seed)
 
 
+def compute_tile_positions(h_latent: int, w_latent: int, tile_size: int, overlap: int) -> List[Tuple[int, int]]:
+    """Compute (y, x) start positions for overlapping tiles covering the full latent grid."""
+    stride = tile_size - overlap
+    positions = []
+    y = 0
+    while y < h_latent:
+        if y + tile_size > h_latent:
+            y = h_latent - tile_size  # clamp last row
+        x = 0
+        while x < w_latent:
+            if x + tile_size > w_latent:
+                x = w_latent - tile_size  # clamp last column
+            positions.append((y, x))
+            if x + tile_size >= w_latent:
+                break
+            x += stride
+        if y + tile_size >= h_latent:
+            break
+        y += stride
+    return positions
+
+
+def create_tile_blend_weight(
+    tile_h: int,
+    tile_w: int,
+    overlap: int,
+    y: int,
+    x: int,
+    h_latent: int,
+    w_latent: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Create a (1, 1, 1, tile_h, tile_w) blend weight with cosine ramps on overlapping edges."""
+    weight = torch.ones(1, 1, 1, tile_h, tile_w, device=device, dtype=dtype)
+    if overlap <= 0:
+        return weight
+
+    # Precompute cosine ramp: (1 - cos(pi * t)) / 2 for t in [0, 1]
+    ramp = torch.linspace(0.0, 1.0, overlap, device=device, dtype=dtype)
+    ramp = (1.0 - torch.cos(math.pi * ramp)) / 2.0
+
+    # Top edge
+    if y > 0:
+        weight[:, :, :, :overlap, :] *= ramp[None, None, None, :, None]
+    # Bottom edge
+    if y + tile_h < h_latent:
+        weight[:, :, :, -overlap:, :] *= ramp.flip(0)[None, None, None, :, None]
+    # Left edge
+    if x > 0:
+        weight[:, :, :, :, :overlap] *= ramp[None, None, None, None, :]
+    # Right edge
+    if x + tile_w < w_latent:
+        weight[:, :, :, :, -overlap:] *= ramp.flip(0)[None, None, None, None, :]
+
+    return weight
+
+
+def generate_body_tiled(
+    args: Union[argparse.Namespace, SimpleNamespace],
+    anima: anima_models.Anima,
+    context: Dict[str, Any],
+    context_null: Optional[Dict[str, Any]],
+    device: torch.device,
+    seed: int,
+) -> torch.Tensor:
+    """MultiDiffusion-style tiled denoising for high-resolution generation."""
+    seed_g = torch.Generator(device="cpu")
+    seed_g.manual_seed(seed)
+
+    height, width = check_inputs(args)
+    logger.info(f"Tiled diffusion: image size {height}x{width} (HxW), infer_steps: {args.infer_steps}")
+
+    tile_size = args.tile_size
+    overlap = args.tile_overlap
+    patch_spatial = anima.patch_spatial
+
+    embed = context["embed"][0].to(device, dtype=torch.bfloat16)
+    if context_null is None:
+        context_null = context
+    negative_embed = context_null["embed"][0].to(device, dtype=torch.bfloat16)
+
+    num_channels_latents = anima_models.Anima.LATENT_CHANNELS
+    h_latent = height // 8
+    w_latent = width // 8
+    shape = (1, num_channels_latents, 1, h_latent, w_latent)
+    latents = randn_tensor(shape, generator=seed_g, device=device, dtype=torch.bfloat16)
+
+    # Warn if extra_per_block_abs_pos_emb is enabled (offset support not implemented for LearnablePosEmbAxis)
+    if anima.extra_per_block_abs_pos_emb:
+        logger.warning(
+            "Tiled diffusion with extra_per_block_abs_pos_emb is not fully supported — "
+            "LearnablePosEmbAxis does not use spatial offsets. Results may have artifacts."
+        )
+
+    # Compute tile positions and precompute blend weights
+    positions = compute_tile_positions(h_latent, w_latent, tile_size, overlap)
+    logger.info(f"Tiled diffusion: {len(positions)} tiles, tile_size={tile_size}, overlap={overlap}")
+
+    blend_weights = {}
+    for (y, x) in positions:
+        tile_h = min(tile_size, h_latent - y)
+        tile_w = min(tile_size, w_latent - x)
+        blend_weights[(y, x)] = create_tile_blend_weight(tile_h, tile_w, overlap, y, x, h_latent, w_latent, device, torch.bfloat16)
+
+    embed = embed.to(torch.bfloat16)
+    negative_embed = negative_embed.to(torch.bfloat16)
+
+    timesteps, sigmas = hunyuan_image_utils.get_timesteps_sigmas(args.infer_steps, args.flow_shift, device)
+    timesteps /= 1000
+    timesteps = timesteps.to(device, dtype=torch.bfloat16)
+
+    do_cfg = args.guidance_scale != 1.0
+    autocast_enabled = args.fp8
+
+    with tqdm(total=len(timesteps), desc="Denoising steps (tiled)") as pbar:
+        for i, t in enumerate(timesteps):
+            t_expand = t.expand(latents.shape[0])
+
+            noise_acc = torch.zeros_like(latents)
+            weight_acc = torch.zeros(1, 1, 1, h_latent, w_latent, device=device, dtype=torch.bfloat16)
+
+            if do_cfg:
+                uncond_noise_acc = torch.zeros_like(latents)
+                uncond_weight_acc = torch.zeros(1, 1, 1, h_latent, w_latent, device=device, dtype=torch.bfloat16)
+
+            for (y, x) in positions:
+                tile_h = min(tile_size, h_latent - y)
+                tile_w = min(tile_size, w_latent - x)
+                tile_latent = latents[:, :, :, y : y + tile_h, x : x + tile_w]
+                tile_padding_mask = torch.zeros(1, 1, tile_h, tile_w, dtype=torch.bfloat16, device=device)
+
+                h_off = y // patch_spatial
+                w_off = x // patch_spatial
+
+                bw = blend_weights[(y, x)]
+
+                # Conditional pass
+                if anima.blocks_to_swap:
+                    anima.prepare_block_swap_before_forward()
+                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                    tile_pred = anima(
+                        tile_latent, t_expand, embed,
+                        padding_mask=tile_padding_mask, h_offset=h_off, w_offset=w_off,
+                    )
+                noise_acc[:, :, :, y : y + tile_h, x : x + tile_w] += tile_pred * bw
+                weight_acc[:, :, :, y : y + tile_h, x : x + tile_w] += bw
+
+                # Unconditional pass
+                if do_cfg:
+                    if anima.blocks_to_swap:
+                        anima.prepare_block_swap_before_forward()
+                    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+                        uncond_tile_pred = anima(
+                            tile_latent, t_expand, negative_embed,
+                            padding_mask=tile_padding_mask, h_offset=h_off, w_offset=w_off,
+                        )
+                    uncond_noise_acc[:, :, :, y : y + tile_h, x : x + tile_w] += uncond_tile_pred * bw
+                    uncond_weight_acc[:, :, :, y : y + tile_h, x : x + tile_w] += bw
+
+            noise_pred = noise_acc / weight_acc
+            if do_cfg:
+                uncond_noise_pred = uncond_noise_acc / uncond_weight_acc
+                noise_pred = uncond_noise_pred + args.guidance_scale * (noise_pred - uncond_noise_pred)
+
+            latents = hunyuan_image_utils.step(latents, noise_pred, sigmas, i).to(latents.dtype)
+            pbar.update()
+
+    return latents
+
+
 def generate_body(
     args: Union[argparse.Namespace, SimpleNamespace],
     anima: anima_models.Anima,
@@ -515,6 +709,13 @@ def generate_body(
     seed_g.manual_seed(seed)
 
     height, width = check_inputs(args)
+
+    # Dispatch to tiled diffusion if enabled and latent exceeds tile size
+    h_latent = height // 8
+    w_latent = width // 8
+    if getattr(args, "tiled_diffusion", False) and (h_latent > args.tile_size or w_latent > args.tile_size):
+        return generate_body_tiled(args, anima, context, context_null, device, seed)
+
     logger.info(f"Image size: {height}x{width} (HxW), infer_steps: {args.infer_steps}")
 
     # image generation ######

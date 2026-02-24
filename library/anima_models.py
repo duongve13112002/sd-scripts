@@ -500,6 +500,66 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
 
         return rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d").float()
 
+    def generate_embeddings_with_offset(
+        self,
+        B_T_H_W_C: torch.Size,
+        h_offset: int = 0,
+        w_offset: int = 0,
+        fps: Optional[torch.Tensor] = None,
+        h_ntk_factor: Optional[float] = None,
+        w_ntk_factor: Optional[float] = None,
+        t_ntk_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Generate RoPE embeddings with spatial offsets for tiled diffusion."""
+        h_ntk_factor = h_ntk_factor if h_ntk_factor is not None else self.h_ntk_factor
+        w_ntk_factor = w_ntk_factor if w_ntk_factor is not None else self.w_ntk_factor
+        t_ntk_factor = t_ntk_factor if t_ntk_factor is not None else self.t_ntk_factor
+
+        h_theta = 10000.0 * h_ntk_factor
+        w_theta = 10000.0 * w_ntk_factor
+        t_theta = 10000.0 * t_ntk_factor
+
+        h_spatial_freqs = 1.0 / (h_theta**self.dim_spatial_range)
+        w_spatial_freqs = 1.0 / (w_theta**self.dim_spatial_range)
+        temporal_freqs = 1.0 / (t_theta**self.dim_temporal_range)
+
+        B, T, H, W, _ = B_T_H_W_C
+        assert h_offset + H <= self.max_h, (
+            f"h_offset + H ({h_offset + H}) exceeds max_h ({self.max_h})"
+        )
+        assert w_offset + W <= self.max_w, (
+            f"w_offset + W ({w_offset + W}) exceeds max_w ({self.max_w})"
+        )
+        half_emb_h = torch.outer(self.seq[h_offset : h_offset + H], h_spatial_freqs)
+        half_emb_w = torch.outer(self.seq[w_offset : w_offset + W], w_spatial_freqs)
+
+        # Temporal dimension always starts at 0
+        if self.enable_fps_modulation:
+            uniform_fps = (fps is None) or (fps.min() == fps.max())
+            assert (
+                uniform_fps or B == 1 or T == 1
+            ), "For video batch, batch size should be 1 for non-uniform fps. For image batch, T should be 1"
+
+            if fps is None:
+                assert T == 1, "T should be 1 for image batch."
+                half_emb_t = torch.outer(self.seq[:T], temporal_freqs)
+            else:
+                half_emb_t = torch.outer(self.seq[:T] / fps[:1] * self.base_fps, temporal_freqs)
+        else:
+            half_emb_t = torch.outer(self.seq[:T], temporal_freqs)
+
+        em_T_H_W_D = torch.cat(
+            [
+                repeat(half_emb_t, "t d -> t h w d", h=H, w=W),
+                repeat(half_emb_h, "h d -> t h w d", t=T, w=W),
+                repeat(half_emb_w, "w d -> t h w d", t=T, h=H),
+            ]
+            * 2,
+            dim=-1,
+        )
+
+        return rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d").float()
+
     @property
     def seq_dim(self) -> int:
         return 0
@@ -1206,6 +1266,8 @@ class Anima(nn.Module):
         x_B_C_T_H_W: torch.Tensor,
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        h_offset: int = 0,
+        w_offset: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         from torchvision import transforms
 
@@ -1222,7 +1284,13 @@ class Anima(nn.Module):
             extra_pos_emb = None
 
         if "rope" in self.pos_emb_cls.lower():
-            return x_B_T_H_W_D, self.pos_embedder(x_B_T_H_W_D, fps=fps), extra_pos_emb
+            if h_offset != 0 or w_offset != 0:
+                rope_emb = self.pos_embedder.generate_embeddings_with_offset(
+                    x_B_T_H_W_D.shape, h_offset=h_offset, w_offset=w_offset, fps=fps
+                )
+            else:
+                rope_emb = self.pos_embedder(x_B_T_H_W_D, fps=fps)
+            return x_B_T_H_W_D, rope_emb, extra_pos_emb
         x_B_T_H_W_D = x_B_T_H_W_D + self.pos_embedder(x_B_T_H_W_D)
 
         return x_B_T_H_W_D, None, extra_pos_emb
@@ -1287,6 +1355,8 @@ class Anima(nn.Module):
         source_attention_mask: Optional[torch.Tensor] = None,
         t5_input_ids: Optional[torch.Tensor] = None,
         t5_attn_mask: Optional[torch.Tensor] = None,
+        h_offset: int = 0,
+        w_offset: int = 0,
     ) -> torch.Tensor:
         """
         Args:
@@ -1298,6 +1368,8 @@ class Anima(nn.Module):
             source_attention_mask: Optional attention mask for Qwen3 embeddings (used with LLM adapter)
             t5_input_ids: Optional T5 token IDs (triggers LLM adapter when provided)
             t5_attn_mask: Optional T5 attention mask
+            h_offset: Height offset in patched space for tiled diffusion RoPE
+            w_offset: Width offset in patched space for tiled diffusion RoPE
         """
         # Run LLM adapter inside forward for correct DDP gradient synchronization
         if t5_input_ids is not None and self.use_llm_adapter and hasattr(self, "llm_adapter"):
@@ -1314,6 +1386,8 @@ class Anima(nn.Module):
             x_B_C_T_H_W,
             fps=fps,
             padding_mask=padding_mask,
+            h_offset=h_offset,
+            w_offset=w_offset,
         )
 
         if timesteps_B_T.ndim == 1:
@@ -1352,10 +1426,14 @@ class Anima(nn.Module):
         target_input_ids: Optional[torch.Tensor] = None,
         target_attention_mask: Optional[torch.Tensor] = None,
         source_attention_mask: Optional[torch.Tensor] = None,
+        h_offset: int = 0,
+        w_offset: int = 0,
         **kwargs,
     ) -> torch.Tensor:
         context = self._preprocess_text_embeds(context, target_input_ids, target_attention_mask, source_attention_mask)
-        return self.forward_mini_train_dit(x, timesteps, context, fps=fps, padding_mask=padding_mask, **kwargs)
+        return self.forward_mini_train_dit(
+            x, timesteps, context, fps=fps, padding_mask=padding_mask, h_offset=h_offset, w_offset=w_offset, **kwargs
+        )
 
     def _preprocess_text_embeds(
         self, source_hidden_states, target_input_ids, target_attention_mask=None, source_attention_mask=None
