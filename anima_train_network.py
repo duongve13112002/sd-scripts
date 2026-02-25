@@ -34,6 +34,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.sample_prompts_te_outputs = None
+        self._padding_mask_cache = {}
 
     def assert_extra_args(
         self,
@@ -55,6 +56,14 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             assert train_dataset_group.is_text_encoder_output_cacheable(
                 cache_supports_dropout=True
             ), "when caching Text Encoder output, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
+            if getattr(args, "cache_llm_adapter_outputs", False):
+                # Adapter output caching is only valid when the adapter is frozen (no LoRA on adapter).
+                if args.network_args is not None and any("train_llm_adapter" in a and "true" in a.lower() for a in args.network_args):
+                    raise ValueError("--cache_llm_adapter_outputs is incompatible with --network_args train_llm_adapter=True")
+        else:
+            assert not getattr(
+                args, "cache_llm_adapter_outputs", False
+            ), "--cache_llm_adapter_outputs requires --cache_text_encoder_outputs"
 
         assert (
             args.network_train_unet_only or not args.cache_text_encoder_outputs
@@ -163,7 +172,11 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def get_text_encoder_outputs_caching_strategy(self, args):
         if args.cache_text_encoder_outputs:
             return strategy_anima.AnimaTextEncoderOutputsCachingStrategy(
-                args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, False
+                args.cache_text_encoder_outputs_to_disk,
+                args.text_encoder_batch_size,
+                args.skip_cache_check,
+                False,
+                cache_llm_adapter_outputs=getattr(args, "cache_llm_adapter_outputs", False),
             )
         return None
 
@@ -181,8 +194,17 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             logger.info("move text encoder to gpu")
             text_encoders[0].to(accelerator.device)
 
+            llm_adapter = None
+            models_for_cache = text_encoders
+            if getattr(args, "cache_llm_adapter_outputs", False):
+                logger.info("Loading LLM adapter for caching outputs...")
+                llm_adapter = anima_utils.load_llm_adapter(
+                    args.pretrained_model_name_or_path, args.llm_adapter_path, dtype=weight_dtype, device=accelerator.device
+                )
+                models_for_cache = [text_encoders[0], llm_adapter]
+
             with accelerator.autocast():
-                dataset.new_cache_text_encoder_outputs(text_encoders, accelerator)
+                dataset.new_cache_text_encoder_outputs(models_for_cache, accelerator)
 
             # cache sample prompts
             if args.sample_prompts is not None:
@@ -205,6 +227,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 self.sample_prompts_te_outputs = sample_prompts_te_outputs
 
             accelerator.wait_for_everyone()
+
+            if llm_adapter is not None:
+                logger.info("move LLM adapter back to cpu")
+                llm_adapter.to("cpu")
 
             # move text encoder back to cpu
             logger.info("move text encoder back to cpu")
@@ -281,37 +307,60 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Gradient checkpointing support
         if args.gradient_checkpointing:
             noisy_model_input.requires_grad_(True)
-            for t in text_encoder_conds:
-                if t is not None and t.dtype.is_floating_point:
-                    t.requires_grad_(True)
+            # Only require grads for text conditions when training the text encoder.
+            # When using cached text encoder outputs (or training DiT-only), requiring grads here adds backward work.
+            if self.is_train_text_encoder(args) and not args.cache_text_encoder_outputs:
+                for t in text_encoder_conds:
+                    if t is not None and t.dtype.is_floating_point:
+                        t.requires_grad_(True)
 
         # Unpack text encoder conditions
-        prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_conds
+        crossattn_emb = None
+        if len(text_encoder_conds) == 5:
+            prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, crossattn_emb = text_encoder_conds
+        else:
+            prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_conds
 
-        # Move to device
-        prompt_embeds = prompt_embeds.to(accelerator.device, dtype=weight_dtype)
-        attn_mask = attn_mask.to(accelerator.device)
-        t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
-        t5_attn_mask = t5_attn_mask.to(accelerator.device)
+        if crossattn_emb is None:
+            # Move to device
+            prompt_embeds = prompt_embeds.to(accelerator.device, dtype=weight_dtype)
+            attn_mask = attn_mask.to(accelerator.device)
+            t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
+            t5_attn_mask = t5_attn_mask.to(accelerator.device)
+        else:
+            crossattn_emb = crossattn_emb.to(accelerator.device, dtype=weight_dtype)
 
         # Create padding mask
         bs = latents.shape[0]
         h_latent = latents.shape[-2]
         w_latent = latents.shape[-1]
-        padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=weight_dtype, device=accelerator.device)
+        padding_mask_key = (bs, h_latent, w_latent, weight_dtype, accelerator.device)
+        padding_mask = self._padding_mask_cache.get(padding_mask_key)
+        if padding_mask is None:
+            padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=weight_dtype, device=accelerator.device)
+            self._padding_mask_cache[padding_mask_key] = padding_mask
 
         # Call model
         noisy_model_input = noisy_model_input.unsqueeze(2)  # 4D to 5D, [B, C, H, W] -> [B, C, 1, H, W]
         with torch.set_grad_enabled(is_train), accelerator.autocast():
-            model_pred = anima(
-                noisy_model_input,
-                timesteps,
-                prompt_embeds,
-                padding_mask=padding_mask,
-                target_input_ids=t5_input_ids,
-                target_attention_mask=t5_attn_mask,
-                source_attention_mask=attn_mask,
-            )
+            if crossattn_emb is None:
+                model_pred = anima(
+                    noisy_model_input,
+                    timesteps,
+                    prompt_embeds,
+                    padding_mask=padding_mask,
+                    target_input_ids=t5_input_ids,
+                    target_attention_mask=t5_attn_mask,
+                    source_attention_mask=attn_mask,
+                )
+            else:
+                # crossattn_emb is already in target (T5-compatible) space
+                model_pred = anima(
+                    noisy_model_input,
+                    timesteps,
+                    crossattn_emb,
+                    padding_mask=padding_mask,
+                )
         model_pred = model_pred.squeeze(2)  # 5D to 4D, [B, C, 1, H, W] -> [B, C, H, W]
 
         # Rectified flow target: noise - latents

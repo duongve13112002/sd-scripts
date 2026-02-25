@@ -92,6 +92,12 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         help="Maximum token length for T5 tokenizer (default: 512)",
     )
     parser.add_argument(
+        "--cache_llm_adapter_outputs",
+        action="store_true",
+        help="Cache LLM adapter outputs (cross-attention embeddings) in the text encoder cache and skip running the adapter during training. "
+        "Requires --cache_text_encoder_outputs. Incompatible with LoRA training for the LLM adapter.",
+    )
+    parser.add_argument(
         "--discrete_flow_shift",
         type=float,
         default=1.0,

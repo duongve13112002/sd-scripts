@@ -1269,13 +1269,21 @@ class Anima(nn.Module):
         h_offset: int = 0,
         w_offset: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        from torchvision import transforms
-
         if self.concat_padding_mask:
-            padding_mask = transforms.functional.resize(
-                padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
-            )
-            x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1)
+            if padding_mask is None:
+                raise ValueError("padding_mask must be provided when concat_padding_mask is True")
+            if padding_mask.ndim != 4:
+                raise ValueError(f"padding_mask must be 4D (B, 1, H, W), got shape {tuple(padding_mask.shape)}")
+            if padding_mask.shape[-2:] != x_B_C_T_H_W.shape[-2:]:
+                from torchvision import transforms
+
+                padding_mask = transforms.functional.resize(
+                    padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
+                )
+
+            # (B, 1, H, W) -> (B, 1, T, H, W) without materializing a repeated tensor
+            padding_mask_B_1_T_H_W = padding_mask.unsqueeze(2).expand(-1, -1, x_B_C_T_H_W.shape[2], -1, -1)
+            x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, padding_mask_B_1_T_H_W], dim=1)
         x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)
 
         if self.extra_per_block_abs_pos_emb:

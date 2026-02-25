@@ -55,14 +55,14 @@ class AnimaTokenizeStrategy(TokenizeStrategy):
 
         # Tokenize with Qwen3
         qwen3_encoding = self.qwen3_tokenizer.batch_encode_plus(
-            text, return_tensors="pt", truncation=True, padding="max_length", max_length=self.qwen3_max_length
+            text, return_tensors="pt", truncation=True, padding=True, max_length=self.qwen3_max_length
         )
         qwen3_input_ids = qwen3_encoding["input_ids"]
         qwen3_attn_mask = qwen3_encoding["attention_mask"]
 
         # Tokenize with T5 (for LLM Adapter target tokens)
         t5_encoding = self.t5_tokenizer.batch_encode_plus(
-            text, return_tensors="pt", truncation=True, padding="max_length", max_length=self.t5_max_length
+            text, return_tensors="pt", truncation=True, padding=True, max_length=self.t5_max_length
         )
         t5_input_ids = t5_encoding["input_ids"]
         t5_attn_mask = t5_encoding["attention_mask"]
@@ -112,6 +112,7 @@ class AnimaTextEncodingStrategy(TextEncodingStrategy):
         attn_mask: torch.Tensor,
         t5_input_ids: torch.Tensor,
         t5_attn_mask: torch.Tensor,
+        crossattn_emb: Optional[torch.Tensor] = None,
         caption_dropout_rates: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         """Apply dropout to cached text encoder outputs.
@@ -121,7 +122,10 @@ class AnimaTextEncodingStrategy(TextEncodingStrategy):
         to match diffusion-pipe-main behavior.
         """
         if caption_dropout_rates is None or torch.all(caption_dropout_rates == 0.0).item():
-            return [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask]
+            outputs = [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask]
+            if crossattn_emb is not None:
+                outputs.append(crossattn_emb)
+            return outputs
 
         # Clone to avoid in-place modification of cached tensors
         prompt_embeds = prompt_embeds.clone()
@@ -131,6 +135,8 @@ class AnimaTextEncodingStrategy(TextEncodingStrategy):
             t5_input_ids = t5_input_ids.clone()
         if t5_attn_mask is not None:
             t5_attn_mask = t5_attn_mask.clone()
+        if crossattn_emb is not None:
+            crossattn_emb = crossattn_emb.clone()
 
         for i in range(prompt_embeds.shape[0]):
             if random.random() < caption_dropout_rates[i].item():
@@ -144,8 +150,13 @@ class AnimaTextEncodingStrategy(TextEncodingStrategy):
                 if t5_attn_mask is not None:
                     t5_attn_mask[i, 0] = 1
                     t5_attn_mask[i, 1:] = 0
+                if crossattn_emb is not None:
+                    crossattn_emb[i] = 0
 
-        return [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask]
+        outputs = [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask]
+        if crossattn_emb is not None:
+            outputs.append(crossattn_emb)
+        return outputs
 
 
 class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
@@ -162,8 +173,10 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         batch_size: int,
         skip_disk_cache_validity_check: bool,
         is_partial: bool = False,
+        cache_llm_adapter_outputs: bool = False,
     ) -> None:
         super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial)
+        self.cache_llm_adapter_outputs = cache_llm_adapter_outputs
 
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         return os.path.splitext(image_abs_path)[0] + self.ANIMA_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX
@@ -186,6 +199,8 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                 return False
             if "t5_attn_mask" not in npz:
                 return False
+            if self.cache_llm_adapter_outputs and "crossattn_emb" not in npz:
+                return False
             if "caption_dropout_rate" not in npz:
                 return False
         except Exception as e:
@@ -200,8 +215,11 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         attn_mask = data["attn_mask"]
         t5_input_ids = data["t5_input_ids"]
         t5_attn_mask = data["t5_attn_mask"]
+        crossattn_emb = data["crossattn_emb"] if self.cache_llm_adapter_outputs and "crossattn_emb" in data else None
         caption_dropout_rate = data["caption_dropout_rate"]
-        return [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, caption_dropout_rate]
+        if crossattn_emb is None:
+            return [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, caption_dropout_rate]
+        return [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, crossattn_emb, caption_dropout_rate]
 
     def cache_batch_outputs(
         self,
@@ -219,6 +237,25 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                 tokenize_strategy, models, tokens_and_masks
             )
 
+        crossattn_emb = None
+        if self.cache_llm_adapter_outputs:
+            if len(models) < 2 or models[1] is None:
+                raise ValueError("cache_llm_adapter_outputs requires llm_adapter model to be passed as models[1]")
+            llm_adapter = models[1]
+            adapter_device = llm_adapter.device
+            prompt_embeds_for_adapter = prompt_embeds.to(adapter_device)
+            attn_mask_for_adapter = attn_mask.to(adapter_device) if attn_mask is not None else None
+            t5_input_ids_for_adapter = t5_input_ids.to(adapter_device, dtype=torch.long)
+            t5_attn_mask_for_adapter = t5_attn_mask.to(adapter_device)
+            with torch.no_grad():
+                crossattn_emb = llm_adapter(
+                    source_hidden_states=prompt_embeds_for_adapter,
+                    target_input_ids=t5_input_ids_for_adapter,
+                    target_attention_mask=t5_attn_mask_for_adapter,
+                    source_attention_mask=attn_mask_for_adapter,
+                )
+                crossattn_emb[~t5_attn_mask_for_adapter.bool()] = 0
+
         # Convert to numpy for caching
         if prompt_embeds.dtype == torch.bfloat16:
             prompt_embeds = prompt_embeds.float()
@@ -226,12 +263,29 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         attn_mask = attn_mask.cpu().numpy()
         t5_input_ids = t5_input_ids.cpu().numpy().astype(np.int32)
         t5_attn_mask = t5_attn_mask.cpu().numpy().astype(np.int32)
+        if crossattn_emb is not None:
+            if crossattn_emb.dtype == torch.bfloat16:
+                crossattn_emb = crossattn_emb.float()
+            crossattn_emb = crossattn_emb.cpu().numpy()
 
         for i, info in enumerate(infos):
             prompt_embeds_i = prompt_embeds[i]
             attn_mask_i = attn_mask[i]
             t5_input_ids_i = t5_input_ids[i]
             t5_attn_mask_i = t5_attn_mask[i]
+            crossattn_emb_i = crossattn_emb[i] if crossattn_emb is not None else None
+
+            # Trim padding to reduce cache size and training compute.
+            # Cache files are per-sample, so variable-length arrays are supported.
+            # Keep at least 1 token to avoid empty tensors.
+            qwen3_len = max(1, int(attn_mask_i.sum()))
+            t5_len = max(1, int(t5_attn_mask_i.sum()))
+            prompt_embeds_i = prompt_embeds_i[:qwen3_len]
+            attn_mask_i = attn_mask_i[:qwen3_len]
+            t5_input_ids_i = t5_input_ids_i[:t5_len]
+            t5_attn_mask_i = t5_attn_mask_i[:t5_len]
+            if crossattn_emb_i is not None:
+                crossattn_emb_i = crossattn_emb_i[:t5_len]
             caption_dropout_rate = torch.tensor(info.caption_dropout_rate, dtype=torch.float32)
 
             if self.cache_to_disk:
@@ -241,10 +295,21 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                     attn_mask=attn_mask_i,
                     t5_input_ids=t5_input_ids_i,
                     t5_attn_mask=t5_attn_mask_i,
+                    **({"crossattn_emb": crossattn_emb_i} if crossattn_emb_i is not None else {}),
                     caption_dropout_rate=caption_dropout_rate,
                 )
             else:
-                info.text_encoder_outputs = (prompt_embeds_i, attn_mask_i, t5_input_ids_i, t5_attn_mask_i, caption_dropout_rate)
+                if crossattn_emb_i is None:
+                    info.text_encoder_outputs = (prompt_embeds_i, attn_mask_i, t5_input_ids_i, t5_attn_mask_i, caption_dropout_rate)
+                else:
+                    info.text_encoder_outputs = (
+                        prompt_embeds_i,
+                        attn_mask_i,
+                        t5_input_ids_i,
+                        t5_attn_mask_i,
+                        crossattn_emb_i,
+                        caption_dropout_rate,
+                    )
 
 
 class AnimaLatentsCachingStrategy(LatentsCachingStrategy):

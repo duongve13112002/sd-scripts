@@ -3967,6 +3967,17 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         action="store_true",
         help="persistent DataLoader workers (useful for reduce time gap between epoch, but may use more memory) / DataLoader のワーカーを持続させる (エポック間の時間差を少なくするのに有効だが、より多くのメモリを消費する可能性がある)",
     )
+    parser.add_argument(
+        "--dataloader_pin_memory",
+        action="store_true",
+        help="pin DataLoader memory (can speed up host->GPU transfer, may use more RAM) / DataLoaderでpin_memoryを有効にする（GPUへの転送が速くなる場合がありますがRAM使用量が増える可能性があります）",
+    )
+    parser.add_argument(
+        "--dataloader_prefetch_factor",
+        type=int,
+        default=2,
+        help="prefetch_factor for DataLoader workers (only valid when num_workers>0) / DataLoaderワーカーのprefetch_factor（num_workers>0のときのみ有効）",
+    )
     parser.add_argument("--seed", type=int, default=None, help="random seed for training / 学習時の乱数のseed")
     parser.add_argument(
         "--gradient_checkpointing", action="store_true", help="enable gradient checkpointing / gradient checkpointingを有効にする"

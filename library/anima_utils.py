@@ -4,6 +4,7 @@ import os
 from typing import Dict, List, Optional, Union
 import torch
 from safetensors.torch import load_file, save_file
+from safetensors import safe_open
 from accelerate.utils import set_module_tensor_to_device  # kept for potential future use
 from accelerate import init_empty_weights
 
@@ -146,6 +147,71 @@ def load_anima_model(
     logger.info(f"Loaded DiT model from {dit_path}, unexpected missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
 
     return model
+
+
+def load_llm_adapter(
+    dit_path: Optional[str],
+    llm_adapter_path: Optional[str] = None,
+    dtype: torch.dtype = torch.bfloat16,
+    device: Union[str, torch.device] = "cpu",
+) -> anima_models.LLMAdapter:
+    """Load only the LLM adapter weights.
+
+    This is useful for caching adapter outputs without loading the full DiT model.
+
+    Args:
+        dit_path: Path to the DiT safetensors file (used when llm_adapter_path is None).
+        llm_adapter_path: Optional path to a separate adapter safetensors file.
+        dtype: Target dtype.
+        device: Target device.
+    """
+    weight_path = llm_adapter_path or dit_path
+    if weight_path is None:
+        raise ValueError("Either dit_path or llm_adapter_path must be provided")
+    if os.path.splitext(weight_path)[1].lower() != ".safetensors":
+        raise ValueError(f"LLM adapter weights must be a .safetensors file, got: {weight_path}")
+
+    # Detect prefix style
+    with safe_open(weight_path, framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+
+    if any(k.startswith("llm_adapter.") for k in keys):
+        prefix = "llm_adapter."
+    elif any(k.startswith("net.llm_adapter.") for k in keys):
+        prefix = "net.llm_adapter."
+    else:
+        prefix = None  # adapter-only weights file (no prefix)
+
+    state_dict: Dict[str, torch.Tensor] = {}
+    with safe_open(weight_path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            if prefix is not None:
+                if not key.startswith(prefix):
+                    continue
+                stripped = key[len(prefix) :]
+            else:
+                stripped = key
+            state_dict[stripped] = f.get_tensor(key)
+
+    if prefix is not None and len(state_dict) == 0:
+        raise ValueError(f"No llm_adapter weights found in {weight_path}")
+
+    adapter = anima_models.LLMAdapter(
+        source_dim=1024,
+        target_dim=1024,
+        model_dim=1024,
+        num_layers=6,
+        self_attn=True,
+    )
+    missing, unexpected = adapter.load_state_dict(state_dict, strict=False)
+    if unexpected:
+        logger.warning(f"Unexpected keys in LLM adapter weights: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
+    if missing:
+        logger.warning(f"Missing keys in LLM adapter weights: {missing[:10]}{'...' if len(missing) > 10 else ''}")
+
+    adapter.to(device=device, dtype=dtype)
+    adapter.eval()
+    return adapter
 
 
 def load_qwen3_tokenizer(qwen3_path: str):

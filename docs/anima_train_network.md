@@ -219,6 +219,8 @@ For LoRA training, use `network_reg_lrs` in `--network_args` instead. See [Secti
   - Cache Qwen3 text encoder outputs to reduce VRAM usage. Recommended when not training text encoder LoRA.
 * `--cache_text_encoder_outputs_to_disk`
   - Cache text encoder outputs to disk. Auto-enables `--cache_text_encoder_outputs`.
+* `--cache_llm_adapter_outputs`
+  - Cache LLM adapter outputs (cross-attention embeddings) in the text encoder cache and skip running the adapter during training. Requires `--cache_text_encoder_outputs`. Incompatible with LLM adapter LoRA (`--network_args "train_llm_adapter=True"`).
 * `--cache_latents`, `--cache_latents_to_disk`
   - Cache Qwen-Image VAE latent outputs.
 * `--vae_chunk_size=<integer>`
@@ -274,6 +276,7 @@ LoRA学習の場合は、`--network_args`の`network_reg_lrs`を使用してく�
 * `--blocks_to_swap` - TransformerブロックをCPUとGPUでスワップしてVRAMを節約。`--cpu_offload_checkpointing`および`--unsloth_offload_checkpointing`とは併用できません。
 * `--unsloth_offload_checkpointing` - 非同期転送でアクティベーションをCPU RAMにオフロード。`--cpu_offload_checkpointing`および`--blocks_to_swap`とは併用できません。
 * `--cache_text_encoder_outputs` - Qwen3の出力をキャッシュしてメモリ使用量を削減。
+* `--cache_llm_adapter_outputs` - LLM Adapterの出力（クロスアテンション埋め込み）をText Encoderキャッシュに保存し、学習中にAdapterの計算をスキップします。`--cache_text_encoder_outputs`が必要です。LLM AdapterのLoRA学習（`--network_args "train_llm_adapter=True"`）とは併用できません。
 * `--cache_latents`, `--cache_latents_to_disk` - Qwen-Image VAEの出力をキャッシュ。
 * `--vae_chunk_size` - Qwen-Image VAEのチャンク処理サイズ。メモリ使用量を削減しますが速度が低下します。デフォルトはチャンク処理なし。
 * `--vae_disable_cache` - Qwen-Image VAEの内部キャッシュを無効化してメモリ使用量を削減します。
