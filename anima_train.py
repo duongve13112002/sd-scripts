@@ -20,6 +20,7 @@ from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
 init_ipex()
 
 from accelerate.utils import set_seed
+from ema import ExponentialMovingAverage
 from library import deepspeed_utils, anima_models, anima_train_utils, anima_utils, strategy_base, strategy_anima, sai_model_spec
 
 import library.train_util as train_util
@@ -401,6 +402,64 @@ def train(args):
 
                     parameter.register_post_accumulate_grad_hook(create_grad_hook(param_group))
 
+    # Initialize EMA
+    ema = None
+    if args.ema and train_dit:
+        ema_device_str = args.ema_device
+        ema_device = accelerator.device if ema_device_str == "gpu" else torch.device("cpu")
+
+        unwrapped_dit = accelerator.unwrap_model(dit)
+        ema_params = [p for p in unwrapped_dit.parameters() if p.requires_grad]
+
+        if accelerator.num_processes > 1:
+            if args.ema_use_feedback:
+                raise ValueError("--ema_use_feedback is not compatible with multi-GPU DDP training.")
+            if args.ema_param_multiplier != 1.0:
+                raise ValueError("--ema_param_multiplier != 1.0 is not compatible with multi-GPU DDP training.")
+
+        ema = ExponentialMovingAverage(
+            parameters=ema_params,
+            decay=args.ema_decay,
+            use_num_updates=args.ema_use_num_updates,
+            use_feedback=args.ema_use_feedback,
+            param_multiplier=args.ema_param_multiplier,
+            device=ema_device,
+            accelerator=accelerator,
+        )
+
+        # Resume EMA from saved model file
+        ema_resume_path = args.ema_resume_path
+        if ema_resume_path is not None and accelerator.is_main_process:
+            from safetensors.torch import load_file as load_safetensors
+
+            accelerator.print(f"Loading EMA weights from {ema_resume_path}")
+            ema_sd = load_safetensors(ema_resume_path, device="cpu")
+            ema_sd_clean = {}
+            for k, v in ema_sd.items():
+                clean_key = k[4:] if k.startswith("net.") else k
+                ema_sd_clean[clean_key] = v
+
+            param_name_to_idx = {}
+            trainable_idx = 0
+            for name, p in unwrapped_dit.named_parameters():
+                if p.requires_grad:
+                    param_name_to_idx[name] = trainable_idx
+                    trainable_idx += 1
+
+            for name, idx in param_name_to_idx.items():
+                if name in ema_sd_clean:
+                    ema.shadow_params[idx] = ema_sd_clean[name].to(ema_device)
+                else:
+                    accelerator.print(f"  Warning: EMA key not found: {name}")
+            accelerator.print(f"Loaded EMA weights: {len(param_name_to_idx)} params")
+            del ema_sd, ema_sd_clean
+            clean_memory_on_device(accelerator.device)
+
+        accelerator.print(
+            f"EMA enabled: decay={args.ema_decay}, device={ema_device_str}, "
+            f"params={sum(p.numel() for p in ema_params):,}"
+        )
+
     # Training loop
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
@@ -604,6 +663,9 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
 
+                if ema is not None:
+                    ema.update()
+
                 optimizer_eval_fn()
                 anima_train_utils.sample_images(
                     accelerator,
@@ -631,6 +693,7 @@ def train(args):
                             num_train_epochs,
                             global_step,
                             accelerator.unwrap_model(dit) if train_dit else None,
+                            ema=ema,
                         )
                 optimizer_train_fn()
 
@@ -671,6 +734,7 @@ def train(args):
                     num_train_epochs,
                     global_step,
                     accelerator.unwrap_model(dit) if train_dit else None,
+                    ema=ema,
                 )
 
         anima_train_utils.sample_images(
@@ -705,6 +769,7 @@ def train(args):
             epoch,
             global_step,
             dit,
+            ema=ema,
         )
         logger.info("model saved.")
 

@@ -1446,17 +1446,27 @@ class Anima(nn.Module):
     def _preprocess_text_embeds(
         self, source_hidden_states, target_input_ids, target_attention_mask=None, source_attention_mask=None
     ):
-        if target_input_ids is not None:
+        if target_input_ids is not None and target_input_ids.shape[-1] > 0:
             context = self.llm_adapter(
                 source_hidden_states,
                 target_input_ids,
                 target_attention_mask=target_attention_mask,
                 source_attention_mask=source_attention_mask,
             )
-            context[~target_attention_mask.bool()] = 0  # zero out padding tokens
-            return context
+            crossattn_mask = target_attention_mask
+            context[~crossattn_mask.bool()] = 0  # zero out padding tokens
         else:
-            return source_hidden_states
+            # Adapter skipped (pre-cached output or no adapter) — use source mask
+            context = source_hidden_states
+            crossattn_mask = source_attention_mask
+
+        # Trim padded positions for efficient cross-attention across all DiT blocks
+        if crossattn_mask is not None:
+            max_actual_len = int(crossattn_mask.sum(dim=-1).max().item())
+            if 0 < max_actual_len < context.shape[1]:
+                context = context[:, :max_actual_len]
+
+        return context
 
 
 # LLM Adapter: Bridges Qwen3 embeddings to T5-compatible space
