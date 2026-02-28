@@ -242,7 +242,7 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             if len(models) < 2 or models[1] is None:
                 raise ValueError("cache_llm_adapter_outputs requires llm_adapter model to be passed as models[1]")
             llm_adapter = models[1]
-            adapter_device = llm_adapter.device
+            adapter_device = next(llm_adapter.parameters()).device
             prompt_embeds_for_adapter = prompt_embeds.to(adapter_device)
             attn_mask_for_adapter = attn_mask.to(adapter_device) if attn_mask is not None else None
             t5_input_ids_for_adapter = t5_input_ids.to(adapter_device, dtype=torch.long)

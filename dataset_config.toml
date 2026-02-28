@@ -1,0 +1,12 @@
+[general]
+shuffle_caption = false
+caption_extension = '.txt'
+keep_tokens = 3
+
+[[datasets]]
+resolution = 1024
+batch_size = 1
+
+  [[datasets.subsets]]
+  image_dir = './train_datasets'
+  num_repeats = 1
