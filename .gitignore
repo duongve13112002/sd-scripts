@@ -12,3 +12,5 @@ GEMINI.md
 .claude
 .gemini
 MagicMock
+datasets/
+train_datasets/
