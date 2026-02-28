@@ -16,13 +16,19 @@ References:
 """
 
 import argparse
+from collections import defaultdict
 import math
 import os
+import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
+# Add project root to path so `library` can be imported when running as a standalone script
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 import torch
 from safetensors.torch import load_file, save_file
+from tqdm import tqdm
 
 from library import train_util
 from library.utils import setup_logging
@@ -33,7 +39,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def load_state_dict(file_name: str, dtype: torch.dtype) -> Tuple[Dict[str, torch.Tensor], Dict[str, str]]:
+def load_state_dict(file_name: str, dtype: torch.dtype, device: torch.device = torch.device("cpu")) -> Tuple[Dict[str, torch.Tensor], Dict[str, str]]:
     """Load a LoRA state dict from file."""
     if os.path.splitext(file_name)[1] == ".safetensors":
         sd = load_file(file_name)
@@ -44,7 +50,7 @@ def load_state_dict(file_name: str, dtype: torch.dtype) -> Tuple[Dict[str, torch
 
     for key in list(sd.keys()):
         if isinstance(sd[key], torch.Tensor):
-            sd[key] = sd[key].to(dtype)
+            sd[key] = sd[key].to(dtype=dtype, device=device)
 
     return sd, metadata
 
@@ -99,11 +105,11 @@ def dare_prune_rescale(tensor: torch.Tensor, density: float, seed: Optional[int]
     if density <= 0.0:
         return torch.zeros_like(tensor)
 
-    # Generate Bernoulli mask
-    generator = torch.Generator()
+    # Generate Bernoulli mask (generator must be on CPU for deterministic seeding)
+    generator = torch.Generator(device="cpu")
     if seed is not None:
         generator.manual_seed(seed)
-    mask = torch.bernoulli(torch.full_like(tensor, density, dtype=torch.float32), generator=generator).to(tensor.dtype)
+    mask = torch.bernoulli(torch.full(tensor.shape, density, dtype=torch.float32, device="cpu"), generator=generator).to(dtype=tensor.dtype, device=tensor.device)
 
     masked = tensor * mask
 
@@ -242,6 +248,8 @@ def dare_ties_merge(
     seed: Optional[int] = None,
     method: str = "dare_ties",
     no_rescale: bool = False,
+    device: torch.device = torch.device("cpu"),
+    num_shards: int = 1,
 ) -> Dict[str, torch.Tensor]:
     """Perform DARE-TIES merge on multiple LoRA models.
 
@@ -254,6 +262,7 @@ def dare_ties_merge(
         seed: Random seed for DARE pruning reproducibility
         method: Merge method - "dare_ties", "dare_linear", or "ties"
         no_rescale: If True, skip L1 rescaling in DARE
+        num_shards: Number of shards to split modules into for VRAM management
 
     Returns:
         Merged LoRA state dict
@@ -265,7 +274,7 @@ def dare_ties_merge(
     all_sds = []
     for path in model_paths:
         logger.info(f"Loading: {path}")
-        sd, _ = load_state_dict(path, merge_dtype)
+        sd, _ = load_state_dict(path, merge_dtype, device=device)
         all_sds.append(sd)
 
     # Collect all module names across all models
@@ -275,66 +284,129 @@ def dare_ties_merge(
     all_module_names = sorted(all_module_names)
     logger.info(f"Total unique modules: {len(all_module_names)}")
 
-    merged_sd = {}
     base_seed = seed if seed is not None else 0
+    merged_sd = {}
 
-    for module_idx, module_name in enumerate(all_module_names):
-        # Expand each model's LoRA to full delta for this module
-        deltas = []
-        delta_weights = []
-        delta_indices = []  # track which model index each delta came from
+    # Process modules in shards to limit VRAM usage
+    # Each shard: compute deltas on GPU -> batched SVD -> store results on CPU -> free VRAM
+    num_shards = max(1, num_shards)
+    shard_size = math.ceil(len(all_module_names) / num_shards)
 
-        for model_idx, (sd, w) in enumerate(zip(all_sds, weights)):
-            down_key = f"{module_name}.lora_down.weight"
-            if down_key not in sd:
-                continue  # this model doesn't have this module
+    for shard_idx in range(num_shards):
+        shard_start = shard_idx * shard_size
+        shard_end = min(shard_start + shard_size, len(all_module_names))
+        shard_modules = all_module_names[shard_start:shard_end]
 
-            delta = expand_lora_to_delta(sd, module_name)
-            deltas.append(delta)
-            delta_weights.append(w)
-            delta_indices.append(model_idx)
+        if num_shards > 1:
+            desc = f"Shard {shard_idx + 1}/{num_shards}: computing deltas"
+        else:
+            desc = "Computing deltas"
 
-        if len(deltas) == 0:
-            continue
+        # Compute merged deltas for this shard
+        shard_deltas = []  # list of (module_name, merged_delta)
 
-        # Step 1: Prune (DARE random or TIES magnitude)
-        pruned_deltas = []
-        for i, delta in enumerate(deltas):
-            if method in ("dare_ties", "dare_linear"):
-                # DARE: random pruning with optional rescaling
-                # Use deterministic seed per module+model for reproducibility
-                prune_seed = base_seed + module_idx * 1000 + delta_indices[i] if seed is not None else None
-                pruned = dare_prune_rescale(delta, density, seed=prune_seed)
-                if no_rescale:
-                    # Undo rescaling - just apply the mask
-                    # Re-prune without rescaling (simpler to just redo)
-                    generator = torch.Generator()
-                    if prune_seed is not None:
-                        generator.manual_seed(prune_seed)
-                    mask = torch.bernoulli(
-                        torch.full_like(delta, density, dtype=torch.float32), generator=generator
-                    ).to(delta.dtype)
-                    pruned = delta * mask
-            elif method == "ties":
-                # TIES: magnitude-based pruning
-                pruned = ties_magnitude_prune(delta, density)
-            pruned_deltas.append(pruned)
+        for module_idx_in_shard, module_name in enumerate(tqdm(shard_modules, desc=desc)):
+            module_idx = shard_start + module_idx_in_shard
+            deltas = []
+            delta_weights = []
+            delta_indices = []
 
-        # Step 2: Sign consensus (for dare_ties and ties methods)
-        if method in ("dare_ties", "ties"):
-            pruned_deltas = ties_sign_consensus(pruned_deltas, delta_weights)
+            for model_idx, (sd, w) in enumerate(zip(all_sds, weights)):
+                down_key = f"{module_name}.lora_down.weight"
+                if down_key not in sd:
+                    continue
 
-        # Step 3: Weighted sum
-        merged_delta = torch.zeros_like(pruned_deltas[0])
-        for delta, w in zip(pruned_deltas, delta_weights):
-            merged_delta += delta * w
+                delta = expand_lora_to_delta(sd, module_name)
+                deltas.append(delta)
+                delta_weights.append(w)
+                delta_indices.append(model_idx)
 
-        # Step 4: SVD decompose back to LoRA format
-        down, up = svd_decompose_delta(merged_delta, rank=output_rank)
+            if len(deltas) == 0:
+                continue
 
-        merged_sd[f"{module_name}.lora_down.weight"] = down
-        merged_sd[f"{module_name}.lora_up.weight"] = up
-        merged_sd[f"{module_name}.alpha"] = torch.tensor(float(output_rank))
+            # Prune (DARE random or TIES magnitude)
+            pruned_deltas = []
+            for i, delta in enumerate(deltas):
+                if method in ("dare_ties", "dare_linear"):
+                    prune_seed = base_seed + module_idx * 1000 + delta_indices[i] if seed is not None else None
+                    pruned = dare_prune_rescale(delta, density, seed=prune_seed)
+                    if no_rescale:
+                        generator = torch.Generator(device="cpu")
+                        if prune_seed is not None:
+                            generator.manual_seed(prune_seed)
+                        mask = torch.bernoulli(
+                            torch.full(delta.shape, density, dtype=torch.float32, device="cpu"), generator=generator
+                        ).to(dtype=delta.dtype, device=delta.device)
+                        pruned = delta * mask
+                elif method == "ties":
+                    pruned = ties_magnitude_prune(delta, density)
+                pruned_deltas.append(pruned)
+
+            # Sign consensus
+            if method in ("dare_ties", "ties"):
+                pruned_deltas = ties_sign_consensus(pruned_deltas, delta_weights)
+
+            # Weighted sum
+            merged_delta = torch.zeros_like(pruned_deltas[0])
+            for delta, w in zip(pruned_deltas, delta_weights):
+                merged_delta += delta * w
+
+            shard_deltas.append((module_name, merged_delta))
+
+        # Batched SVD for this shard - group by shape
+        shape_groups: Dict[tuple, List[Tuple[str, torch.Tensor]]] = defaultdict(list)
+        for module_name, delta in shard_deltas:
+            if len(delta.shape) == 4:
+                svd_key = (delta.shape[0], delta.shape[1] * delta.shape[2] * delta.shape[3], True, delta.shape[1], delta.shape[2], delta.shape[3])
+            else:
+                svd_key = (delta.shape[0], delta.shape[1], False)
+            shape_groups[svd_key].append((module_name, delta))
+
+        if num_shards > 1:
+            svd_desc = f"Shard {shard_idx + 1}/{num_shards}: batched SVD"
+        else:
+            svd_desc = "Batched SVD"
+
+        for svd_key, group in tqdm(shape_groups.items(), desc=svd_desc):
+            is_conv = svd_key[2]
+            names = [g[0] for g in group]
+            deltas = [g[1] for g in group]
+
+            if is_conv:
+                in_dim, kh, kw = svd_key[3], svd_key[4], svd_key[5]
+                deltas_2d = [d.reshape(d.shape[0], -1) for d in deltas]
+            else:
+                deltas_2d = deltas
+
+            batched = torch.stack(deltas_2d)
+
+            U, S, Vh = torch.linalg.svd(batched.float(), full_matrices=False)
+
+            r = min(output_rank, min(batched.shape[1], batched.shape[2]))
+            U = U[:, :, :r]
+            S = S[:, :r]
+            Vh = Vh[:, :r, :]
+
+            sqrt_S = S.sqrt()
+            up_batch = U * sqrt_S.unsqueeze(1)
+            down_batch = sqrt_S.unsqueeze(2) * Vh
+
+            for i, name in enumerate(names):
+                down = down_batch[i]
+                up = up_batch[i]
+
+                if is_conv:
+                    down = down.reshape(r, in_dim, kh, kw)
+
+                # Store on CPU immediately to free VRAM
+                merged_sd[f"{name}.lora_down.weight"] = down.to(merge_dtype).cpu().contiguous()
+                merged_sd[f"{name}.lora_up.weight"] = up.to(merge_dtype).cpu().contiguous()
+                merged_sd[f"{name}.alpha"] = torch.tensor(float(output_rank))
+
+        # Free shard tensors
+        del shard_deltas, shape_groups
+        if device.type != "cpu":
+            torch.cuda.empty_cache()
 
     logger.info(f"Merge complete: {len(all_module_names)} modules merged")
     return merged_sd
@@ -357,6 +429,8 @@ def merge(args):
     if save_dtype is None:
         save_dtype = merge_dtype
 
+    device = torch.device(args.device)
+
     merged_sd = dare_ties_merge(
         model_paths=args.models,
         weights=args.ratios,
@@ -366,6 +440,8 @@ def merge(args):
         seed=args.seed,
         method=args.method,
         no_rescale=args.no_rescale,
+        device=device,
+        num_shards=args.num_shards,
     )
 
     # Convert to save dtype
@@ -462,6 +538,18 @@ def setup_parser() -> argparse.ArgumentParser:
         "--no_rescale",
         action="store_true",
         help="Skip L1 rescaling in DARE (not recommended)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help="Device for merge computation, e.g. 'cuda' or 'cpu' (default: cpu)",
+    )
+    parser.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="Split modules into N shards to limit VRAM usage (default: 1, no sharding)",
     )
 
     return parser

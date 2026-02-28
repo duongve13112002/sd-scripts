@@ -20,7 +20,7 @@ merge:
 	python networks/dare_ties_merge_lora.py \
 		--models $(wildcard output_mini/*.safetensors) \
 		--ratios $(foreach f,$(wildcard output_mini/*.safetensors),1.0) \
-		--density 0.5 --seed 42 \
+		--density 0.5 --seed 42 --device cuda --num_shards 5 \
 		--save_to output/merged_lora.safetensors
 
 # Catch numeric args for lora-mini
