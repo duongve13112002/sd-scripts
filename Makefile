@@ -9,18 +9,21 @@ lora:
 sync:
 	cp output/*.safetensors $(LORA_DIR)/
 
+TRAIN_DIR ?= train_datasets
+
 lora-mini:
 	python tools/train_mini_loras.py \
 		--config training_mini_config.toml \
-		--train_dir train_datasets \
+		--train_dir $(TRAIN_DIR) \
 		--output_dir output_mini \
-		$(if $(filter-out $@,$(MAKECMDGOALS)),--count $(filter-out $@,$(MAKECMDGOALS)))
+		$(if $(COUNT),--group_size $(COUNT)) \
+		$(if $(filter-out $@,$(MAKECMDGOALS)),--group_size $(filter-out $@,$(MAKECMDGOALS)))
 
 merge:
 	python networks/dare_ties_merge_lora.py \
 		--models $(wildcard output_mini/*.safetensors) \
 		--ratios $(foreach f,$(wildcard output_mini/*.safetensors),1.0) \
-		--density 0.5 --seed 42 --device cuda --num_shards 5 \
+		--method ties --density 0.5 --device cuda \
 		--save_to output/merged_lora.safetensors
 
 # Catch numeric args for lora-mini

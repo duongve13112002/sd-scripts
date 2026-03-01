@@ -1667,6 +1667,17 @@ class LLMAdapter(nn.Module):
         self.norm = LLMAdapterRMSNorm(target_dim)
 
     def forward(self, source_hidden_states, target_input_ids, target_attention_mask=None, source_attention_mask=None):
+        # Inject learned embeddings if attached (prefix/postfix tuning).
+        # Appended as postfix to preserve tag-order positional encoding (RoPE).
+        if hasattr(self, "prefix_embeds") and self.prefix_embeds is not None:
+            B = source_hidden_states.shape[0]
+            extra = self.prefix_embeds.unsqueeze(0).expand(B, -1, -1).to(dtype=source_hidden_states.dtype)
+            source_hidden_states = torch.cat([source_hidden_states, extra], dim=1)
+            if source_attention_mask is not None:
+                num_extra = self.prefix_embeds.shape[0]
+                extra_mask = torch.ones(B, num_extra, device=source_attention_mask.device, dtype=source_attention_mask.dtype)
+                source_attention_mask = torch.cat([source_attention_mask, extra_mask], dim=-1)
+
         if target_attention_mask is not None:
             target_attention_mask = target_attention_mask.to(torch.bool)
             if target_attention_mask.ndim == 2:

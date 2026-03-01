@@ -1,12 +1,12 @@
-pretrained_model_name_or_path = "../comfy/ComfyUI/models/diffusion_models/anima-preview.safetensors"
-qwen3 = "../comfy/ComfyUI/models/text_encoders/qwen_3_06b_base.safetensors"
-vae = "../comfy/ComfyUI/models/vae/qwen_image_vae.safetensors"
+pretrained_model_name_or_path = "../../comfy/ComfyUI/models/diffusion_models/anima-preview.safetensors"
+qwen3 = "../../comfy/ComfyUI/models/text_encoders/qwen_3_06b_base.safetensors"
+vae = "../../comfy/ComfyUI/models/vae/qwen_image_vae.safetensors"
 
 output_dir = "output_mini"
 save_model_as = "safetensors"
 
 network_module = "networks.lora_anima"
-network_dim = 8
+network_dim = 16
 network_train_unet_only = true
 
 learning_rate = 1e-4
@@ -16,15 +16,15 @@ lr_scheduler = "constant"
 timestep_sampling = "sigmoid"
 discrete_flow_shift = 1.0
 
-max_train_epochs = 4
-save_every_n_epochs = 4
+max_train_epochs = 12
+save_every_n_epochs = 12
 mixed_precision = "bf16"
 
 gradient_checkpointing = true
 cache_latents = true
 cache_text_encoder_outputs = true
 cache_llm_adapter_outputs = true
-vae_chunk_size = 64
-vae_disable_cache = true
+# vae_chunk_size = 64
+# vae_disable_cache = true
 attn_mode = "flash"
 blocks_to_swap = 0

@@ -396,13 +396,16 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         anima_text_encoding_strategy: strategy_anima.AnimaTextEncodingStrategy = text_encoding_strategy
         if text_encoder_outputs_list is not None:
             caption_dropout_rates = text_encoder_outputs_list[-1]
-            text_encoder_outputs_list = text_encoder_outputs_list[:-1]
+            encoder_outputs = text_encoder_outputs_list[:-1]
 
             # Apply caption dropout to cached outputs
-            text_encoder_outputs_list = anima_text_encoding_strategy.drop_cached_text_encoder_outputs(
-                *text_encoder_outputs_list, caption_dropout_rates=caption_dropout_rates
+            encoder_outputs = anima_text_encoding_strategy.drop_cached_text_encoder_outputs(
+                *encoder_outputs, caption_dropout_rates=caption_dropout_rates
             )
-            batch["text_encoder_outputs_list"] = text_encoder_outputs_list
+            # Use a shallow-copied batch so the original text_encoder_outputs_list
+            # (with caption_dropout_rates appended) stays intact for validation's
+            # multi-timestep loop which reuses the same batch.
+            batch = {**batch, "text_encoder_outputs_list": encoder_outputs}
 
         return super().process_batch(
             batch,
