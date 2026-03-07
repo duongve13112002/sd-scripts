@@ -721,6 +721,8 @@ class BaseDataset(torch.utils.data.Dataset):
 
         self.image_transforms = IMAGE_TRANSFORMS
 
+        self.custom_shuffle_caption_fn = None  # optional: fn(flex_tokens) -> shuffled list
+
         if resize_interpolation is not None:
             assert validate_interpolation_fn(
                 resize_interpolation
@@ -908,7 +910,10 @@ class BaseDataset(torch.utils.data.Dataset):
                     return l
 
                 if subset.shuffle_caption:
-                    random.shuffle(flex_tokens)
+                    if self.custom_shuffle_caption_fn is not None:
+                        flex_tokens = self.custom_shuffle_caption_fn(flex_tokens)
+                    else:
+                        random.shuffle(flex_tokens)
 
                 flex_tokens = dropout_tags(flex_tokens)
 

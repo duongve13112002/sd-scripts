@@ -4,8 +4,9 @@ import argparse
 import gc
 import math
 import os
+import random
 import time
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -24,6 +25,45 @@ setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def anima_smart_shuffle_caption(flex_tokens: List[str]) -> List[str]:
+    """Shuffle caption tags with awareness of @artist prefix and 'on the ...' sections.
+
+    - Tags up to and including the first @-prefixed tag are kept in order.
+    - Remaining tags are split into sections by 'on the ...' delimiters.
+    - Tags within each section are shuffled independently.
+    """
+    # Find the @artist boundary within flex_tokens
+    split_idx = 0
+    for idx, tag in enumerate(flex_tokens):
+        if tag.startswith("@"):
+            split_idx = idx + 1
+            break
+
+    prefix = flex_tokens[:split_idx]
+    suffix = flex_tokens[split_idx:]
+
+    # Split suffix into sections delimited by "on the ..." tags
+    sections: list[list[str]] = [[]]
+    for tag in suffix:
+        if tag.lower().startswith("on the "):
+            sections.append([tag])
+        else:
+            sections[-1].append(tag)
+
+    result = list(prefix)
+    for section in sections:
+        if not section:
+            continue
+        if section[0].lower().startswith("on the "):
+            header, body = [section[0]], section[1:]
+        else:
+            header, body = [], section
+        shuffled = body.copy()
+        random.shuffle(shuffled)
+        result.extend(header + shuffled)
+    return result
 
 
 # Anima-specific training arguments
@@ -96,6 +136,13 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="Cache LLM adapter outputs (cross-attention embeddings) in the text encoder cache and skip running the adapter during training. "
         "Requires --cache_text_encoder_outputs. Incompatible with LoRA training for the LLM adapter.",
+    )
+    parser.add_argument(
+        "--caption_shuffle_variants",
+        type=int,
+        default=0,
+        help="Number of shuffled caption variants to cache. Tags after @artist are shuffled. "
+        "0=disabled (default). Requires --cache_text_encoder_outputs.",
     )
     parser.add_argument(
         "--discrete_flow_shift",

@@ -37,8 +37,11 @@ def create_network(
     if exclude_patterns is None:
         exclude_patterns = []
     else:
-        exclude_patterns = ast.literal_eval(exclude_patterns)
-        if not isinstance(exclude_patterns, list):
+        try:
+            exclude_patterns = ast.literal_eval(exclude_patterns)
+            if not isinstance(exclude_patterns, list):
+                exclude_patterns = [exclude_patterns]
+        except (ValueError, SyntaxError):
             exclude_patterns = [exclude_patterns]
 
     # add default exclude patterns
@@ -47,8 +50,11 @@ def create_network(
     # regular expression for module selection: exclude and include
     include_patterns = kwargs.get("include_patterns", None)
     if include_patterns is not None:
-        include_patterns = ast.literal_eval(include_patterns)
-        if not isinstance(include_patterns, list):
+        try:
+            include_patterns = ast.literal_eval(include_patterns)
+            if not isinstance(include_patterns, list):
+                include_patterns = [include_patterns]
+        except (ValueError, SyntaxError):
             include_patterns = [include_patterns]
 
     # rank/module dropout

@@ -84,6 +84,14 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 args.blocks_to_swap is None or args.blocks_to_swap == 0
             ), "blocks_to_swap is not supported with unsloth_offload_checkpointing"
 
+        # Install smart caption shuffle for Anima (respects @artist prefix and "on the ..." sections)
+        if args.shuffle_caption:
+            for dataset in train_dataset_group.datasets:
+                dataset.custom_shuffle_caption_fn = anima_train_utils.anima_smart_shuffle_caption
+            if val_dataset_group is not None:
+                for dataset in val_dataset_group.datasets:
+                    dataset.custom_shuffle_caption_fn = anima_train_utils.anima_smart_shuffle_caption
+
         train_dataset_group.verify_bucket_reso_steps(16)  # WanVAE spatial downscale = 8 and patch size = 2
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(16)
@@ -177,6 +185,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 args.skip_cache_check,
                 False,
                 cache_llm_adapter_outputs=getattr(args, "cache_llm_adapter_outputs", False),
+                caption_shuffle_variants=getattr(args, "caption_shuffle_variants", 0),
             )
         return None
 
@@ -342,8 +351,52 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         # Call model
         noisy_model_input = noisy_model_input.unsqueeze(2)  # 4D to 5D, [B, C, H, W] -> [B, C, 1, H, W]
+
+        # Check for CFG postfix mode
+        cfg_postfix = getattr(network, "mode", None) == "cfg" and hasattr(network, "postfix_pos") and crossattn_emb is None
+
         with torch.set_grad_enabled(is_train), accelerator.autocast():
-            if crossattn_emb is None:
+            if cfg_postfix:
+                # CFG-aware dual postfix: two forward passes
+                adapter = anima.llm_adapter
+
+                # Positive pass: real caption + postfix_pos
+                adapter.postfix_embeds = network.postfix_pos
+                pos_pred = anima(
+                    noisy_model_input,
+                    timesteps,
+                    prompt_embeds,
+                    padding_mask=padding_mask,
+                    target_input_ids=t5_input_ids,
+                    target_attention_mask=t5_attn_mask,
+                    source_attention_mask=attn_mask,
+                )
+
+                # Negative pass: unconditional (zeroed Qwen3) + postfix_neg
+                adapter.postfix_embeds = network.postfix_neg
+                uncond_embeds = torch.zeros_like(prompt_embeds)
+                uncond_attn_mask = torch.zeros_like(attn_mask)
+                uncond_t5_ids = torch.zeros_like(t5_input_ids)
+                uncond_t5_ids[:, 0] = 1  # </s> token
+                uncond_t5_attn = torch.zeros_like(t5_attn_mask)
+                uncond_t5_attn[:, 0] = 1
+                neg_pred = anima(
+                    noisy_model_input,
+                    timesteps,
+                    uncond_embeds,
+                    padding_mask=padding_mask,
+                    target_input_ids=uncond_t5_ids,
+                    target_attention_mask=uncond_t5_attn,
+                    source_attention_mask=uncond_attn_mask,
+                )
+
+                # Restore positive postfix as default
+                adapter.postfix_embeds = network.postfix_pos
+
+                # CFG combine
+                cfg_scale = network.cfg_scale
+                model_pred = neg_pred + cfg_scale * (pos_pred - neg_pred)
+            elif crossattn_emb is None:
                 model_pred = anima(
                     noisy_model_input,
                     timesteps,

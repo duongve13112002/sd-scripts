@@ -214,13 +214,39 @@ def load_llm_adapter(
     return adapter
 
 
+def _is_qwen3_5(path: str) -> bool:
+    """Detect whether a path refers to a Qwen3.5 model (vs Qwen3)."""
+    basename = os.path.basename(path).lower()
+    return "qwen_3_5" in basename or "qwen3_5" in basename or "qwen3.5" in basename
+
+
+def _get_qwen_config_dir(qwen3_path: str) -> str:
+    """Return the appropriate bundled config directory for the given model path."""
+    configs_root = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs")
+    if _is_qwen3_5(qwen3_path):
+        config_dir = os.path.join(configs_root, "qwen3_5_08b")
+        model_name = "Qwen3.5-0.8B"
+    else:
+        config_dir = os.path.join(configs_root, "qwen3_06b")
+        model_name = "Qwen3-0.6B"
+
+    if not os.path.exists(config_dir):
+        raise FileNotFoundError(
+            f"{model_name} config directory not found at {config_dir}. "
+            f"Expected config.json, tokenizer.json, etc. "
+            f"You can download these from the {model_name} HuggingFace repository."
+        )
+    return config_dir
+
+
 def load_qwen3_tokenizer(qwen3_path: str):
-    """Load Qwen3 tokenizer only (without the text encoder model).
+    """Load Qwen3/Qwen3.5 tokenizer only (without the text encoder model).
 
     Args:
         qwen3_path: Path to either a directory with model files or a safetensors file.
                      If a directory, loads tokenizer from it directly.
-                     If a file, uses configs/qwen3_06b/ for tokenizer config.
+                     If a file, auto-detects Qwen3 vs Qwen3.5 from filename and uses
+                     the appropriate bundled config directory.
     Returns:
         tokenizer
     """
@@ -229,13 +255,7 @@ def load_qwen3_tokenizer(qwen3_path: str):
     if os.path.isdir(qwen3_path):
         tokenizer = AutoTokenizer.from_pretrained(qwen3_path, local_files_only=True)
     else:
-        config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", "qwen3_06b")
-        if not os.path.exists(config_dir):
-            raise FileNotFoundError(
-                f"Qwen3 config directory not found at {config_dir}. "
-                "Expected configs/qwen3_06b/ with config.json, tokenizer.json, etc. "
-                "You can download these from the Qwen3-0.6B HuggingFace repository."
-            )
+        config_dir = _get_qwen_config_dir(qwen3_path)
         tokenizer = AutoTokenizer.from_pretrained(config_dir, local_files_only=True)
 
     if tokenizer.pad_token is None:
@@ -251,7 +271,9 @@ def load_qwen3_text_encoder(
     lora_weights: Optional[List[Dict[str, torch.Tensor]]] = None,
     lora_multipliers: Optional[List[float]] = None,
 ):
-    """Load Qwen3-0.6B text encoder.
+    """Load Qwen3 or Qwen3.5 text encoder.
+
+    Auto-detects Qwen3.5 from filename (looks for 'qwen_3_5', 'qwen3_5', or 'qwen3.5').
 
     Args:
         qwen3_path: Path to either a directory with model files or a safetensors file
@@ -264,25 +286,26 @@ def load_qwen3_text_encoder(
     import transformers
     from transformers import AutoTokenizer
 
-    logger.info(f"Loading Qwen3 text encoder from {qwen3_path}")
+    is_qwen35 = _is_qwen3_5(qwen3_path)
+    model_label = "Qwen3.5" if is_qwen35 else "Qwen3"
+    logger.info(f"Loading {model_label} text encoder from {qwen3_path}")
 
     if os.path.isdir(qwen3_path):
         # Directory with full model
         tokenizer = AutoTokenizer.from_pretrained(qwen3_path, local_files_only=True)
         model = transformers.AutoModelForCausalLM.from_pretrained(qwen3_path, torch_dtype=dtype, local_files_only=True).model
     else:
-        # Single safetensors file - use configs/qwen3_06b/ for config
-        config_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", "qwen3_06b")
-        if not os.path.exists(config_dir):
-            raise FileNotFoundError(
-                f"Qwen3 config directory not found at {config_dir}. "
-                "Expected configs/qwen3_06b/ with config.json, tokenizer.json, etc. "
-                "You can download these from the Qwen3-0.6B HuggingFace repository."
-            )
+        # Single safetensors file - use bundled config
+        config_dir = _get_qwen_config_dir(qwen3_path)
 
         tokenizer = AutoTokenizer.from_pretrained(config_dir, local_files_only=True)
-        qwen3_config = transformers.Qwen3Config.from_pretrained(config_dir, local_files_only=True)
-        model = transformers.Qwen3ForCausalLM(qwen3_config).model
+
+        if is_qwen35:
+            qwen_config = transformers.Qwen3_5TextConfig.from_pretrained(config_dir, local_files_only=True)
+            model = transformers.Qwen3_5ForCausalLM(qwen_config).model
+        else:
+            qwen_config = transformers.Qwen3Config.from_pretrained(config_dir, local_files_only=True)
+            model = transformers.Qwen3ForCausalLM(qwen_config).model
 
         # Load weights
         if qwen3_path.endswith(".safetensors"):
@@ -311,7 +334,7 @@ def load_qwen3_text_encoder(
                 new_sd[k] = v
 
         info = model.load_state_dict(new_sd, strict=False)
-        logger.info(f"Loaded Qwen3 state dict: {info}")
+        logger.info(f"Loaded {model_label} state dict: {info}")
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
