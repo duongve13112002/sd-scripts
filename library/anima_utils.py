@@ -146,6 +146,14 @@ def load_anima_model(
         raise RuntimeError(f"Unexpected keys in checkpoint: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
     logger.info(f"Loaded DiT model from {dit_path}, unexpected missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
 
+    # Move non-checkpoint buffers (RoPE embeddings) to the correct device.
+    # These are created on CPU during __init__ and not present in the checkpoint,
+    # so load_state_dict(assign=True) doesn't move them.
+    if hasattr(model, "pos_embedder"):
+        model.pos_embedder.to(loading_device)
+    if hasattr(model, "extra_pos_embedder"):
+        model.extra_pos_embedder.to(loading_device)
+
     return model
 
 

@@ -1454,6 +1454,11 @@ class Anima(nn.Module):
                 source_attention_mask=source_attention_mask,
             )
             crossattn_mask = target_attention_mask
+            # Adapter may have appended T5-side postfix tokens (dual mode) — extend mask to match
+            if crossattn_mask is not None and context.shape[1] > crossattn_mask.shape[-1]:
+                num_extra = context.shape[1] - crossattn_mask.shape[-1]
+                extra_mask = torch.ones(crossattn_mask.shape[0], num_extra, device=crossattn_mask.device, dtype=crossattn_mask.dtype)
+                crossattn_mask = torch.cat([crossattn_mask, extra_mask], dim=-1)
             context[~crossattn_mask.bool()] = 0  # zero out padding tokens
         else:
             # Adapter skipped (pre-cached output or no adapter) — use source mask
@@ -1678,6 +1683,14 @@ class LLMAdapter(nn.Module):
                 extra_mask = torch.ones(B, num_extra, device=source_attention_mask.device, dtype=source_attention_mask.dtype)
                 source_attention_mask = torch.cat([source_attention_mask, extra_mask], dim=-1)
 
+        # Extend target_attention_mask for T5-side postfix BEFORE 4D reshape
+        if hasattr(self, "postfix_t5_embeds") and self.postfix_t5_embeds is not None:
+            if target_attention_mask is not None:
+                B = source_hidden_states.shape[0]
+                num_extra = self.postfix_t5_embeds.shape[0]
+                extra_mask = torch.ones(B, num_extra, device=target_attention_mask.device, dtype=target_attention_mask.dtype)
+                target_attention_mask = torch.cat([target_attention_mask, extra_mask], dim=-1)
+
         if target_attention_mask is not None:
             target_attention_mask = target_attention_mask.to(torch.bool)
             if target_attention_mask.ndim == 2:
@@ -1689,6 +1702,13 @@ class LLMAdapter(nn.Module):
                 source_attention_mask = source_attention_mask.unsqueeze(1).unsqueeze(1)
 
         x = self.in_proj(self.embed(target_input_ids))
+
+        # Inject T5-side postfix embeddings (dual mode: adds learned query tokens)
+        if hasattr(self, "postfix_t5_embeds") and self.postfix_t5_embeds is not None:
+            B = x.shape[0]
+            extra_t5 = self.postfix_t5_embeds.unsqueeze(0).expand(B, -1, -1).to(dtype=x.dtype)
+            x = torch.cat([x, extra_t5], dim=1)
+
         context = source_hidden_states
         position_ids = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
         position_ids_context = torch.arange(context.shape[1], device=x.device).unsqueeze(0)
