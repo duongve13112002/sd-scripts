@@ -164,6 +164,12 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         help="Scale factor for sigmoid (logit_normal) timestep sampling (default: 1.0)",
     )
     parser.add_argument(
+        "--lora_fp32_accumulation",
+        action="store_true",
+        help="Compute LoRA delta (down→up matmuls) in fp32 before adding to bf16 base output. "
+        "Improves precision of small LoRA contributions with negligible VRAM/speed overhead.",
+    )
+    parser.add_argument(
         "--attn_mode",
         choices=["torch", "xformers", "flash", "sageattn", "sdpa"],  # "sdpa" is for backward compatibility
         default=None,

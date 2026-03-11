@@ -358,6 +358,12 @@ class LoRANetwork(torch.nn.Module):
             assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
 
+    def prepare_network(self, args):
+        if getattr(args, "lora_fp32_accumulation", False):
+            logger.info("enabling fp32 accumulation for LoRA modules")
+            for lora in self.text_encoder_loras + self.unet_loras:
+                lora.fp32_accumulation = True
+
     def set_multiplier(self, multiplier):
         self.multiplier = multiplier
         for lora in self.text_encoder_loras + self.unet_loras:

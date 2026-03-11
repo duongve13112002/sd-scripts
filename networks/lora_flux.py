@@ -107,6 +107,8 @@ class LoRAModule(torch.nn.Module):
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
 
+        self.fp32_accumulation = False
+
         self.ggpo_sigma = ggpo_sigma
         self.ggpo_beta = ggpo_beta
 
@@ -132,7 +134,11 @@ class LoRAModule(torch.nn.Module):
                 return org_forwarded
 
         if self.split_dims is None:
-            lx = self.lora_down(x)
+            # fp32 accumulation: compute LoRA delta in fp32 for better precision
+            if self.fp32_accumulation:
+                lx = torch.nn.functional.linear(x.float(), self.lora_down.weight.float())
+            else:
+                lx = self.lora_down(x)
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -153,7 +159,11 @@ class LoRAModule(torch.nn.Module):
             else:
                 scale = self.scale
 
-            lx = self.lora_up(lx)
+            if self.fp32_accumulation:
+                lx = torch.nn.functional.linear(lx, self.lora_up.weight.float())
+                lx = (lx * self.multiplier * scale).to(org_forwarded.dtype)
+            else:
+                lx = self.lora_up(lx)
 
             # LoRA Gradient-Guided Perturbation Optimization
             if (
@@ -171,8 +181,12 @@ class LoRAModule(torch.nn.Module):
                     perturbation = torch.randn(self.org_module_shape, dtype=self.dtype, device=self.device)
                     perturbation.mul_(perturbation_scale_factor)
                     perturbation_output = x @ perturbation.T  # Result: (batch × n)
+                if self.fp32_accumulation:
+                    return org_forwarded + lx + perturbation_output
                 return org_forwarded + (self.multiplier * scale * lx) + perturbation_output
             else:
+                if self.fp32_accumulation:
+                    return org_forwarded + lx
                 return org_forwarded + lx * self.multiplier * scale
         else:
             lxs = [lora_down(x) for lora_down in self.lora_down]

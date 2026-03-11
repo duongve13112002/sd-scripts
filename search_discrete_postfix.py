@@ -494,6 +494,7 @@ def score_candidates_by_gradient(
     # Accumulate gradients over multiple batches, micro-batching to save VRAM
     total_loss = 0.0
     total_samples = 0
+    pbar = tqdm(total=num_batches * eval_images, desc="Gradient scoring")
     for batch_idx in range(num_batches):
         latents, te_conds, fixed_noise = prepare_eval_batch(
             all_data, eval_images, weight_dtype, seed=args.seed + batch_idx
@@ -512,6 +513,9 @@ def score_candidates_by_gradient(
             loss.backward()
             total_loss += loss.item()
             total_samples += 1
+            pbar.set_postfix(loss=f"{total_loss / total_samples:.6f}")
+            pbar.update(1)
+    pbar.close()
 
     avg_loss = total_loss / total_samples
     logger.info(f"  Average loss with zero placeholder: {avg_loss:.6f}")
@@ -777,6 +781,10 @@ def main():
     )
     if args.blocks_to_swap > 0:
         anima_model.enable_block_swap(args.blocks_to_swap, device)
+    # Freeze all model parameters — only postfix placeholders need gradients.
+    # Without this, backward() allocates ~4GB for model gradients alone.
+    for p in anima_model.parameters():
+        p.requires_grad_(False)
     if args.gradient_checkpointing:
         anima_model.enable_gradient_checkpointing()
     # Keep model in train mode so gradient checkpointing is active
