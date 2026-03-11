@@ -126,7 +126,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             attn_mode = args.attn_mode
 
         # Load DiT
-        logger.info(f"Loading Anima DiT model with attn_mode={attn_mode}, split_attn: {args.split_attn}...")
+        attn_softmax_scale = getattr(args, "attn_softmax_scale", None)
+        logger.info(f"Loading Anima DiT model with attn_mode={attn_mode}, split_attn: {args.split_attn}, attn_softmax_scale: {attn_softmax_scale}...")
         model = anima_utils.load_anima_model(
             accelerator.device,
             args.pretrained_model_name_or_path,
@@ -135,6 +136,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             loading_device,
             loading_dtype,
             args.fp8_scaled,
+            attn_softmax_scale=attn_softmax_scale,
         )
 
         # Store unsloth preference so that when the base NetworkTrainer calls

@@ -176,6 +176,13 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         help="split attention computation to reduce memory usage / メモリ使用量を減らすためにattention時にバッチを分割する",
     )
     parser.add_argument(
+        "--attn_softmax_scale",
+        type=float,
+        default=None,
+        help="Custom softmax scale for attention (default: 1/sqrt(head_dim)). Larger values sharpen attention and improve bf16 precision."
+        " For head_dim=128, default is ~0.088. Try 0.1-0.15 for better low-precision stability.",
+    )
+    parser.add_argument(
         "--vae_chunk_size",
         type=int,
         default=None,

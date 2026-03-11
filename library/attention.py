@@ -36,6 +36,7 @@ class AttentionParams:
     seqlens: Optional[torch.Tensor] = None
     cu_seqlens: Optional[torch.Tensor] = None
     max_seqlen: Optional[int] = None
+    softmax_scale: Optional[float] = None  # custom softmax scale (default: 1/sqrt(head_dim))
 
     @property
     def supports_fp32(self) -> bool:
@@ -46,8 +47,8 @@ class AttentionParams:
         return self.attn_mode in ["xformers"]
 
     @staticmethod
-    def create_attention_params(attn_mode: Optional[str], split_attn: bool) -> "AttentionParams":
-        return AttentionParams(attn_mode, split_attn)
+    def create_attention_params(attn_mode: Optional[str], split_attn: bool, softmax_scale: Optional[float] = None) -> "AttentionParams":
+        return AttentionParams(attn_mode, split_attn, softmax_scale=softmax_scale)
 
     @staticmethod
     def create_attention_params_from_mask(
@@ -130,7 +131,7 @@ def attention(
             k = k[:, :seqlen]
             v = v[:, :seqlen]
             max_seqlen = attn_params.max_seqlen
-            attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, False)  # do not in-place modify
+            attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, False, softmax_scale=attn_params.softmax_scale)  # do not in-place modify
             attn_params.max_seqlen = max_seqlen  # keep max_seqlen for padding
             seqlen_trimmed = True
 
@@ -150,7 +151,7 @@ def attention(
     if attn_params.split_attn:
         if attn_params.seqlens is None:
             # If no seqlens provided, assume all tokens are valid
-            attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, True)  # do not in-place modify
+            attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, True, softmax_scale=attn_params.softmax_scale)  # do not in-place modify
             attn_params.seqlens = torch.tensor([q.shape[1]] * q.shape[0], device=q.device)
             attn_params.max_seqlen = q.shape[1]
         q = [transpose_fn(q[i : i + 1, : attn_params.seqlens[i]]) for i in range(len(q))]
@@ -161,11 +162,13 @@ def attention(
         k = transpose_fn(k)
         v = transpose_fn(v)
 
+    scale = attn_params.softmax_scale  # None = default 1/sqrt(head_dim)
+
     if attn_params.attn_mode == "torch":
         if attn_params.split_attn:
             x = []
             for i in range(len(q)):
-                x_i = torch.nn.functional.scaled_dot_product_attention(q[i], k[i], v[i], dropout_p=drop_rate)
+                x_i = torch.nn.functional.scaled_dot_product_attention(q[i], k[i], v[i], dropout_p=drop_rate, scale=scale)
                 q[i] = None
                 k[i] = None
                 v[i] = None
@@ -174,14 +177,14 @@ def attention(
             del q, k, v
 
         else:
-            x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate)
+            x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate, scale=scale)
             del q, k, v
 
     elif attn_params.attn_mode == "xformers":
         if attn_params.split_attn:
             x = []
             for i in range(len(q)):
-                x_i = xops.memory_efficient_attention(q[i], k[i], v[i], p=drop_rate)
+                x_i = xops.memory_efficient_attention(q[i], k[i], v[i], p=drop_rate, scale=scale)
                 q[i] = None
                 k[i] = None
                 v[i] = None
@@ -190,7 +193,7 @@ def attention(
             del q, k, v
 
         else:
-            x = xops.memory_efficient_attention(q, k, v, attn_bias=attn_params.attention_mask, p=drop_rate)
+            x = xops.memory_efficient_attention(q, k, v, attn_bias=attn_params.attention_mask, p=drop_rate, scale=scale)
             del q, k, v
 
     elif attn_params.attn_mode == "sageattn":
@@ -198,7 +201,7 @@ def attention(
             x = []
             for i in range(len(q)):
                 # HND seems to cause an error
-                x_i = sageattn(q[i], k[i], v[i])  # B, H, L, D. No dropout support
+                x_i = sageattn(q[i], k[i], v[i], sm_scale=scale)  # B, H, L, D. No dropout support
                 q[i] = None
                 k[i] = None
                 v[i] = None
@@ -206,7 +209,7 @@ def attention(
             x = torch.cat(x, dim=0)
             del q, k, v
         elif attn_params.cu_seqlens is None:  # all tokens are valid
-            x = sageattn(q, k, v)  # B, L, H, D. No dropout support
+            x = sageattn(q, k, v, sm_scale=scale)  # B, L, H, D. No dropout support
             del q, k, v
         else:
             # Reshape to [(bxs), a, d]
@@ -217,7 +220,8 @@ def attention(
 
             # Assume cu_seqlens_q == cu_seqlens_kv and max_seqlen_q == max_seqlen_kv. No dropout support
             x = sageattn_varlen(
-                q, k, v, attn_params.cu_seqlens, attn_params.cu_seqlens, attn_params.max_seqlen, attn_params.max_seqlen
+                q, k, v, attn_params.cu_seqlens, attn_params.cu_seqlens, attn_params.max_seqlen, attn_params.max_seqlen,
+                sm_scale=scale,
             )
             del q, k, v
 
@@ -229,7 +233,7 @@ def attention(
             x = []
             for i in range(len(q)):
                 # HND seems to cause an error
-                x_i = flash_attn_func(q[i], k[i], v[i], drop_rate)  # B, L, H, D
+                x_i = flash_attn_func(q[i], k[i], v[i], drop_rate, softmax_scale=scale)  # B, L, H, D
                 q[i] = None
                 k[i] = None
                 v[i] = None
@@ -237,7 +241,7 @@ def attention(
             x = torch.cat(x, dim=0)
             del q, k, v
         elif attn_params.cu_seqlens is None:  # all tokens are valid
-            x = flash_attn_func(q, k, v, drop_rate)  # B, L, H, D
+            x = flash_attn_func(q, k, v, drop_rate, softmax_scale=scale)  # B, L, H, D
             del q, k, v
         else:
             # Reshape to [(bxs), a, d]
@@ -248,7 +252,8 @@ def attention(
 
             # Assume cu_seqlens_q == cu_seqlens_kv and max_seqlen_q == max_seqlen_kv
             x = flash_attn_varlen_func(
-                q, k, v, attn_params.cu_seqlens, attn_params.cu_seqlens, attn_params.max_seqlen, attn_params.max_seqlen, drop_rate
+                q, k, v, attn_params.cu_seqlens, attn_params.cu_seqlens, attn_params.max_seqlen, attn_params.max_seqlen,
+                drop_rate, softmax_scale=scale,
             )
             del q, k, v
 

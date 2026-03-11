@@ -40,6 +40,7 @@ def load_anima_model(
     fp8_scaled: bool = False,
     lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
     lora_multipliers: Optional[list[float]] = None,
+    attn_softmax_scale: Optional[float] = None,
 ) -> anima_models.Anima:
     """
     Load Anima model from the specified checkpoint.
@@ -96,6 +97,7 @@ def load_anima_model(
         "use_llm_adapter": True,
         "attn_mode": attn_mode,
         "split_attn": split_attn,
+        "attn_softmax_scale": attn_softmax_scale,
     }
     with init_empty_weights():
         model = anima_models.Anima(**dit_config)

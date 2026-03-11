@@ -1117,6 +1117,7 @@ class Anima(nn.Module):
         use_llm_adapter: bool = False,
         attn_mode: str = "torch",
         split_attn: bool = False,
+        attn_softmax_scale: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -1147,6 +1148,7 @@ class Anima(nn.Module):
 
         self.attn_mode = attn_mode
         self.split_attn = split_attn
+        self.attn_softmax_scale = attn_softmax_scale
 
         # Block swap support
         self.blocks_to_swap = None
@@ -1409,7 +1411,7 @@ class Anima(nn.Module):
             "extra_per_block_pos_emb": extra_pos_emb,
         }
 
-        attn_params = attention.AttentionParams.create_attention_params(self.attn_mode, self.split_attn)
+        attn_params = attention.AttentionParams.create_attention_params(self.attn_mode, self.split_attn, self.attn_softmax_scale)
 
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:
@@ -1559,20 +1561,32 @@ class LLMAdapterAttention(nn.Module):
         context_shape = context.shape[:-1]
         kv_shape = (*context_shape, self.n_heads, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(x).view(q_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(context).view(kv_shape)).transpose(1, 2)
-        value_states = self.v_proj(context).view(kv_shape).transpose(1, 2)
+        query_states = self.q_norm(self.q_proj(x).view(q_shape))
+        key_states = self.k_norm(self.k_proj(context).view(kv_shape))
+        value_states = self.v_proj(context).view(kv_shape)
 
         if position_embeddings is not None:
             assert position_embeddings_context is not None
             cos, sin = position_embeddings
-            query_states = _adapter_apply_rotary_pos_emb(query_states, cos, sin)
+            # RoPE expects [B, H, L, D] layout
+            query_states = _adapter_apply_rotary_pos_emb(query_states.transpose(1, 2), cos, sin).transpose(1, 2)
             cos, sin = position_embeddings_context
-            key_states = _adapter_apply_rotary_pos_emb(key_states, cos, sin)
+            key_states = _adapter_apply_rotary_pos_emb(key_states.transpose(1, 2), cos, sin).transpose(1, 2)
 
-        attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
+        # Use flash attention when available for fp32 softmax accumulators and memory savings.
+        # Fall back to SDPA when mask is provided (flash doesn't support arbitrary masks).
+        if attention.flash_attn_func is not None and mask is None and query_states.dtype in (torch.float16, torch.bfloat16):
+            # flash_attn_func expects [B, L, H, D] layout (already in this format)
+            attn_output = attention.flash_attn_func(query_states, key_states, value_states)
+        else:
+            # Fallback to PyTorch SDPA: needs [B, H, L, D] layout
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+            attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
+            attn_output = attn_output.transpose(1, 2)
 
-        attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
 
