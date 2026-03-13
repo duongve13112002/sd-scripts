@@ -395,10 +395,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                     anima.prepare_block_swap_before_forward()
 
         # Differential Guidance: amplify target in regions where model is most wrong
-        if getattr(args, 'do_differential_guidance', False):
-            with torch.no_grad():
-                diff_scale = getattr(args, 'differential_guidance_scale', 3.0)
-                target = model_pred + diff_scale * (target - model_pred)
+        # if getattr(args, 'do_differential_guidance', False):
+        #     with torch.no_grad():
+        #         diff_scale = getattr(args, 'differential_guidance_scale', 3.0)
+        #         target = model_pred + diff_scale * (target - model_pred)
 
         # Loss weighting
         weighting = anima_train_utils.compute_loss_weighting_for_anima(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
