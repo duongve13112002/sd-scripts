@@ -718,11 +718,11 @@ def train(args):
                         if is_swapping_blocks:
                             accelerator.unwrap_model(dit).prepare_block_swap_before_forward()
 
-                # Differential Guidance: amplify target in regions where model is most wrong
-                if getattr(args, 'do_differential_guidance', False):
-                    with torch.no_grad():
-                        diff_scale = getattr(args, 'differential_guidance_scale', 3.0)
-                        target = model_pred + diff_scale * (target - model_pred)
+                # # Differential Guidance: amplify target in regions where model is most wrong
+                # if getattr(args, 'do_differential_guidance', False):
+                #     with torch.no_grad():
+                #         diff_scale = getattr(args, 'differential_guidance_scale', 3.0)
+                #         target = model_pred + diff_scale * (target - model_pred)
 
                 # Weighting
                 weighting = anima_train_utils.compute_loss_weighting_for_anima(
