@@ -5,7 +5,7 @@ import re
 from typing import Dict, List, Optional, Tuple, Type, Union
 import torch
 from library.utils import setup_logging
-from networks.lora_flux import LoRAModule, LoRAInfModule
+from networks.lora_flux import LoRAModule, LoRAInfModule, DoRAModule
 
 import logging
 
@@ -65,6 +65,11 @@ def create_network(
     if module_dropout is not None:
         module_dropout = float(module_dropout)
 
+    # DoRA mode
+    use_dora = kwargs.get("use_dora", "false")
+    if use_dora is not None:
+        use_dora = True if use_dora.lower() == "true" else False
+
     # verbose
     verbose = kwargs.get("verbose", "false")
     if verbose is not None:
@@ -104,6 +109,8 @@ def create_network(
     else:
         reg_dims = None
 
+    module_class = DoRAModule if use_dora else LoRAModule
+
     network = LoRANetwork(
         text_encoders,
         unet,
@@ -113,6 +120,7 @@ def create_network(
         dropout=neuron_dropout,
         rank_dropout=rank_dropout,
         module_dropout=module_dropout,
+        module_class=module_class,
         train_llm_adapter=train_llm_adapter,
         exclude_patterns=exclude_patterns,
         include_patterns=include_patterns,
@@ -145,6 +153,7 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
     modules_dim = {}
     modules_alpha = {}
     train_llm_adapter = False
+    has_dora = False
     for key, value in weights_sd.items():
         if "." not in key:
             continue
@@ -155,11 +164,18 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
         elif "lora_down" in key:
             dim = value.size()[0]
             modules_dim[lora_name] = dim
+        elif "dora_scale" in key:
+            has_dora = True
 
         if "llm_adapter" in lora_name:
             train_llm_adapter = True
 
-    module_class = LoRAInfModule if for_inference else LoRAModule
+    if for_inference:
+        module_class = LoRAInfModule
+    elif has_dora:
+        module_class = DoRAModule
+    else:
+        module_class = LoRAModule
 
     network = LoRANetwork(
         text_encoders,
@@ -381,6 +397,12 @@ class LoRANetwork(torch.nn.Module):
         else:
             weights_sd = torch.load(file, map_location="cpu")
 
+        # Rename dora_scale → magnitude for DoRA modules
+        for key in list(weights_sd.keys()):
+            if key.endswith(".dora_scale"):
+                new_key = key.replace(".dora_scale", ".magnitude")
+                weights_sd[new_key] = weights_sd.pop(key)
+
         info = self.load_state_dict(weights_sd, False)
         return info
 
@@ -552,6 +574,14 @@ class LoRANetwork(torch.nn.Module):
             metadata = None
 
         state_dict = self.state_dict()
+
+        # DoRA: rename magnitude → dora_scale for ComfyUI, remove internal buffers
+        for key in list(state_dict.keys()):
+            if key.endswith(".magnitude"):
+                new_key = key.replace(".magnitude", ".dora_scale")
+                state_dict[new_key] = state_dict.pop(key)
+            elif key.endswith("._org_weight_norm"):
+                del state_dict[key]
 
         if dtype is not None:
             for key in list(state_dict.keys()):
