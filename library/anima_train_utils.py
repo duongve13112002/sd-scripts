@@ -47,7 +47,7 @@ def anima_smart_shuffle_caption(flex_tokens: List[str]) -> List[str]:
     # Split suffix into sections delimited by "on the ..." tags
     sections: list[list[str]] = [[]]
     for tag in suffix:
-        if tag.lower().startswith("on the "):
+        if tag.startswith("On the ") or tag.startswith("In the "):
             sections.append([tag])
         else:
             sections[-1].append(tag)
@@ -56,7 +56,7 @@ def anima_smart_shuffle_caption(flex_tokens: List[str]) -> List[str]:
     for section in sections:
         if not section:
             continue
-        if section[0].lower().startswith("on the "):
+        if section[0].startswith("On the ") or section[0].startswith("In the "):
             header, body = [section[0]], section[1:]
         else:
             header, body = [], section
