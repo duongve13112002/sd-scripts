@@ -511,6 +511,15 @@ def get_noisy_model_input_and_timesteps(
         timesteps = noise_scheduler.timesteps[indices].to(device=device)
         sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
 
+    # Restrict sigma range (P-GRAFT-inspired timestep restriction)
+    t_min = getattr(args, "t_min", None)
+    t_max = getattr(args, "t_max", None)
+    if t_min is not None or t_max is not None:
+        lo = t_min if t_min is not None else 0.0
+        hi = t_max if t_max is not None else 1.0
+        sigmas = lo + sigmas * (hi - lo)
+        timesteps = sigmas * num_timesteps
+
     # Broadcast sigmas to latent shape
     sigmas = sigmas.view(-1, 1, 1, 1) if latents.ndim == 4 else sigmas.view(-1, 1, 1, 1, 1)
 
