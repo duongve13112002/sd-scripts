@@ -4150,6 +4150,19 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="set maximum time step for U-Net training (1~1000, default is 1000) / U-Net学習時のtime stepの最大値を設定する（1~1000で指定、省略時はデフォルト値(1000)）",
     )
     parser.add_argument(
+        "--t_min",
+        type=float,
+        default=None,
+        help="Restrict training sigma range: minimum sigma (0.0~1.0). Sigmas are remapped to [t_min, t_max]. "
+        "Inspired by P-GRAFT (arXiv:2510.02692) — e.g., --t_min=0.75 trains only on high-noise timesteps.",
+    )
+    parser.add_argument(
+        "--t_max",
+        type=float,
+        default=None,
+        help="Restrict training sigma range: maximum sigma (0.0~1.0). Sigmas are remapped to [t_min, t_max]. Default 1.0.",
+    )
+    parser.add_argument(
         "--loss_type",
         type=str,
         default="l2",

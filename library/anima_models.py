@@ -1554,7 +1554,16 @@ class LLMAdapterAttention(nn.Module):
 
         self.o_proj = nn.Linear(inner_dim, query_dim, bias=False)
 
-    def forward(self, x, mask=None, context=None, position_embeddings=None, position_embeddings_context=None):
+    def forward(self, x, q_mask=None, kv_mask=None, context=None, position_embeddings=None, position_embeddings_context=None):
+        """
+        Args:
+            x: Query input [B, L_q, D].
+            q_mask: Optional 2-D bool mask [B, L_q] — True = valid token.
+            kv_mask: Optional 2-D bool mask [B, L_kv] — True = valid token.
+            context: Key/Value input [B, L_kv, D]. Defaults to x (self-attention).
+            position_embeddings: (cos, sin) for query RoPE.
+            position_embeddings_context: (cos, sin) for key RoPE.
+        """
         context = x if context is None else context
         input_shape = x.shape[:-1]
         q_shape = (*input_shape, self.n_heads, self.head_dim)
@@ -1573,17 +1582,50 @@ class LLMAdapterAttention(nn.Module):
             cos, sin = position_embeddings_context
             key_states = _adapter_apply_rotary_pos_emb(key_states.transpose(1, 2), cos, sin).transpose(1, 2)
 
-        # Use flash attention when available for fp32 softmax accumulators and memory savings.
-        # Fall back to SDPA when mask is provided (flash doesn't support arbitrary masks).
-        if attention.flash_attn_func is not None and mask is None and query_states.dtype in (torch.float16, torch.bfloat16):
-            # flash_attn_func expects [B, L, H, D] layout (already in this format)
+        can_use_flash = (
+            attention.flash_attn_varlen_func is not None
+            and query_states.dtype in (torch.float16, torch.bfloat16)
+        )
+
+        if can_use_flash and q_mask is None and kv_mask is None:
+            # No masking — simple flash attention, [B, L, H, D] layout
             attn_output = attention.flash_attn_func(query_states, key_states, value_states)
+        elif can_use_flash:
+            # Varlen flash attention: pack valid tokens, attend, unpack
+            B, L_q = query_states.shape[:2]
+            L_kv = key_states.shape[1]
+
+            eff_q_mask = q_mask if q_mask is not None else query_states.new_ones(B, L_q, dtype=torch.bool)
+            eff_kv_mask = kv_mask if kv_mask is not None else key_states.new_ones(B, L_kv, dtype=torch.bool)
+
+            q_seqlens = eff_q_mask.sum(dim=1, dtype=torch.int32)
+            kv_seqlens = eff_kv_mask.sum(dim=1, dtype=torch.int32)
+
+            cu_seqlens_q = F.pad(q_seqlens.cumsum(0, dtype=torch.int32), (1, 0))
+            cu_seqlens_kv = F.pad(kv_seqlens.cumsum(0, dtype=torch.int32), (1, 0))
+
+            # Pack by removing padding: [B, L, H, D] → [total_valid, H, D]
+            q_packed = query_states[eff_q_mask]
+            k_packed = key_states[eff_kv_mask]
+            v_packed = value_states[eff_kv_mask]
+
+            out_packed = attention.flash_attn_varlen_func(
+                q_packed, k_packed, v_packed,
+                cu_seqlens_q, cu_seqlens_kv,
+                q_seqlens.max().item(), kv_seqlens.max().item(),
+            )
+
+            # Unpack: [total_valid_q, H, D] → [B, L_q, H, D]
+            attn_output = query_states.new_zeros(B, L_q, self.n_heads, self.head_dim)
+            attn_output[eff_q_mask] = out_packed
         else:
             # Fallback to PyTorch SDPA: needs [B, H, L, D] layout
             query_states = query_states.transpose(1, 2)
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
-            attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
+            # Expand kv_mask to 4D for SDPA broadcasting: [B, L] → [B, 1, 1, L]
+            sdpa_mask = kv_mask[:, None, None, :] if kv_mask is not None else None
+            attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=sdpa_mask)
             attn_output = attn_output.transpose(1, 2)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -1634,7 +1676,8 @@ class LLMAdapterTransformerBlock(nn.Module):
             normed = self.norm_self_attn(x)
             attn_out = self.self_attn(
                 normed,
-                mask=target_attention_mask,
+                q_mask=target_attention_mask,
+                kv_mask=target_attention_mask,
                 position_embeddings=position_embeddings,
                 position_embeddings_context=position_embeddings,
             )
@@ -1643,7 +1686,8 @@ class LLMAdapterTransformerBlock(nn.Module):
         normed = self.norm_cross_attn(x)
         attn_out = self.cross_attn(
             normed,
-            mask=source_attention_mask,
+            q_mask=target_attention_mask,
+            kv_mask=source_attention_mask,
             context=context,
             position_embeddings=position_embeddings,
             position_embeddings_context=position_embeddings_context,
@@ -1705,15 +1749,17 @@ class LLMAdapter(nn.Module):
                 extra_mask = torch.ones(B, num_extra, device=target_attention_mask.device, dtype=target_attention_mask.dtype)
                 target_attention_mask = torch.cat([target_attention_mask, extra_mask], dim=-1)
 
+        # Keep masks as 2D [B, L] bool tensors — the attention layer handles
+        # expansion to 4D for SDPA or packing for flash_attn_varlen_func.
         if target_attention_mask is not None:
             target_attention_mask = target_attention_mask.to(torch.bool)
-            if target_attention_mask.ndim == 2:
-                target_attention_mask = target_attention_mask.unsqueeze(1).unsqueeze(1)
+            if target_attention_mask.ndim == 4:
+                target_attention_mask = target_attention_mask.squeeze(1).squeeze(1)
 
         if source_attention_mask is not None:
             source_attention_mask = source_attention_mask.to(torch.bool)
-            if source_attention_mask.ndim == 2:
-                source_attention_mask = source_attention_mask.unsqueeze(1).unsqueeze(1)
+            if source_attention_mask.ndim == 4:
+                source_attention_mask = source_attention_mask.squeeze(1).squeeze(1)
 
         x = self.in_proj(self.embed(target_input_ids))
 
