@@ -665,6 +665,44 @@ class LoRANetwork(torch.nn.Module):
 
         state_dict = self.state_dict()
 
+        # OrthoLoRA → standard LoRA conversion for ComfyUI compatibility
+        # Compute ΔW = P·diag(λ)·Q - P_base·diag(λ_base)·Q_base, then SVD → lora_up/lora_down
+        ortho_prefixes = set()
+        for key in state_dict.keys():
+            if key.endswith(".base_lambda"):
+                ortho_prefixes.add(key[: -len(".base_lambda")])
+
+        for prefix in ortho_prefixes:
+            P = state_dict[f"{prefix}.p_layer.weight"]  # (out_dim, rank)
+            Q = state_dict[f"{prefix}.q_layer.weight"]  # (rank, in_dim)
+            lam = state_dict[f"{prefix}.lambda_layer"]  # (1, rank)
+            P_base = state_dict[f"{prefix}.base_p_weight"]  # (out_dim, rank)
+            Q_base = state_dict[f"{prefix}.base_q_weight"]  # (rank, in_dim)
+            lam_base = state_dict[f"{prefix}.base_lambda"]  # (1, rank)
+            alpha = state_dict.get(f"{prefix}.alpha")
+            rank = Q.shape[0]
+
+            # Effective delta weight (out_dim × in_dim), use GPU for SVD speed
+            svd_device = "cuda" if torch.cuda.is_available() else "cpu"
+            delta_w = (P @ (lam.squeeze(0).unsqueeze(1) * Q) - P_base @ (lam_base.squeeze(0).unsqueeze(1) * Q_base)).float().to(svd_device)
+
+            # SVD decomposition → standard LoRA format
+            U, S, Vh = torch.linalg.svd(delta_w, full_matrices=False)
+            # Keep original rank (the delta is rank-2r at most, but we truncate to r for compat)
+            save_dtype = dtype if dtype is not None else P.dtype
+            lora_up = (U[:, :rank] * S[:rank].sqrt().unsqueeze(0)).to(save_dtype).cpu().contiguous()
+            lora_down = (S[:rank].sqrt().unsqueeze(1) * Vh[:rank, :]).to(save_dtype).cpu().contiguous()
+
+            # Remove OrthoLoRA keys
+            for suffix in ["p_layer.weight", "q_layer.weight", "lambda_layer", "base_p_weight", "base_q_weight", "base_lambda"]:
+                state_dict.pop(f"{prefix}.{suffix}", None)
+
+            # Add standard LoRA keys
+            state_dict[f"{prefix}.lora_up.weight"] = lora_up
+            state_dict[f"{prefix}.lora_down.weight"] = lora_down
+            if alpha is not None:
+                state_dict[f"{prefix}.alpha"] = alpha
+
         # DoRA: rename magnitude → dora_scale for ComfyUI, remove internal buffers
         for key in list(state_dict.keys()):
             if key.endswith(".magnitude"):
