@@ -5,7 +5,7 @@ import re
 from typing import Dict, List, Optional, Tuple, Type, Union
 import torch
 from library.utils import setup_logging
-from networks.lora_flux import LoRAModule, LoRAInfModule, DoRAModule
+from networks.lora_flux import LoRAModule, LoRAInfModule, DoRAModule, OrthoLoRAModule
 
 import logging
 
@@ -70,6 +70,23 @@ def create_network(
     if use_dora is not None:
         use_dora = True if use_dora.lower() == "true" else False
 
+    # OrthoLoRA mode
+    use_ortho = kwargs.get("use_ortho", "false")
+    if use_ortho is not None:
+        use_ortho = True if use_ortho.lower() == "true" else False
+    sig_type = kwargs.get("sig_type", "last")
+    ortho_reg_weight = kwargs.get("ortho_reg_weight", None)
+    ortho_reg_weight = float(ortho_reg_weight) if ortho_reg_weight is not None else 0.01
+
+    # Timestep-dependent rank masking
+    use_timestep_mask = kwargs.get("use_timestep_mask", "false")
+    if use_timestep_mask is not None:
+        use_timestep_mask = True if use_timestep_mask.lower() == "true" else False
+    min_rank = kwargs.get("min_rank", None)
+    min_rank = int(min_rank) if min_rank is not None else 1
+    alpha_rank_scale = kwargs.get("alpha_rank_scale", None)
+    alpha_rank_scale = float(alpha_rank_scale) if alpha_rank_scale is not None else 1.0
+
     # verbose
     verbose = kwargs.get("verbose", "false")
     if verbose is not None:
@@ -109,7 +126,12 @@ def create_network(
     else:
         reg_dims = None
 
-    module_class = DoRAModule if use_dora else LoRAModule
+    if use_dora:
+        module_class = DoRAModule
+    elif use_ortho:
+        module_class = OrthoLoRAModule
+    else:
+        module_class = LoRAModule
 
     network = LoRANetwork(
         text_encoders,
@@ -127,7 +149,20 @@ def create_network(
         reg_dims=reg_dims,
         reg_lrs=reg_lrs,
         verbose=verbose,
+        sig_type=sig_type,
     )
+
+    # Set timestep mask and ortho regularization config
+    network._use_timestep_mask = use_timestep_mask
+    network._min_rank = min_rank
+    network._max_rank = network_dim
+    network._alpha_rank_scale = alpha_rank_scale
+    network._ortho_reg_weight = ortho_reg_weight if use_ortho else 0.0
+
+    if use_timestep_mask:
+        logger.info(f"Timestep-dependent rank masking: min_rank={min_rank}, alpha={alpha_rank_scale}")
+    if use_ortho:
+        logger.info(f"OrthoLoRA: sig_type={sig_type}, ortho_reg_weight={ortho_reg_weight}")
 
     loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
     loraplus_unet_lr_ratio = kwargs.get("loraplus_unet_lr_ratio", None)
@@ -154,6 +189,7 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
     modules_alpha = {}
     train_llm_adapter = False
     has_dora = False
+    has_ortho = False
     for key, value in weights_sd.items():
         if "." not in key:
             continue
@@ -164,6 +200,10 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
         elif "lora_down" in key:
             dim = value.size()[0]
             modules_dim[lora_name] = dim
+        elif "q_layer" in key and "weight" in key and "base_" not in key:
+            dim = value.size()[0]
+            modules_dim[lora_name] = dim
+            has_ortho = True
         elif "dora_scale" in key:
             has_dora = True
 
@@ -174,6 +214,8 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
         module_class = LoRAInfModule
     elif has_dora:
         module_class = DoRAModule
+    elif has_ortho:
+        module_class = OrthoLoRAModule
     else:
         module_class = LoRAModule
 
@@ -219,6 +261,7 @@ class LoRANetwork(torch.nn.Module):
         reg_dims: Optional[Dict[str, int]] = None,
         reg_lrs: Optional[Dict[str, float]] = None,
         verbose: Optional[bool] = False,
+        sig_type: str = "last",
     ) -> None:
         super().__init__()
         self.multiplier = multiplier
@@ -230,6 +273,7 @@ class LoRANetwork(torch.nn.Module):
         self.train_llm_adapter = train_llm_adapter
         self.reg_dims = reg_dims
         self.reg_lrs = reg_lrs
+        self.sig_type = sig_type
 
         self.loraplus_lr_ratio = None
         self.loraplus_unet_lr_ratio = None
@@ -269,8 +313,8 @@ class LoRANetwork(torch.nn.Module):
         ) -> Tuple[List[LoRAModule], List[str]]:
             prefix = self.LORA_PREFIX_ANIMA if is_unet else self.LORA_PREFIX_TEXT_ENCODER
 
-            loras = []
-            skipped = []
+            # First pass: collect candidate modules
+            candidates = []
             for name, module in root_module.named_modules():
                 if target_replace_modules is None or module.__class__.__name__ in target_replace_modules:
                     if target_replace_modules is None:
@@ -285,7 +329,7 @@ class LoRANetwork(torch.nn.Module):
                             original_name = (name + "." if name else "") + child_name
                             lora_name = f"{prefix}.{original_name}".replace(".", "_")
 
-                            # exclude/include filter (fullmatch: pattern must match the entire original_name)
+                            # exclude/include filter
                             excluded = any(pattern.fullmatch(original_name) for pattern in exclude_re_patterns)
                             included = any(pattern.fullmatch(original_name) for pattern in include_re_patterns)
                             if excluded and not included:
@@ -308,7 +352,6 @@ class LoRANetwork(torch.nn.Module):
                                             alpha_val = self.alpha
                                             logger.info(f"Module {original_name} matched with regex '{reg}' -> dim: {dim}")
                                             break
-                                # fallback to default dim if not matched by reg_dims or reg_dims is not specified
                                 if dim is None:
                                     if is_linear or is_conv2d_1x1:
                                         dim = default_dim if default_dim is not None else self.lora_dim
@@ -316,30 +359,49 @@ class LoRANetwork(torch.nn.Module):
 
                             if dim is None or dim == 0:
                                 if is_linear or is_conv2d_1x1:
-                                    skipped.append(lora_name)
+                                    candidates.append((lora_name, None, None, None, original_name, True))  # skipped
                                 continue
 
-                            lora = module_class(
-                                lora_name,
-                                child_module,
-                                self.multiplier,
-                                dim,
-                                alpha_val,
-                                dropout=dropout,
-                                rank_dropout=rank_dropout,
-                                module_dropout=module_dropout,
-                            )
-                            lora.original_name = original_name
-                            loras.append(lora)
+                            candidates.append((lora_name, child_module, dim, alpha_val, original_name, False))
 
                     if target_replace_modules is None:
                         break
+
+            # Second pass: create LoRA modules with progress bar
+            from tqdm import tqdm
+
+            loras = []
+            skipped = []
+            non_skipped = [(ln, cm, d, a, on) for ln, cm, d, a, on, skip in candidates if not skip]
+            skipped = [ln for ln, cm, d, a, on, skip in candidates if skip]
+
+            label = "DiT" if is_unet else f"TE{text_encoder_idx + 1}" if text_encoder_idx is not None else "model"
+            for lora_name, child_module, dim, alpha_val, original_name in tqdm(non_skipped, desc=f"Creating {label} LoRA", leave=False):
+                extra_kwargs = {}
+                if module_class == OrthoLoRAModule:
+                    extra_kwargs["sig_type"] = self.sig_type
+
+                lora = module_class(
+                    lora_name,
+                    child_module,
+                    self.multiplier,
+                    dim,
+                    alpha_val,
+                    dropout=dropout,
+                    rank_dropout=rank_dropout,
+                    module_dropout=module_dropout,
+                    **extra_kwargs,
+                )
+                lora.original_name = original_name
+                loras.append(lora)
+
             return loras, skipped
 
         # Create LoRA for text encoders (Qwen3 - typically not trained for Anima)
+        # Skip for OrthoLoRA since SVD init is expensive and TE modules are discarded in apply_to anyway
         self.text_encoder_loras: List[Union[LoRAModule, LoRAInfModule]] = []
         skipped_te = []
-        if text_encoders is not None:
+        if text_encoders is not None and module_class != OrthoLoRAModule:
             for i, text_encoder in enumerate(text_encoders):
                 if text_encoder is None:
                     continue
@@ -388,6 +450,34 @@ class LoRANetwork(torch.nn.Module):
     def set_enabled(self, is_enabled):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.enabled = is_enabled
+
+    def set_timestep_mask(self, timesteps: torch.Tensor, max_timestep: float = 1.0):
+        """Compute and set timestep-dependent rank mask on all modules."""
+        if not getattr(self, "_use_timestep_mask", False):
+            return
+        t = timesteps.float().mean().item()
+        r = int(((max_timestep - t) / max_timestep) ** self._alpha_rank_scale * (self._max_rank - self._min_rank)) + self._min_rank
+        r = min(r, self._max_rank)  # clamp
+        mask = torch.zeros(1, self._max_rank)
+        mask[:, :r] = 1.0
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora._timestep_mask = mask
+
+    def clear_timestep_mask(self):
+        """Remove timestep mask (use full rank)."""
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora._timestep_mask = None
+
+    def get_ortho_regularization(self) -> torch.Tensor:
+        """Sum orthogonality regularization from all OrthoLoRA modules."""
+        total_reg = torch.tensor(0.0, device=next(self.parameters()).device)
+        count = 0
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if hasattr(lora, "regularization"):
+                p_reg, q_reg = lora.regularization()
+                total_reg = total_reg + p_reg + q_reg
+                count += 1
+        return total_reg / max(count, 1)
 
     def load_weights(self, file):
         if os.path.splitext(file)[1] == ".safetensors":
@@ -491,13 +581,13 @@ class LoRANetwork(torch.nn.Module):
                         group_key = f"reg_lr_{reg_idx}"
                         if group_key not in reg_groups:
                             reg_groups[group_key] = {"lora": {}, "plus": {}, "lr": reg_lr}
-                        if loraplus_ratio is not None and "lora_up" in name:
+                        if loraplus_ratio is not None and ("lora_up" in name or "p_layer" in name):
                             reg_groups[group_key]["plus"][f"{lora.lora_name}.{name}"] = param
                         else:
                             reg_groups[group_key]["lora"][f"{lora.lora_name}.{name}"] = param
                         continue
 
-                    if loraplus_ratio is not None and "lora_up" in name:
+                    if loraplus_ratio is not None and ("lora_up" in name or "p_layer" in name):
                         param_groups["plus"][f"{lora.lora_name}.{name}"] = param
                     else:
                         param_groups["lora"][f"{lora.lora_name}.{name}"] = param

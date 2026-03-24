@@ -172,7 +172,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return strategy_anima.AnimaTextEncodingStrategy()
 
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
-        pass
+        self._network = network  # store reference for ortho regularization in post_process_loss
 
     def get_models_for_text_encoding(self, args, accelerator, text_encoders):
         if args.cache_text_encoder_outputs:
@@ -315,6 +315,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         )
         timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
 
+        # Set timestep-dependent rank mask on LoRA modules
+        if hasattr(network, "set_timestep_mask"):
+            network.set_timestep_mask(timesteps, max_timestep=1.0)
+
         # Gradient checkpointing support
         if args.gradient_checkpointing:
             noisy_model_input.requires_grad_(True)
@@ -418,6 +422,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 )
         model_pred = model_pred.squeeze(2)  # 5D to 4D, [B, C, 1, H, W] -> [B, C, H, W]
 
+        # Note: do NOT clear timestep mask here — gradient checkpointing recomputes the forward
+        # pass during backward, so the mask must remain set. It gets overwritten on the next step.
+
         # Rectified flow target: noise - latents
         target = noise - latents
 
@@ -481,6 +488,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         )
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
+        # Orthogonality regularization for OrthoLoRA
+        if hasattr(self, "_network") and getattr(self._network, "_ortho_reg_weight", 0) > 0:
+            ortho_reg = self._network.get_ortho_regularization()
+            loss = loss + self._network._ortho_reg_weight * ortho_reg
         return loss
 
     def get_sai_model_spec(self, args):

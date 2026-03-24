@@ -109,6 +109,8 @@ class LoRAModule(torch.nn.Module):
 
         self.fp32_accumulation = False
 
+        self._timestep_mask = None
+
         self.ggpo_sigma = ggpo_sigma
         self.ggpo_beta = ggpo_beta
 
@@ -139,6 +141,10 @@ class LoRAModule(torch.nn.Module):
                 lx = torch.nn.functional.linear(x.float(), self.lora_down.weight.float())
             else:
                 lx = self.lora_down(x)
+
+            # timestep-dependent rank masking
+            if self._timestep_mask is not None and self.training:
+                lx = lx * self._timestep_mask.to(lx.device)
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -190,6 +196,10 @@ class LoRAModule(torch.nn.Module):
                 return org_forwarded + lx * self.multiplier * scale
         else:
             lxs = [lora_down(x) for lora_down in self.lora_down]
+
+            # timestep-dependent rank masking
+            if self._timestep_mask is not None and self.training:
+                lxs = [lx * self._timestep_mask.to(lx.device) for lx in lxs]
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -374,6 +384,10 @@ class DoRAModule(LoRAModule):
         else:
             lx = self.lora_down(x)
 
+        # timestep-dependent rank masking
+        if self._timestep_mask is not None and self.training:
+            lx = lx * self._timestep_mask.to(lx.device)
+
         # normal dropout
         if self.dropout is not None and self.training:
             lx = torch.nn.functional.dropout(lx, p=self.dropout)
@@ -408,6 +422,142 @@ class DoRAModule(LoRAModule):
             mag_scale = mag_scale.unsqueeze(0)  # [1, out_dim]
 
         return mag_scale * (org_out + lora_out)
+
+
+class OrthoLoRAModule(torch.nn.Module):
+    """
+    Orthogonal LoRA: SVD-based weight parameterization for better initialization.
+    Uses P @ diag(λ) @ Q decomposition with frozen base copies to ensure zero output at init.
+    Orthogonality regularization keeps P and Q close to orthonormal bases during training.
+    Reference: T-LoRA (AAAI 2026)
+    """
+
+    def __init__(
+        self,
+        lora_name,
+        org_module: torch.nn.Module,
+        multiplier=1.0,
+        lora_dim=4,
+        alpha=1,
+        dropout=None,
+        rank_dropout=None,
+        module_dropout=None,
+        sig_type="last",
+    ):
+        super().__init__()
+        self.lora_name = lora_name
+
+        if org_module.__class__.__name__ == "Conv2d":
+            raise ValueError("OrthoLoRAModule does not support Conv2d")
+
+        in_dim = org_module.in_features
+        out_dim = org_module.out_features
+
+        self.lora_dim = lora_dim
+
+        # Q: in_dim -> rank, P: rank -> out_dim, λ: [1, rank]
+        self.q_layer = torch.nn.Linear(in_dim, lora_dim, bias=False)
+        self.p_layer = torch.nn.Linear(lora_dim, out_dim, bias=False)
+        self.lambda_layer = torch.nn.Parameter(torch.ones(1, lora_dim))
+
+        # SVD-based orthogonal initialization (use GPU for speed if available)
+        svd_device = "cuda" if torch.cuda.is_available() else "cpu"
+        base_m = torch.normal(mean=0, std=1.0 / lora_dim, size=(in_dim, out_dim), device=svd_device)
+        u, s, v = torch.linalg.svd(base_m)
+        u, s, v = u.cpu(), s.cpu(), v.cpu()
+
+        if sig_type == "principal":
+            self.q_layer.weight.data = u[:lora_dim].clone().contiguous()
+            self.p_layer.weight.data = v[:, :lora_dim].clone().contiguous()
+            self.lambda_layer.data = s[None, :lora_dim].clone().contiguous()
+        elif sig_type == "last":
+            self.q_layer.weight.data = u[-lora_dim:].clone().contiguous()
+            self.p_layer.weight.data = v[:, -lora_dim:].clone().contiguous()
+            self.lambda_layer.data = s[None, -lora_dim:].clone().contiguous()
+        elif sig_type == "middle":
+            start_u = math.ceil((u.shape[0] - lora_dim) / 2)
+            self.q_layer.weight.data = u[start_u : start_u + lora_dim].clone().contiguous()
+            start_v = math.ceil((v.shape[1] - lora_dim) / 2)
+            self.p_layer.weight.data = v[:, start_v : start_v + lora_dim].clone().contiguous()
+            start_s = math.ceil((s.shape[0] - lora_dim) / 2)
+            self.lambda_layer.data = s[None, start_s : start_s + lora_dim].clone().contiguous()
+
+        del u, s, v, base_m
+
+        # Frozen base copies for residual (ensures zero output at init)
+        self.register_buffer("base_q_weight", self.q_layer.weight.data.clone().contiguous())
+        self.register_buffer("base_p_weight", self.p_layer.weight.data.clone().contiguous())
+        self.register_buffer("base_lambda", self.lambda_layer.data.clone().contiguous())
+
+        if type(alpha) == torch.Tensor:
+            alpha = alpha.detach().float().numpy()
+        alpha = lora_dim if alpha is None or alpha == 0 else alpha
+        self.scale = alpha / lora_dim
+        self.register_buffer("alpha", torch.tensor(alpha))
+
+        self.multiplier = multiplier
+        self.org_module = org_module
+        self.dropout = dropout
+        self.rank_dropout = rank_dropout
+        self.module_dropout = module_dropout
+
+        self._timestep_mask = None
+
+    def apply_to(self):
+        self.org_forward = self.org_module.forward
+        self.org_module.forward = self.forward
+        del self.org_module
+
+    def forward(self, x):
+        org_forwarded = self.org_forward(x)
+
+        # module dropout
+        if self.module_dropout is not None and self.training:
+            if torch.rand(1) < self.module_dropout:
+                return org_forwarded
+
+        dtype = self.q_layer.weight.dtype
+
+        # timestep mask
+        mask = self._timestep_mask.to(x.device) if self._timestep_mask is not None else 1.0
+
+        # trainable path
+        q_out = self.q_layer(x.to(dtype)) * self.lambda_layer * mask
+
+        # normal dropout
+        if self.dropout is not None and self.training:
+            q_out = torch.nn.functional.dropout(q_out, p=self.dropout)
+
+        # rank dropout
+        if self.rank_dropout is not None and self.training:
+            rd_mask = torch.rand((q_out.size(0), self.lora_dim), device=q_out.device) > self.rank_dropout
+            if len(q_out.size()) == 3:
+                rd_mask = rd_mask.unsqueeze(1)
+            q_out = q_out * rd_mask
+            scale = self.scale * (1.0 / (1.0 - self.rank_dropout))
+        else:
+            scale = self.scale
+
+        p_out = self.p_layer(q_out)
+
+        # frozen base path (residual subtraction ensures zero output at init)
+        base_out = torch.nn.functional.linear(
+            torch.nn.functional.linear(x.to(dtype), self.base_q_weight) * self.base_lambda * mask,
+            self.base_p_weight,
+        )
+
+        lora_out = (p_out - base_out) * self.multiplier * scale
+        return org_forwarded + lora_out.to(org_forwarded.dtype)
+
+    def regularization(self):
+        """Orthogonality regularization: ‖PᵀP - I‖² + ‖QQᵀ - I‖²"""
+        p_reg = torch.sum(
+            (self.p_layer.weight.T @ self.p_layer.weight - torch.eye(self.lora_dim, device=self.p_layer.weight.device)) ** 2
+        )
+        q_reg = torch.sum(
+            (self.q_layer.weight @ self.q_layer.weight.T - torch.eye(self.lora_dim, device=self.q_layer.weight.device)) ** 2
+        )
+        return p_reg, q_reg
 
 
 class LoRAInfModule(LoRAModule):
