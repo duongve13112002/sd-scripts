@@ -386,7 +386,7 @@ class Sd3TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                 l_attn_mask_o, g_attn_mask_o, t5_attn_mask_o = l_attn_mask, g_attn_mask, t5_attn_mask
 
             if self.cache_to_disk:
-                np.savez(
+                self.save_outputs_npz(
                     info.text_encoder_outputs_npz,
                     lg_out=lg_out_o,
                     lg_pooled=lg_pooled_o,

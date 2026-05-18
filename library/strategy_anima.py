@@ -267,7 +267,7 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                 t5_attn_mask_out = t5_attn_mask
 
             if self.cache_to_disk:
-                np.savez(
+                self.save_outputs_npz(
                     info.text_encoder_outputs_npz,
                     prompt_embeds=prompt_embeds_out,
                     attn_mask=attn_mask_out,
