@@ -17,6 +17,10 @@ from library.utils import setup_logging
 setup_logging()
 import logging
 
+
+def _write_npz(npz_path: str, kwargs: dict):
+    np.savez(npz_path, **kwargs)
+
 logger = logging.getLogger(__name__)
 
 
@@ -370,6 +374,39 @@ class TextEncoderOutputsCachingStrategy:
 
     def is_disk_cached_outputs_expected(self, npz_path: str) -> bool:
         raise NotImplementedError
+
+    def set_async_write_executor(self, executor):
+        """Set a ThreadPoolExecutor for async disk writes. Pass None to disable."""
+        self._write_executor = executor
+        self._write_futures = []
+
+    def wait_for_async_writes(self):
+        """Wait for all pending async disk writes to complete and check for errors."""
+        futures = getattr(self, "_write_futures", [])
+        for f in futures:
+            f.result()
+        self._write_futures = []
+
+    def submit_async_write(self, fn, *args):
+        """Submit a disk write to the background executor if available, else run inline."""
+        executor = getattr(self, "_write_executor", None)
+        if executor is not None:
+            if not hasattr(self, "_write_futures"):
+                self._write_futures = []
+            future = executor.submit(fn, *args)
+            self._write_futures.append(future)
+            self._write_futures = [f for f in self._write_futures if not f.done()]
+        else:
+            fn(*args)
+
+    def save_outputs_npz(self, npz_path: str, **kwargs):
+        """Save text encoder outputs to npz, async if executor is set.
+
+        Numpy arrays are copied before handoff so the calling thread can
+        immediately reuse its encode buffers without data races.
+        """
+        safe_kwargs = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in kwargs.items()}
+        self.submit_async_write(_write_npz, npz_path, safe_kwargs)
 
     def cache_batch_outputs(
         self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, batch: List

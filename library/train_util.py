@@ -1350,6 +1350,16 @@ class BaseDataset(torch.utils.data.Dataset):
         num_processes = accelerator.num_processes
         process_index = accelerator.process_index
 
+        total_images = len(image_infos)
+        if caching_strategy.cache_to_disk and num_processes > 1:
+            my_image_count = sum(1 for i in range(total_images) if i % num_processes == process_index)
+        else:
+            my_image_count = total_images
+        logger.info(
+            f"[Process {process_index + 1}/{num_processes}] device={accelerator.device}, "
+            f"will encode {my_image_count}/{total_images} text encoder outputs"
+        )
+
         logger.info("checking cache validity...")
         for i, info in enumerate(tqdm(image_infos)):
             # check disk cache exists and size of text encoder outputs
@@ -1380,11 +1390,26 @@ class BaseDataset(torch.utils.data.Dataset):
             logger.info("no Text Encoder outputs to cache")
             return
 
-        # iterate batches
-        logger.info("caching Text Encoder outputs...")
-        for batch in tqdm(batches, smoothing=1, total=len(batches)):
-            # cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.alpha_mask, subset.random_crop)
-            caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
+        # Set up async write executor to overlap GPU encoding with disk I/O
+        write_executor = None
+        if caching_strategy.cache_to_disk:
+            write_workers = max(1, os.cpu_count() // num_processes)
+            write_workers = min(write_workers, batch_size)
+            write_executor = ThreadPoolExecutor(max_workers=write_workers)
+            caching_strategy.set_async_write_executor(write_executor)
+
+        try:
+            # iterate batches
+            logger.info("caching Text Encoder outputs...")
+            for batch in tqdm(batches, smoothing=1, total=len(batches)):
+                caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
+
+            if write_executor is not None:
+                caching_strategy.wait_for_async_writes()
+        finally:
+            if write_executor is not None:
+                caching_strategy.set_async_write_executor(None)
+                write_executor.shutdown(wait=True)
 
     # if weight_dtype is specified, Text Encoder itself and output will be converted to the dtype
     # this method is only for SDXL, but it should be implemented here because it needs to be a method of dataset

@@ -228,23 +228,21 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         t5_attn_mask = t5_attn_mask.cpu().numpy().astype(np.int32)
 
         for i, info in enumerate(infos):
-            prompt_embeds_i = prompt_embeds[i]
-            attn_mask_i = attn_mask[i]
-            t5_input_ids_i = t5_input_ids[i]
-            t5_attn_mask_i = t5_attn_mask[i]
             caption_dropout_rate = torch.tensor(info.caption_dropout_rate, dtype=torch.float32)
 
             if self.cache_to_disk:
-                np.savez(
+                self.save_outputs_npz(
                     info.text_encoder_outputs_npz,
-                    prompt_embeds=prompt_embeds_i,
-                    attn_mask=attn_mask_i,
-                    t5_input_ids=t5_input_ids_i,
-                    t5_attn_mask=t5_attn_mask_i,
+                    prompt_embeds=prompt_embeds[i],
+                    attn_mask=attn_mask[i],
+                    t5_input_ids=t5_input_ids[i],
+                    t5_attn_mask=t5_attn_mask[i],
                     caption_dropout_rate=caption_dropout_rate,
                 )
             else:
-                info.text_encoder_outputs = (prompt_embeds_i, attn_mask_i, t5_input_ids_i, t5_attn_mask_i, caption_dropout_rate)
+                info.text_encoder_outputs = (
+                    prompt_embeds[i], attn_mask[i], t5_input_ids[i], t5_attn_mask[i], caption_dropout_rate
+                )
 
 
 class AnimaLatentsCachingStrategy(LatentsCachingStrategy):
