@@ -1148,6 +1148,24 @@ class BaseDataset(torch.utils.data.Dataset):
         num_processes = accelerator.num_processes
         process_index = accelerator.process_index
 
+        # Diagnostic: show how many images this process will actually encode
+        total_images = len(image_infos)
+        if caching_strategy.cache_to_disk and num_processes > 1:
+            my_image_count = sum(1 for i in range(total_images) if i % num_processes == process_index)
+        else:
+            my_image_count = total_images
+        logger.info(
+            f"[Process {process_index + 1}/{num_processes}] device={accelerator.device}, "
+            f"will encode {my_image_count}/{total_images} images"
+        )
+        if num_processes == 1 and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            logger.warning(
+                f"cache_to_disk is enabled but only 1 process is running while "
+                f"{torch.cuda.device_count()} GPUs are visible. "
+                f"Launch with 'accelerate launch --num_processes {torch.cuda.device_count()}' "
+                f"to distribute caching across all GPUs."
+            )
+
         # define a function to submit a batch to cache
         def submit_batch(batch, cond):
             for info in batch:
@@ -1164,6 +1182,17 @@ class BaseDataset(torch.utils.data.Dataset):
         max_workers = max(1, max_workers // num_processes)  # consider multi-gpu
         max_workers = min(max_workers, caching_strategy.batch_size)  # max_workers should be less than batch_size
         executor = ThreadPoolExecutor(max_workers)
+
+        # Use a separate thread pool for disk writes so the GPU can encode the next
+        # batch while the previous batch is being written to disk (overlap I/O and compute).
+        # Workers are capped by (cpu_count / num_processes) so multiple GPU processes
+        # don't oversubscribe the CPU, and by batch_size since that's the max concurrent writes.
+        write_executor = None
+        if caching_strategy.cache_to_disk:
+            write_workers = max(1, os.cpu_count() // num_processes)
+            write_workers = min(write_workers, caching_strategy.batch_size)
+            write_executor = ThreadPoolExecutor(max_workers=write_workers)
+            caching_strategy.set_async_write_executor(write_executor)
 
         try:
             # iterate images
@@ -1216,8 +1245,15 @@ class BaseDataset(torch.utils.data.Dataset):
             if len(batch) > 0:
                 submit_batch(batch, current_condition)
 
+            # Wait for all pending async disk writes to finish before returning
+            if write_executor is not None:
+                caching_strategy.wait_for_async_writes()
+
         finally:
             executor.shutdown()
+            if write_executor is not None:
+                caching_strategy.set_async_write_executor(None)
+                write_executor.shutdown(wait=True)
 
     def cache_latents(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True, file_suffix=".npz"):
         # マルチGPUには対応していないので、そちらはtools/cache_latents.pyを使うこと
