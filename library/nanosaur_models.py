@@ -830,7 +830,7 @@ class _RotaryEmbeddingDinoV3(nn.Module):
 
     def _create_embed(self, feat_shape) -> torch.Tensor:
         coords = _make_coords_dinov3(feat_shape[0], feat_shape[1], normalize_coords=self.normalize_coords,
-                                      grid_indexing=self.grid_indexing, grid_offset=self.grid_offset)
+                                     grid_indexing=self.grid_indexing, grid_offset=self.grid_offset)
         coords = coords[:, :, None].to(device=self.periods.device, dtype=self.periods.dtype)
         angles = 2 * math.pi * coords / self.periods[None, None, :]
         angles = angles.flatten(1).tile(2)
@@ -958,7 +958,7 @@ class _EvaDinoV3(nn.Module):
         return self.pos_drop(x), self.rope.get_embed(shape=(h, w))
 
     def forward_intermediates(self, x: torch.Tensor, indices=None, norm: bool = False,
-                               output_fmt: str = "NCHW", intermediates_only: bool = False):
+                              output_fmt: str = "NCHW", intermediates_only: bool = False):
         if output_fmt != "NCHW":
             raise ValueError("Only NCHW output is supported.")
         take_indices, _ = _feature_take_indices(len(self.blocks), indices)
@@ -1083,7 +1083,9 @@ class _Decoder(nn.Module):
             attn = nn.ModuleList()
             block_out = ch * ch_mult[i_level]
             for _ in range(self.num_res_blocks + 1):
-                block.append(_ResnetBlock(in_channels=block_in, out_channels=block_out, temb_channels=0, dropout=dropout))
+                block.append(
+                    _ResnetBlock(in_channels=block_in, out_channels=block_out, temb_channels=0, dropout=dropout)
+                )
                 block_in = block_out
                 if curr_res in attn_resolutions:
                     attn.append(_AttnBlock(block_in))

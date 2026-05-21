@@ -27,14 +27,12 @@ Usage (SPRINT disabled for debugging):
 """
 
 import argparse
-import math
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
 from safetensors.torch import load_file
-from tqdm import tqdm
 
 from library.nanosaur_models import NanoSaurTransformer2DModel
 from library.nanosaur_utils import (
@@ -42,10 +40,7 @@ from library.nanosaur_utils import (
     load_nanosaur_text_encoder,
     load_nanosaur_vae,
 )
-from library.nanosaur_train_util import (
-    get_sampling_timesteps,
-    rectified_flow_sample,
-)
+from library.nanosaur_train_util import rectified_flow_sample
 from library import nanosaur_models
 
 
@@ -217,7 +212,6 @@ def generate(
     )
 
     # Decode
-    vae.vae.to(device)
     images = vae.decode(denoised)  # (B, 3, H, W) in [-1, 1]
 
     pil_images = []

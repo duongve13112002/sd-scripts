@@ -8,8 +8,7 @@
 
 import math
 import os
-import re
-from typing import Dict, List, Optional, Tuple, Type, Union
+from typing import Dict, List, Optional, Type
 
 import torch
 import torch.nn as nn
@@ -557,7 +556,11 @@ class LoRANetwork(nn.Module):
 
             if lora_name in lookup and lora_name.startswith(self.LORA_PREFIX_UNET):
                 orig = lookup[lora_name]
-                new_key = f"{self.COMFYUI_DIFFUSION_PREFIX}.{orig}.{sub_key}" if sub_key else f"{self.COMFYUI_DIFFUSION_PREFIX}.{orig}"
+                new_key = (
+                    f"{self.COMFYUI_DIFFUSION_PREFIX}.{orig}.{sub_key}"
+                    if sub_key
+                    else f"{self.COMFYUI_DIFFUSION_PREFIX}.{orig}"
+                )
                 comfyui_sd[new_key] = value
             else:
                 # keep as-is for TE keys or unknown keys

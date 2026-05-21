@@ -21,8 +21,7 @@ Full argument reference: docs/nanosaur_train_network.md
 """
 
 import argparse
-import copy
-from typing import Any, List, Optional, Tuple
+from typing import Tuple
 
 import torch
 from accelerate import Accelerator
@@ -164,7 +163,7 @@ class NanoSaurNetworkTrainer(train_network.NetworkTrainer):
                 logger.info("Moving VAE and UNet to CPU to save memory during text encoder caching")
                 org_vae_device = vae.device
                 org_unet_device = unet.device
-                vae.vae.to("cpu")
+                vae.to("cpu")
                 unet.to("cpu")
                 clean_memory_on_device(accelerator.device)
 
@@ -205,7 +204,7 @@ class NanoSaurNetworkTrainer(train_network.NetworkTrainer):
 
             if not args.lowram:
                 logger.info("Restoring VAE and UNet to original device")
-                vae.vae.to(org_vae_device)
+                vae.to(org_vae_device)
                 unet.to(org_unet_device)
         else:
             text_encoders[0].to(accelerator.device, dtype=weight_dtype)

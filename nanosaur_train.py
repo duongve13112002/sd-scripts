@@ -181,7 +181,7 @@ def train(args: argparse.Namespace) -> None:
         )
     else:
         train_dataset_group = train_util.load_arbitrary_dataset(args)
-        val_dataset_group = None
+        val_dataset_group = None  # noqa: F841
 
     train_dataset_group.verify_bucket_reso_steps(16)
 

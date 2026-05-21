@@ -259,7 +259,8 @@ class NanoSaurLatentsCachingStrategy(LatentsCachingStrategy):
         ``model`` is expected to be a ``NanoSaurVAEWrapper`` whose ``encode``
         method returns already-scaled latents.
         """
-        encode_by_vae = lambda img_tensor: model.encode(img_tensor).to("cpu")
+        def encode_by_vae(img_tensor):
+            return model.encode(img_tensor).to("cpu")
         vae_device = model.device
         vae_dtype = model.dtype
 

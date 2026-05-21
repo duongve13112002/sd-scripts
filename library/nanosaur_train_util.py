@@ -5,19 +5,19 @@ import argparse
 import math
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
+
 from accelerate import Accelerator, PartialState
 from PIL import Image
 from safetensors.torch import save_file
 from tqdm import tqdm
 
-from library import nanosaur_models, strategy_base, strategy_nanosaur, train_util
+from library import nanosaur_models, strategy_base, train_util
 from library.device_utils import clean_memory_on_device
-from library.nanosaur_models import LATENT_SCALE, LATENT_SHIFT, NanoSaurTransformer2DModel
+from library.nanosaur_models import NanoSaurTransformer2DModel
 from library.nanosaur_utils import NanoSaurVAEWrapper
 from library.safetensors_utils import mem_eff_save_file
 import logging
@@ -349,9 +349,9 @@ def sample_images(
 
         # Decode to image
         org_vae_device = vae.device
-        vae.vae.to(accelerator.device)
+        vae.to(accelerator.device)
         decoded = vae.decode(denoised)  # (1, 3, H, W) in [-1, 1]
-        vae.vae.to(org_vae_device)
+        vae.to(org_vae_device)
         clean_memory_on_device(accelerator.device)
 
         decoded = decoded.clamp(-1.0, 1.0).float().cpu()
