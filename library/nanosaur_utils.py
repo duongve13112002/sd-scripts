@@ -126,6 +126,8 @@ def load_nanosaur_model(
     dtype: Optional[torch.dtype],
     device: Union[str, torch.device],
     disable_mmap: bool = False,
+    use_flash_attn: bool = False,
+    use_sage_attn: bool = False,
 ) -> NanoSaurTransformer2DModel:
     """
     Load the NanoSaur diffusion transformer from a safetensors checkpoint.
@@ -151,6 +153,8 @@ def load_nanosaur_model(
             num_text_blocks=MODEL_TEXT_BLOCKS,
             patch_size=MODEL_PATCH,
             txt_embed_dim=TEXT_EMBED_DIM,
+            use_flash_attn=use_flash_attn,
+            use_sage_attn=use_sage_attn,
         ).to(dtype or torch.float32)
 
     logger.info(f"Loading NanoSaur state dict from {ckpt_path}")

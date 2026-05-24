@@ -508,14 +508,46 @@ class LoRANetwork(nn.Module):
         return True
 
     def merge_to(self, text_encoders, unet, weights_sd: dict, dtype=None, device=None) -> None:
+        # Accept both ComfyUI format (diffusion_model.*) and internal format (lora_unet_*)
+        weights_sd = self._maybe_convert_comfyui_to_internal(weights_sd)
+
         for lora in self.text_encoder_loras + self.unet_loras:
             sd_for_lora = {
                 k[len(lora.lora_name) + 1:]: v
                 for k, v in weights_sd.items()
                 if k.startswith(lora.lora_name + ".")
             }
-            if sd_for_lora:
-                lora.merge_to(sd_for_lora, dtype, device)
+            if not sd_for_lora:
+                continue
+
+            # Locate the original module in the model by dotted path
+            target = unet
+            try:
+                for part in lora.original_name.split("."):
+                    target = target[int(part)] if part.isdigit() else getattr(target, part)
+            except (AttributeError, IndexError, KeyError, TypeError):
+                logger.warning(f"merge_to: cannot find module '{lora.original_name}', skipping")
+                continue
+
+            down_w = sd_for_lora["lora_down.weight"].float()
+            up_w = sd_for_lora["lora_up.weight"].float()
+            w = target.weight.data.float()
+            dev = device or target.weight.device
+
+            if len(w.shape) == 2:
+                delta = lora.multiplier * (up_w @ down_w) * lora.scale
+            elif down_w.shape[2:] == (1, 1):
+                delta = lora.multiplier * (
+                    (up_w.squeeze(3).squeeze(2) @ down_w.squeeze(3).squeeze(2))
+                    .unsqueeze(2).unsqueeze(3)
+                ) * lora.scale
+            else:
+                conved = nn.functional.conv2d(down_w.permute(1, 0, 2, 3), up_w).permute(1, 0, 2, 3)
+                delta = lora.multiplier * conved * lora.scale
+
+            merged = (w + delta.to(w.device)).to(dtype=dtype or target.weight.dtype, device=dev)
+            target.weight.data.copy_(merged)
+
         logger.info("NanoSaur LoRA weights merged")
 
     def load_weights(self, file: str):
@@ -685,9 +717,12 @@ class LoRANetwork(nn.Module):
 
         internal_sd = self.state_dict()
 
-        # Cast dtype
+        # Cast dtype; keep alpha buffers in float32 regardless (ComfyUI spec)
         if dtype is not None:
-            internal_sd = {k: v.detach().clone().to("cpu").to(dtype) for k, v in internal_sd.items()}
+            internal_sd = {
+                k: v.detach().clone().to("cpu").to(torch.float32 if k.endswith(".alpha") else dtype)
+                for k, v in internal_sd.items()
+            }
         else:
             internal_sd = {k: v.detach().clone().to("cpu") for k, v in internal_sd.items()}
 

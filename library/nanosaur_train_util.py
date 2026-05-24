@@ -514,3 +514,17 @@ def add_nanosaur_train_arguments(parser: argparse.ArgumentParser) -> None:
         help="Disable SPRINT (path drop guidance) optimization during sampling. "
         "/ サンプリング中のSPRINT (パスドロップガイダンス) 最適化を無効にする。",
     )
+    parser.add_argument(
+        "--use_flash_attn",
+        action="store_true",
+        default=False,
+        help="Use Flash Attention (requires flash_attn package). Falls back to SDPA if unavailable. "
+        "/ Flash Attentionを使用する (flash_attnパッケージが必要)。",
+    )
+    parser.add_argument(
+        "--use_sage_attn",
+        action="store_true",
+        default=False,
+        help="Use SageAttention for faster inference (requires sageattention package). Inference only — not recommended for training. "
+        "/ SageAttentionを使用して高速推論を行う (sageattentionパッケージが必要)。推論のみ推奨。",
+    )

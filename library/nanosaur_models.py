@@ -13,6 +13,11 @@ from torch.nn.functional import scaled_dot_product_attention as attention
 from library import custom_offloading_utils
 import logging
 
+try:
+    from sageattention import sageattn as _sageattn
+except ImportError:
+    _sageattn = None
+
 logger = logging.getLogger(__name__)
 
 # Model constants
@@ -191,18 +196,49 @@ class Attention(nn.Module):
     """Combined self-attention + cross-attention over text tokens."""
 
     def __init__(
-        self, dim: int, num_heads: int = 8, qkv_bias: bool = False, use_cross_attention: bool = True
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        use_cross_attention: bool = True,
+        use_flash_attn: bool = False,
+        use_sage_attn: bool = False,
     ):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.use_cross_attention = use_cross_attention
+        self.use_flash_attn = use_flash_attn
+        self.use_sage_attn = use_sage_attn
         self.qkv_x = nn.Linear(dim, dim * 3, bias=qkv_bias)
         if use_cross_attention:
             self.kv_y = nn.Linear(dim, dim * 2, bias=qkv_bias)
         self.q_norm = Norm(dim // num_heads)
         self.k_norm = Norm(dim // num_heads)
         self.proj = nn.Linear(dim, dim)
+
+    def _attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # q/k/v: (B, H, N, D)
+        if self.use_sage_attn and attn_mask is None:
+            if _sageattn is None:
+                raise RuntimeError(
+                    "SageAttention not installed. "
+                    "Install from https://github.com/thu-ml/SageAttention"
+                )
+            # sageattn expects (B, H, N, D) with tensor_layout="HND"
+            return _sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+        if self.use_flash_attn and attn_mask is None:
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=True, enable_math=False, enable_mem_efficient=False
+            ):
+                return attention(q, k, v)
+        return attention(q, k, v, attn_mask=attn_mask)
 
     def forward(
         self,
@@ -234,9 +270,9 @@ class Attention(nn.Module):
             y_token_bias = torch.log(torch.clamp(y_token_weights, min=1e-4))
             x_token_bias = torch.zeros(b, n, device=q.device, dtype=q.dtype)
             attn_bias = torch.cat([x_token_bias, y_token_bias], dim=1)[:, None, None, :]
-            x = attention(q, k, v, attn_mask=attn_bias)
+            x = self._attn(q, k, v, attn_mask=attn_bias)
         else:
-            x = attention(q, k, v)
+            x = self._attn(q, k, v)
         return self.proj(x.transpose(1, 2).reshape(b, n, c))
 
 
@@ -250,10 +286,19 @@ class FlattenDiTBlock(nn.Module):
         mlp_ratio: float = 4,
         is_encoder_block: bool = False,
         use_cross_attention: bool = True,
+        use_flash_attn: bool = False,
+        use_sage_attn: bool = False,
     ):
         super().__init__()
         self.norm1 = Norm(hidden_size, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=groups, qkv_bias=False, use_cross_attention=use_cross_attention)
+        self.attn = Attention(
+            hidden_size,
+            num_heads=groups,
+            qkv_bias=False,
+            use_cross_attention=use_cross_attention,
+            use_flash_attn=use_flash_attn,
+            use_sage_attn=use_sage_attn,
+        )
         self.norm2 = Norm(hidden_size, eps=1e-6)
         self.mlp = FeedForward(hidden_size, int(hidden_size * mlp_ratio))
         self.is_encoder_block = is_encoder_block
@@ -326,10 +371,19 @@ class NerfEmbedder(nn.Module):
 class TextRefineAttention(nn.Module):
     """Self-attention used inside TextRefineBlock."""
 
-    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        use_flash_attn: bool = False,
+        use_sage_attn: bool = False,
+    ):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
+        self.use_flash_attn = use_flash_attn
+        self.use_sage_attn = use_sage_attn
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = Norm(dim // num_heads)
         self.k_norm = Norm(dim // num_heads)
@@ -341,21 +395,46 @@ class TextRefineAttention(nn.Module):
         q, k, v = qkv_x[0], qkv_x[1], qkv_x[2]
         q = self.q_norm(q)
         k = self.k_norm(k)
-        x = attention(
-            q.view(b, self.num_heads, -1, c // self.num_heads),
-            k.view(b, self.num_heads, -1, c // self.num_heads),
-            v.view(b, self.num_heads, -1, c // self.num_heads),
-        )
+        q = q.view(b, self.num_heads, -1, c // self.num_heads)
+        k = k.view(b, self.num_heads, -1, c // self.num_heads)
+        v = v.view(b, self.num_heads, -1, c // self.num_heads)
+        if self.use_sage_attn:
+            if _sageattn is None:
+                raise RuntimeError(
+                    "SageAttention not installed. "
+                    "Install from https://github.com/thu-ml/SageAttention"
+                )
+            x = _sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+        elif self.use_flash_attn:
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=True, enable_math=False, enable_mem_efficient=False
+            ):
+                x = attention(q, k, v)
+        else:
+            x = attention(q, k, v)
         return self.proj(x.transpose(1, 2).reshape(b, n, c))
 
 
 class TextRefineBlock(nn.Module):
     """Refines text embeddings conditioned on timestep."""
 
-    def __init__(self, hidden_size: int, groups: int, mlp_ratio: float = 4):
+    def __init__(
+        self,
+        hidden_size: int,
+        groups: int,
+        mlp_ratio: float = 4,
+        use_flash_attn: bool = False,
+        use_sage_attn: bool = False,
+    ):
         super().__init__()
         self.norm1 = Norm(hidden_size, eps=1e-6)
-        self.attn = TextRefineAttention(hidden_size, num_heads=groups, qkv_bias=False)
+        self.attn = TextRefineAttention(
+            hidden_size,
+            num_heads=groups,
+            qkv_bias=False,
+            use_flash_attn=use_flash_attn,
+            use_sage_attn=use_sage_attn,
+        )
         self.norm2 = Norm(hidden_size, eps=1e-6)
         self.mlp = FeedForward(hidden_size, int(hidden_size * mlp_ratio))
         self.adaLN_modulation = nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
@@ -455,6 +534,8 @@ class NanoSaurTransformer2DModel(nn.Module):
         sprint_num_f: int = 2,
         sprint_num_h: int = 2,
         rope_scale: float = 2 * math.pi,
+        use_flash_attn: bool = False,
+        use_sage_attn: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -491,12 +572,22 @@ class NanoSaurTransformer2DModel(nn.Module):
                     num_groups,
                     is_encoder_block=True,
                     use_cross_attention=(i % 2 == 0),
+                    use_flash_attn=use_flash_attn,
+                    use_sage_attn=use_sage_attn,
                 )
                 for i in range(num_encoder_blocks)
             ]
         )
         self.text_refine_blocks = nn.ModuleList(
-            [TextRefineBlock(hidden_size, num_groups) for _ in range(num_text_blocks)]
+            [
+                TextRefineBlock(
+                    hidden_size,
+                    num_groups,
+                    use_flash_attn=use_flash_attn,
+                    use_sage_attn=use_sage_attn,
+                )
+                for _ in range(num_text_blocks)
+            ]
         )
         self.local_context = LocalContext2D(hidden_size, num_encoder_blocks)
         self.dec_net = SimpleMLPAdaLN(

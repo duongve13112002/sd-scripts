@@ -269,6 +269,10 @@ def train(args: argparse.Namespace) -> None:
         accelerator.wait_for_everyone()
         gemma3 = None
         clean_memory_on_device(accelerator.device)
+    else:
+        # Online encoding: keep Gemma3 on device throughout training
+        logger.info("Online text encoding enabled — Gemma3 will encode each batch on-the-fly")
+        gemma3.to(accelerator.device, dtype=weight_dtype)
 
     # Load diffusion model
 
@@ -278,6 +282,8 @@ def train(args: argparse.Namespace) -> None:
         weight_dtype,
         torch.device("cpu"),
         disable_mmap=args.disable_mmap_load_safetensors,
+        use_flash_attn=getattr(args, "use_flash_attn", False),
+        use_sage_attn=getattr(args, "use_sage_attn", False),
     )
 
     if args.gradient_checkpointing:
@@ -397,10 +403,14 @@ def train(args: argparse.Namespace) -> None:
                         logger.error("No cached text encoder outputs found in batch!")
                         continue
                 else:
-                    raise NotImplementedError(
-                        "Online text encoding not yet implemented for nanosaur_train.py. "
-                        "Use --cache_text_encoder_outputs instead."
-                    )
+                    # Online text encoding: tokenize and encode captions per step
+                    captions = batch["captions"]
+                    with torch.no_grad():
+                        tokens = tokenize_strategy.tokenize(captions)
+                        te_outputs = text_encoding_strategy.encode_tokens(
+                            tokenize_strategy, [gemma3], tokens
+                        )
+                    hidden_states = te_outputs[0].to(weight_dtype)
 
                 # Sample noise and timesteps
                 noise = torch.randn_like(latents)
@@ -459,7 +469,7 @@ def train(args: argparse.Namespace) -> None:
                         global_step=global_step,
                         model=accelerator.unwrap_model(model),
                         vae=_vae,
-                        text_encoders=[None],  # use cached outputs only
+                        text_encoders=[gemma3],  # None when cached, model when online
                         sample_prompts_te_outputs=sample_prompts_te_outputs,
                     )
 

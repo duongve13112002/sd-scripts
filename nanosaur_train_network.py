@@ -88,6 +88,8 @@ class NanoSaurNetworkTrainer(train_network.NetworkTrainer):
             loading_dtype,
             torch.device("cpu"),
             disable_mmap=args.disable_mmap_load_safetensors,
+            use_flash_attn=getattr(args, "use_flash_attn", False),
+            use_sage_attn=getattr(args, "use_sage_attn", False),
         )
 
         if args.fp8_base:
