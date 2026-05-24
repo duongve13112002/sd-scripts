@@ -154,7 +154,7 @@ Besides the arguments explained in the [train_network.py guide](train_network.md
 
 * `--network_module=networks.lora_nanosaur` **required** – Use the NanoSaur LoRA module.
 * `--network_dim=<integer>` – LoRA rank. Default `16`. Larger values capture more information but increase file size and VRAM usage.
-* `--network_alpha=<float>` – LoRA alpha (scaling factor). Commonly set equal to `--network_dim`. Default `16`.
+* `--network_alpha=<float>` – LoRA alpha (scaling factor). Commonly set equal to `--network_dim`. Default `16`. Alpha values are always saved as float32 regardless of the `--save_precision` setting, so no precision loss occurs.
 * `--network_train_unet_only` – If set, only trains LoRA for the diffusion model (DiT), skipping the Gemma3 text encoder. By default both diffusion model and text encoder are trained.
 * `--network_args` – Additional network arguments. Supported keys:
   * `"target_modules=FlattenDiTBlock,TextRefineBlock"` – Comma-separated list of target module types for LoRA injection. Defaults to all trainable module types.
@@ -172,16 +172,19 @@ Besides the arguments explained in the [train_network.py guide](train_network.md
 #### Memory and Speed / メモリ・速度関連
 
 * `--blocks_to_swap=<integer>` – Number of Transformer blocks to offload between CPU and GPU. Reduces VRAM usage at the cost of training speed. Recommended: `10–18` for 24 GB VRAM cards. Cannot be combined with `--cpu_offload_checkpointing`.
-* `--cache_text_encoder_outputs` – Cache Gemma3 outputs to avoid repeated text encoder forward passes. Reduces VRAM and speeds up training when the text encoder is not being trained.
+* `--cache_text_encoder_outputs` – Cache Gemma3 outputs to avoid repeated text encoder forward passes. Reduces VRAM and speeds up training when the text encoder is not being trained. If omitted, online encoding is used (Gemma3 runs every step).
 * `--cache_text_encoder_outputs_to_disk` – Cache text encoder outputs to disk. Automatically enables `--cache_text_encoder_outputs`.
 * `--cache_latents` / `--cache_latents_to_disk` – Cache VAE latents in memory / on disk. Strongly recommended for multi-resolution bucket training.
 * `--fp8_base` – Load the diffusion model in FP8 precision to save VRAM. Requires a compatible GPU (e.g., NVIDIA Ada or Hopper architecture).
 * `--gradient_checkpointing` – Enable gradient checkpointing to reduce VRAM at the cost of slightly slower backward passes.
+* `--use_flash_attn` – Enable Flash Attention for the DiT and TextRefineBlocks. Requires the `flash_attn` package (`pip install flash_attn`). Falls back to PyTorch SDPA if unavailable. Speeds up training on supported CUDA GPUs.
+* `--use_sage_attn` – Enable SageAttention for the DiT and TextRefineBlocks. Requires the `sageattention` package. Primarily recommended for inference; not recommended during training. Incompatible with attention bias (e.g., token weights), which automatically falls back to SDPA.
 
 #### Incompatible or Deprecated Options / 非互換・非推奨の引数
 
 * `--v2`, `--v_parameterization`, `--clip_skip` – Stable Diffusion v1/v2 options not used for NanoSaur.
-* `--noise_offset` – Not applicable to NanoSaur's rectified flow matching.
+* `--noise_offset`, `--multires_noise_iterations`, `--ip_noise_gamma` – Not applicable to NanoSaur's rectified flow matching; these options are silently ignored.
+* `--min_snr_gamma` – SNR weighting is not applicable to NanoSaur's logistic-normal timestep schedule; this option is silently ignored.
 
 <details>
 <summary>日本語</summary>
@@ -198,7 +201,7 @@ Besides the arguments explained in the [train_network.py guide](train_network.md
 
 * `--network_module=networks.lora_nanosaur` **[必須]** – NanoSaur LoRAモジュールを使用します。
 * `--network_dim=<integer>` – LoRAランク。デフォルトは`16`。値が大きいほど多くの情報を捉えますが、ファイルサイズとVRAM使用量が増加します。
-* `--network_alpha=<float>` – LoRAのアルファ（スケーリング係数）。通常は`--network_dim`と同じ値に設定します。デフォルトは`16`。
+* `--network_alpha=<float>` – LoRAのアルファ（スケーリング係数）。通常は`--network_dim`と同じ値に設定します。デフォルトは`16`。アルファ値は常にfloat32で保存されるため、bf16/fp16保存時も精度が失われません。
 * `--network_train_unet_only` – 指定すると、拡散モデル（DiT）のLoRAのみを学習し、Gemma3テキストエンコーダーはスキップします。デフォルトでは拡散モデルとテキストエンコーダーの両方が学習されます。
 * `--network_args` – 追加ネットワーク引数。サポートするキー:
   * `"target_modules=FlattenDiTBlock,TextRefineBlock"` – LoRA注入の対象となるモジュールタイプのカンマ区切りリスト。デフォルトは全ての学習可能なモジュールタイプです。
@@ -216,16 +219,19 @@ Besides the arguments explained in the [train_network.py guide](train_network.md
 #### メモリ・速度関連
 
 * `--blocks_to_swap=<integer>` – CPUとGPU間でオフロードするTransformerブロック数。VRAMを節約できますが学習速度が低下します。24GB VRAMカードでは`10〜18`を推奨。`--cpu_offload_checkpointing`とは併用できません。
-* `--cache_text_encoder_outputs` – Gemma3の出力をキャッシュして、繰り返しのテキストエンコーダー前向き計算を省略します。テキストエンコーダーを学習させない場合、VRAMを削減し学習を高速化します。
+* `--cache_text_encoder_outputs` – Gemma3の出力をキャッシュして、繰り返しのテキストエンコーダー前向き計算を省略します。テキストエンコーダーを学習させない場合、VRAMを削減し学習を高速化します。省略するとオンラインエンコーディングが使用されます（毎ステップGemma3が実行されます）。
 * `--cache_text_encoder_outputs_to_disk` – テキストエンコーダー出力をディスクにキャッシュします。`--cache_text_encoder_outputs`が自動的に有効になります。
 * `--cache_latents` / `--cache_latents_to_disk` – VAEの潜在変数をメモリ/ディスクにキャッシュします。マルチ解像度バケット学習では強く推奨されます。
 * `--fp8_base` – 拡散モデルをFP8精度でロードしてVRAMを節約します。対応するGPUが必要です（例: NVIDIA AdaまたはHopperアーキテクチャ）。
 * `--gradient_checkpointing` – 勾配チェックポインティングを有効にして、バックワードパスが若干遅くなる代わりにVRAMを削減します。
+* `--use_flash_attn` – DiTおよびTextRefineBlocksのFlash Attentionを有効にします。`flash_attn`パッケージが必要です（`pip install flash_attn`）。利用不可の場合はPyTorch SDPAにフォールバックします。対応CUDAGPUで学習を高速化します。
+* `--use_sage_attn` – DiTおよびTextRefineBlocksのSageAttentionを有効にします。`sageattention`パッケージが必要です。主に推論時に推奨します。学習中は非推奨。アテンションバイアス（トークンウェイトなど）と非互換で、自動的にSDPAにフォールバックします。
 
 #### 非互換・非推奨の引数
 
 * `--v2`, `--v_parameterization`, `--clip_skip` – Stable Diffusion v1/v2向けの引数のため、NanoSaur学習では使用されません。
-* `--noise_offset` – NanoSaurのRectified Flow Matchingには適用されません。
+* `--noise_offset`、`--multires_noise_iterations`、`--ip_noise_gamma` – NanoSaurのRectified Flow Matchingには適用されません。これらのオプションは無視されます。
+* `--min_snr_gamma` – NanoSaurのロジスティック正規分布タイムステップスケジュールにはSNR重み付けが適用されません。このオプションは無視されます。
 </details>
 
 ### 4.2. Multi-GPU Training / マルチGPU学習
@@ -263,6 +269,8 @@ When training finishes, a LoRA model file (e.g. `my_nanosaur_lora.safetensors`) 
 ### ComfyUI
 
 The saved LoRA uses ComfyUI-compatible key format (`diffusion_model.{path}.lora_up.weight` / `.lora_down.weight`). It can be loaded directly in ComfyUI with the appropriate NanoSaur LoRA loader node.
+
+`merge_to` (merging LoRA weights directly into the base model) accepts both ComfyUI key format (`diffusion_model.*`) and the internal sd-scripts format (`lora_unet_*`), so LoRA files from either source can be merged without conversion.
 
 ### Inference with this repository / このリポジトリでの推論
 

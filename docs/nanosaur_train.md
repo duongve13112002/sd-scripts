@@ -188,11 +188,13 @@ accelerate launch --mixed_precision bf16 nanosaur_train.py \
 ### Memory and Speed / メモリ・速度関連
 
 * `--blocks_to_swap=<integer>` – Number of DiT blocks to offload to CPU. Reduces VRAM at the cost of training speed. Recommended: `10–18` for 24 GB cards.
-* `--cache_text_encoder_outputs` – Cache Gemma3 outputs (since the text encoder is not trained in full fine-tuning, this is highly recommended).
+* `--cache_text_encoder_outputs` – Cache Gemma3 outputs (since the text encoder is not trained in full fine-tuning, this is highly recommended). If omitted, online encoding is used — Gemma3 runs every training step, which increases VRAM usage but requires no pre-caching.
 * `--cache_text_encoder_outputs_to_disk` – Cache text encoder outputs to disk.
 * `--cache_latents` / `--cache_latents_to_disk` – Cache VAE latents in memory / on disk.
 * `--fp8_base` – Load model in FP8 precision.
 * `--mixed_precision="bf16"` – **Recommended.** Use bf16 mixed precision throughout.
+* `--use_flash_attn` – Enable Flash Attention for the DiT and TextRefineBlocks. Requires the `flash_attn` package. Falls back to PyTorch SDPA when unavailable.
+* `--use_sage_attn` – Enable SageAttention. Requires the `sageattention` package. Primarily recommended for inference; use with caution during training.
 
 ### Output / 出力関連
 
@@ -233,11 +235,13 @@ accelerate launch --mixed_precision bf16 nanosaur_train.py \
 ### メモリ・速度関連
 
 * `--blocks_to_swap=<integer>` – CPUにオフロードするDiTブロック数。VRAMを節約しますが学習速度が低下します。24GB VRAMカードでは`10〜18`を推奨。
-* `--cache_text_encoder_outputs` – Gemma3の出力をキャッシュします（フルファインチューニングではテキストエンコーダーは学習されないため、強く推奨します）。
+* `--cache_text_encoder_outputs` – Gemma3の出力をキャッシュします（フルファインチューニングではテキストエンコーダーは学習されないため、強く推奨します）。省略するとオンラインエンコーディングが使用されます（毎学習ステップGemma3が実行され、VRAMが増加しますが事前キャッシュは不要です）。
 * `--cache_text_encoder_outputs_to_disk` – テキストエンコーダー出力をディスクにキャッシュします。
 * `--cache_latents` / `--cache_latents_to_disk` – VAEの潜在変数をメモリ/ディスクにキャッシュします。
 * `--fp8_base` – FP8精度でモデルをロードします。
 * `--mixed_precision="bf16"` – **推奨。** bf16混合精度を使用します。
+* `--use_flash_attn` – DiTおよびTextRefineBlocksのFlash Attentionを有効にします。`flash_attn`パッケージが必要です。利用不可の場合はPyTorch SDPAにフォールバックします。
+* `--use_sage_attn` – SageAttentionを有効にします。`sageattention`パッケージが必要です。主に推論時に推奨。学習中は注意して使用してください。
 
 ### 出力関連
 
