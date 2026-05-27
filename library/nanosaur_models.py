@@ -18,6 +18,11 @@ try:
 except ImportError:
     _sageattn = None
 
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+except ImportError:
+    _flash_attn_func = None
+
 logger = logging.getLogger(__name__)
 
 # Model constants
@@ -234,10 +239,17 @@ class Attention(nn.Module):
             # sageattn expects (B, H, N, D) with tensor_layout="HND"
             return _sageattn(q, k, v, tensor_layout="HND", is_causal=False)
         if self.use_flash_attn and attn_mask is None:
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=True, enable_math=False, enable_mem_efficient=False
-            ):
-                return attention(q, k, v)
+            if _flash_attn_func is None:
+                raise RuntimeError(
+                    "flash_attn not installed. "
+                    "Install from https://github.com/Dao-AILab/flash-attention"
+                )
+            # flash_attn_func expects (B, N, H, D) — transpose from (B, H, N, D)
+            q_ = q.transpose(1, 2)  # (B, N, H, D)
+            k_ = k.transpose(1, 2)
+            v_ = v.transpose(1, 2)
+            out = _flash_attn_func(q_, k_, v_, dropout_p=0.0, causal=False)
+            return out.transpose(1, 2)  # back to (B, H, N, D)
         return attention(q, k, v, attn_mask=attn_mask)
 
     def forward(
@@ -406,10 +418,16 @@ class TextRefineAttention(nn.Module):
                 )
             x = _sageattn(q, k, v, tensor_layout="HND", is_causal=False)
         elif self.use_flash_attn:
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=True, enable_math=False, enable_mem_efficient=False
-            ):
-                x = attention(q, k, v)
+            if _flash_attn_func is None:
+                raise RuntimeError(
+                    "flash_attn not installed. "
+                    "Install from https://github.com/Dao-AILab/flash-attention"
+                )
+            # flash_attn_func expects (B, N, H, D) — transpose from (B, H, N, D)
+            q_ = q.transpose(1, 2)
+            k_ = k.transpose(1, 2)
+            v_ = v.transpose(1, 2)
+            x = _flash_attn_func(q_, k_, v_, dropout_p=0.0, causal=False).transpose(1, 2)
         else:
             x = attention(q, k, v)
         return self.proj(x.transpose(1, 2).reshape(b, n, c))
