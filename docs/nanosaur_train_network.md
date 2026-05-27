@@ -177,8 +177,21 @@ Besides the arguments explained in the [train_network.py guide](train_network.md
 * `--cache_latents` / `--cache_latents_to_disk` – Cache VAE latents in memory / on disk. Strongly recommended for multi-resolution bucket training.
 * `--fp8_base` – Load the diffusion model in FP8 precision to save VRAM. Requires a compatible GPU (e.g., NVIDIA Ada or Hopper architecture).
 * `--gradient_checkpointing` – Enable gradient checkpointing to reduce VRAM at the cost of slightly slower backward passes.
-* `--use_flash_attn` – Enable Flash Attention for the DiT and TextRefineBlocks. Requires the `flash_attn` package (`pip install flash_attn`). Falls back to PyTorch SDPA if unavailable. Speeds up training on supported CUDA GPUs.
-* `--use_sage_attn` – Enable SageAttention for the DiT and TextRefineBlocks. Requires the `sageattention` package. Primarily recommended for inference; not recommended during training. Incompatible with attention bias (e.g., token weights), which automatically falls back to SDPA.
+* `--use_flash_attn` – Enable Flash Attention for the DiT and TextRefineBlocks. Requires the `flash_attn` package (`pip install flash_attn`). Falls back to PyTorch SDPA if unavailable. Speeds up training on supported CUDA GPUs. See [installation note](#installing-optional-attention-packages-lora) below.
+* `--use_sage_attn` – Enable SageAttention for the DiT and TextRefineBlocks. Requires the `sageattention` package (`pip install sageattention`). Primarily recommended for inference; not recommended during training. See [installation note](#installing-optional-attention-packages-lora) below.
+
+> **Installing optional attention packages**<a name="installing-optional-attention-packages-lora"></a>
+>
+> `flash_attn` is the standalone CUDA kernel by [Dao-AI-Lab](https://github.com/Dao-AILab/flash-attention) — it is **not** the same as enabling PyTorch's built-in SDPA flash hint. It requires a CUDA GPU (compute capability ≥ 7.5, i.e. Turing / RTX 20xx or newer) and a CUDA toolkit matching your PyTorch build:
+>
+> ```bash
+> pip install flash_attn                      # compiles from source (~5–10 min)
+> pip install flash_attn --no-build-isolation # if the above fails on CUDA mismatch
+> ```
+>
+> `sageattention` is installed via `pip install sageattention` and has similar CUDA requirements.
+>
+> **Why `attn_mask is None`?** Both `flash_attn` and `sageattn` kernels do **not** accept additive attention bias tensors. NanoSaur's cross-attention can receive per-token weight biases when used via ComfyUI (prompt syntax `(word:1.5)` → log-space additive bias on attention scores). When such a bias is present (`attn_mask is not None`), the model automatically falls back to PyTorch SDPA. During sd-scripts training `attn_mask` is always `None`, so Flash Attention / SageAttention activate unconditionally when enabled.
 
 #### Incompatible or Deprecated Options / 非互換・非推奨の引数
 
@@ -224,8 +237,21 @@ Besides the arguments explained in the [train_network.py guide](train_network.md
 * `--cache_latents` / `--cache_latents_to_disk` – VAEの潜在変数をメモリ/ディスクにキャッシュします。マルチ解像度バケット学習では強く推奨されます。
 * `--fp8_base` – 拡散モデルをFP8精度でロードしてVRAMを節約します。対応するGPUが必要です（例: NVIDIA AdaまたはHopperアーキテクチャ）。
 * `--gradient_checkpointing` – 勾配チェックポインティングを有効にして、バックワードパスが若干遅くなる代わりにVRAMを削減します。
-* `--use_flash_attn` – DiTおよびTextRefineBlocksのFlash Attentionを有効にします。`flash_attn`パッケージが必要です（`pip install flash_attn`）。利用不可の場合はPyTorch SDPAにフォールバックします。対応CUDAGPUで学習を高速化します。
-* `--use_sage_attn` – DiTおよびTextRefineBlocksのSageAttentionを有効にします。`sageattention`パッケージが必要です。主に推論時に推奨します。学習中は非推奨。アテンションバイアス（トークンウェイトなど）と非互換で、自動的にSDPAにフォールバックします。
+* `--use_flash_attn` – DiTおよびTextRefineBlocksのFlash Attentionを有効にします。`flash_attn`パッケージが必要です（`pip install flash_attn`）。利用不可の場合はPyTorch SDPAにフォールバックします。対応CUDAGPUで学習を高速化します。下記のインストール注意事項を参照してください。
+* `--use_sage_attn` – DiTおよびTextRefineBlocksのSageAttentionを有効にします。`sageattention`パッケージが必要です（`pip install sageattention`）。主に推論時に推奨します。学習中は非推奨。下記のインストール注意事項を参照してください。
+
+> **オプションアテンションパッケージのインストール**
+>
+> `flash_attn` は [Dao-AI-Lab](https://github.com/Dao-AILab/flash-attention) によるスタンドアロンのCUDAカーネルです。PyTorchの組み込みSDPAフラッシュアテンションヒントとは**異なります**。CUDAが使えるGPU（コンピュート能力 ≥ 7.5、つまりTuring / RTX 20xx以降）と、お使いのPyTorchビルドに対応したCUDAツールキットが必要です：
+>
+> ```bash
+> pip install flash_attn                      # ソースからコンパイル（約5〜10分）
+> pip install flash_attn --no-build-isolation # CUDAバージョン不一致でエラーの場合
+> ```
+>
+> `sageattention` は `pip install sageattention` でインストールでき、同様のCUDA要件があります。
+>
+> **`attn_mask is None` について:** `flash_attn` と `sageattn` のカーネルは加算アテンションバイアステンソルを受け付けません。NanoSaurのクロスアテンションはComfyUI経由で使用する場合にトークンごとの重みバイアスを受け取ることがあります（プロンプト構文 `(word:1.5)` → アテンションスコアへの対数空間加算バイアス）。このようなバイアスが存在する場合（`attn_mask is not None`）、モデルは自動的にPyTorch SDPAにフォールバックします。sd-scriptsの学習中は `attn_mask` が常に `None` であるため、Flash Attention / SageAttentionは有効時に無条件で使用されます。
 
 #### 非互換・非推奨の引数
 
