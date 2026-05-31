@@ -57,6 +57,9 @@ class NanoSaurNetworkTrainer(train_network.NetworkTrainer):
         super().__init__()
         self.sample_prompts_te_outputs = None
         self.is_swapping_blocks: bool = False
+        # Empty-prompt (unconditional) embedding for classifier-free guidance dropout.
+        # Computed once in cache_text_encoder_outputs_if_needed; kept on CPU.
+        self.uncond_hidden = None
 
     # Extra arg validation
 
@@ -197,6 +200,9 @@ class NanoSaurNetworkTrainer(train_network.NetworkTrainer):
 
                 self.sample_prompts_te_outputs = sample_prompts_te_outputs
 
+            # Pre-compute the empty-prompt embedding for CFG dropout (TE still on GPU).
+            self._compute_uncond_hidden(args, accelerator, text_encoders)
+
             accelerator.wait_for_everyone()
 
             if not self.is_train_text_encoder(args):
@@ -210,6 +216,23 @@ class NanoSaurNetworkTrainer(train_network.NetworkTrainer):
                 unet.to(org_unet_device)
         else:
             text_encoders[0].to(accelerator.device, dtype=weight_dtype)
+            # Online encoding: TE stays on device — compute uncond embedding once.
+            self._compute_uncond_hidden(args, accelerator, text_encoders)
+
+    def _compute_uncond_hidden(self, args, accelerator, text_encoders):
+        """Encode the empty prompt once to use as the unconditional embedding for
+        classifier-free guidance dropout. Stored on CPU; skipped if dropout is off."""
+        if float(getattr(args, "cond_dropout_rate", 0.0)) <= 0.0:
+            return
+        tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+        text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
+        if tokenize_strategy is None or text_encoding_strategy is None:
+            return
+        with accelerator.autocast(), torch.no_grad():
+            tokens = tokenize_strategy.tokenize("")
+            uncond = text_encoding_strategy.encode_tokens(tokenize_strategy, text_encoders, tokens)
+        self.uncond_hidden = uncond[0].detach().to("cpu")
+        logger.info(f"NanoSaur: cached unconditional embedding for CFG dropout (rate={args.cond_dropout_rate})")
 
     # Noise scheduler
 
@@ -252,6 +275,16 @@ class NanoSaurNetworkTrainer(train_network.NetworkTrainer):
             latents.requires_grad_(True)
             if hidden_states is not None and hidden_states.dtype.is_floating_point:
                 hidden_states.requires_grad_(True)
+
+        # Classifier-free guidance dropout: replace conditioning with the empty-prompt
+        # embedding for a fraction of samples (matches reference COND_DROPOUT).
+        cond_dropout_rate = float(getattr(args, "cond_dropout_rate", 0.0))
+        if is_train and cond_dropout_rate > 0.0 and self.uncond_hidden is not None:
+            drop_mask = torch.rand(hidden_states.size(0), device=hidden_states.device) < cond_dropout_rate
+            if drop_mask.any():
+                uncond = self.uncond_hidden.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                uncond = uncond.expand(hidden_states.size(0), -1, -1)
+                hidden_states = torch.where(drop_mask.view(-1, 1, 1), uncond, hidden_states)
 
         # Sample noise and timesteps
         noise = torch.randn_like(latents)

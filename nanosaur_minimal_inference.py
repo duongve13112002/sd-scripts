@@ -51,8 +51,11 @@ def _apply_lora(model: NanoSaurTransformer2DModel, lora_path: str, scale: float 
     """
     Apply a NanoSaur LoRA to the model by directly merging weights.
 
-    Supports ComfyUI format (``diffusion_model.{path}.lora_{up|down}.weight``)
-    and sd-scripts format (``lora_unet_{path}.lora_{up|down}.weight``).
+    Applies the ComfyUI key format (``diffusion_model.{path}.lora_{up|down}.weight``),
+    which is what ``networks.lora_nanosaur`` saves by default. The internal sd-scripts
+    format (``lora_unet_{path}``) is NOT merged here — its underscore-joined paths are
+    ambiguous to invert — and such keys are skipped with a warning. Load the saved
+    ComfyUI-format file for inference.
 
     The LoRA is applied by adding ``scale * (up @ down) * alpha/rank`` to the
     corresponding weight in the model.
@@ -79,9 +82,10 @@ def _apply_lora(model: NanoSaurTransformer2DModel, lora_path: str, scale: float 
         if base.startswith("diffusion_model."):
             param_path = base[len("diffusion_model."):]
         elif base.startswith("lora_unet_"):
-            # convert lora_unet_blocks_0_attn_qkv_x → need module lookup
-            param_path = base[len("lora_unet_"):].replace("_", ".", 1)
-            # This is ambiguous; prefer ComfyUI format
+            # Internal sd-scripts format: underscore-joined path cannot be reliably
+            # inverted to dotted module names here. Skip and warn.
+            print(f"  warning: skipping internal-format LoRA key '{base}' "
+                  f"(re-save in ComfyUI format to apply it)")
             param_path = None
         else:
             param_path = None

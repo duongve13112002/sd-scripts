@@ -121,6 +121,21 @@ def build_param_groups(model: torch.nn.Module, attr_lr_map: dict, default_lr: fl
     return param_groups
 
 
+def _compute_uncond_hidden(args, accelerator, tokenize_strategy, text_encoding_strategy, gemma3):
+    """Encode the empty prompt once for classifier-free guidance dropout.
+
+    Returns a CPU tensor (1, L, D), or None when dropout is disabled. Must be
+    called while ``gemma3`` is on the compute device.
+    """
+    if float(getattr(args, "cond_dropout_rate", 0.0)) <= 0.0:
+        return None
+    with accelerator.autocast(), torch.no_grad():
+        tokens = tokenize_strategy.tokenize("")
+        uncond = text_encoding_strategy.encode_tokens(tokenize_strategy, [gemma3], tokens)
+    logger.info(f"NanoSaur: cached unconditional embedding for CFG dropout (rate={args.cond_dropout_rate})")
+    return uncond[0].detach().to("cpu")
+
+
 # Main training function
 
 
@@ -266,6 +281,11 @@ def train(args: argparse.Namespace) -> None:
                                 tokenize_strategy, [gemma3], tokens
                             )
 
+        # Pre-compute empty-prompt embedding for CFG dropout before freeing the TE.
+        uncond_hidden = _compute_uncond_hidden(
+            args, accelerator, tokenize_strategy, text_encoding_strategy, gemma3
+        )
+
         accelerator.wait_for_everyone()
         gemma3 = None
         clean_memory_on_device(accelerator.device)
@@ -273,6 +293,9 @@ def train(args: argparse.Namespace) -> None:
         # Online encoding: keep Gemma3 on device throughout training
         logger.info("Online text encoding enabled — Gemma3 will encode each batch on-the-fly")
         gemma3.to(accelerator.device, dtype=weight_dtype)
+        uncond_hidden = _compute_uncond_hidden(
+            args, accelerator, tokenize_strategy, text_encoding_strategy, gemma3
+        )
 
     # Load diffusion model
 
@@ -412,6 +435,16 @@ def train(args: argparse.Namespace) -> None:
                         )
                     hidden_states = te_outputs[0].to(weight_dtype)
 
+                # Classifier-free guidance dropout: swap conditioning for the
+                # empty-prompt embedding on a fraction of samples (matches reference).
+                cond_dropout_rate = float(getattr(args, "cond_dropout_rate", 0.0))
+                if cond_dropout_rate > 0.0 and uncond_hidden is not None:
+                    drop_mask = torch.rand(hidden_states.size(0), device=hidden_states.device) < cond_dropout_rate
+                    if drop_mask.any():
+                        uncond = uncond_hidden.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                        uncond = uncond.expand(hidden_states.size(0), -1, -1)
+                        hidden_states = torch.where(drop_mask.view(-1, 1, 1), uncond, hidden_states)
+
                 # Sample noise and timesteps
                 noise = torch.randn_like(latents)
                 noisy_input, t = nanosaur_train_util.get_noisy_model_input_and_timesteps(
@@ -432,11 +465,19 @@ def train(args: argparse.Namespace) -> None:
                     x0_pred, latents, noisy_input, t
                 )
 
-                loss = torch.nn.functional.mse_loss(velocity_pred.float(), velocity_target.float())
-
-                # Masked loss support
-                if "loss_weights" in batch:
+                loss = torch.nn.functional.mse_loss(
+                    velocity_pred.float(), velocity_target.float(), reduction="none"
+                )
+                # Masked loss support (needs per-pixel loss, not a scalar)
+                if getattr(args, "masked_loss", False) or (
+                    "alpha_masks" in batch and batch["alpha_masks"] is not None
+                ):
                     loss = apply_masked_loss(loss, batch)
+                loss = loss.mean(dim=list(range(1, loss.ndim)))  # per-sample mean
+                # Per-sample weighting (e.g. prior_loss_weight for regularization images)
+                if "loss_weights" in batch and batch["loss_weights"] is not None:
+                    loss = loss * batch["loss_weights"].to(loss.device)
+                loss = loss.mean()
 
                 accelerator.backward(loss)
 
@@ -536,6 +577,7 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
     add_custom_train_arguments(parser)
+    train_util.add_masked_loss_arguments(parser)
     add_logging_arguments(parser)
     nanosaur_train_util.add_nanosaur_train_arguments(parser)
 

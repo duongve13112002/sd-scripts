@@ -458,19 +458,25 @@ def add_nanosaur_train_arguments(parser: argparse.ArgumentParser) -> None:
         help="Path to the NanoSaur text encoder safetensors (contains Gemma3 weights + spiece_model). "
         "/ NanoSauのテキストエンコーダsafetensorsのパス (Gemma3の重みとspiece_modelを含む)。",
     )
-    parser.add_argument(
-        "--vae",
-        type=str,
-        required=False,
-        help="Path to the NanoSaur VAE safetensors. "
-        "/ NanoSaur VAE safetensorsのパス。",
-    )
+    # NOTE: --vae is intentionally NOT declared here; it is already provided by
+    # train_util.add_training_arguments() and re-declaring it raises an argparse
+    # "conflicting option string" error. args.vae is consumed the same way.
     parser.add_argument(
         "--time_sampling_alpha",
         type=float,
         default=2.0,
         help="Alpha parameter for logistic-normal timestep sampling. Higher values bias toward t=0.5. Default: 2.0 "
         "/ ロジスティック正規分布タイムステップサンプリングのアルファパラメータ。デフォルト: 2.0",
+    )
+    parser.add_argument(
+        "--cond_dropout_rate",
+        type=float,
+        default=0.1,
+        help="Probability of replacing the text conditioning with the empty-prompt (unconditional) embedding "
+        "during training, enabling classifier-free guidance. Matches the reference NanoSaur trainer (0.1). "
+        "Set to 0.0 to disable. Works with both online and cached text-encoder outputs. "
+        "/ 学習中にテキスト条件を空プロンプト（無条件）埋め込みに置き換える確率。CFGを有効にする。"
+        "リファレンス実装と同じ既定値0.1。0.0で無効化。",
     )
     parser.add_argument(
         "--sample_shift",

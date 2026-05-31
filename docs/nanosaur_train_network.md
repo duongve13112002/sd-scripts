@@ -162,7 +162,7 @@ Besides the arguments explained in the [train_network.py guide](train_network.md
 #### NanoSaur Training Parameters / NanoSaur 学習パラメータ
 
 * `--time_sampling_alpha=<float>` – Alpha parameter for logistic-normal timestep sampling. Higher values concentrate sampling toward the midpoint (`t=0.5`). Default: `2.0`.
-* `--sample_shift=<float>` – Timestep schedule shift used during sample image generation. Higher values bias toward high-signal (low-noise) steps. Default: `4.0`.
+* `--cond_dropout_rate=<float>` – Probability of replacing the text conditioning with the empty-prompt (unconditional) embedding during training. This is what enables classifier-free guidance (CFG) at inference. Matches the reference NanoSaur trainer. Works with both online and cached text-encoder outputs. Default: `0.1`. Set to `0.0` to disable.
 * `--sample_cfg=<float>` – CFG guidance scale for sample image generation. Default: `7.0`.
 * `--sample_steps=<integer>` – Number of Euler denoising steps for sample image generation. Default: `40`.
 * `--cfg_start=<float>` – Fraction of denoising steps from which CFG is applied during sampling. Default: `0.03`.
@@ -222,7 +222,7 @@ Besides the arguments explained in the [train_network.py guide](train_network.md
 #### NanoSaur 学習パラメータ
 
 * `--time_sampling_alpha=<float>` – ロジスティック正規分布タイムステップサンプリングのアルファパラメータ。値が大きいほど`t=0.5`付近にサンプリングが集中します。デフォルト: `2.0`。
-* `--sample_shift=<float>` – サンプル画像生成中に使用されるタイムステップスケジュールシフト。値が大きいほど高信号（低ノイズ）のステップに偏ります。デフォルト: `4.0`。
+* `--cond_dropout_rate=<float>` – 学習中にテキスト条件を空プロンプト（無条件）埋め込みに置き換える確率。これにより推論時のクラシファイアフリーガイダンス（CFG）が有効になります。リファレンス実装と同じ挙動で、オンライン／キャッシュ済みのテキストエンコーダ出力の両方で動作します。デフォルト: `0.1`。`0.0`で無効化。
 * `--sample_cfg=<float>` – サンプル画像生成のCFGガイダンススケール。デフォルト: `7.0`。
 * `--sample_steps=<integer>` – サンプル画像生成のオイラーノイズ除去ステップ数。デフォルト: `40`。
 * `--cfg_start=<float>` – サンプリング中にCFGが適用される開始ステップの割合。デフォルト: `0.03`。

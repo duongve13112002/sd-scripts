@@ -178,6 +178,8 @@ accelerate launch --mixed_precision bf16 nanosaur_train.py \
 ### NanoSaur Training Parameters / NanoSaur 学習パラメータ
 
 * `--time_sampling_alpha=<float>` – Alpha for logistic-normal timestep sampling. Default: `2.0`. Higher values concentrate timesteps near `t=0.5`.
+* `--cond_dropout_rate=<float>` – Probability of replacing the text conditioning with the empty-prompt (unconditional) embedding during training, enabling classifier-free guidance at inference. Matches the reference NanoSaur trainer; works with both online and cached text-encoder outputs. Default: `0.1`. Set to `0.0` to disable.
+* `--masked_loss` – Restrict the loss to a masked region (requires `--conditioning_data_dir` or alpha masks in the dataset). Optional.
 * `--sample_shift=<float>` – Timestep schedule shift for sample generation. Default: `4.0`.
 * `--sample_cfg=<float>` – CFG guidance scale for sample generation. Default: `7.0`.
 * `--sample_steps=<integer>` – Euler denoising steps for sample generation. Default: `40`.
@@ -238,6 +240,8 @@ accelerate launch --mixed_precision bf16 nanosaur_train.py \
 ### NanoSaur 学習パラメータ
 
 * `--time_sampling_alpha=<float>` – ロジスティック正規分布タイムステップサンプリングのアルファ。デフォルト: `2.0`。値が大きいほどタイムステップが`t=0.5`付近に集中します。
+* `--cond_dropout_rate=<float>` – 学習中にテキスト条件を空プロンプト（無条件）埋め込みに置き換える確率。推論時のクラシファイアフリーガイダンスを有効にします。リファレンス実装と同じ挙動で、オンライン／キャッシュ済みのテキストエンコーダ出力の両方で動作します。デフォルト: `0.1`。`0.0`で無効化。
+* `--masked_loss` – 損失をマスク領域に限定します（データセットに`--conditioning_data_dir`またはアルファマスクが必要）。任意。
 * `--sample_shift=<float>` – サンプル生成のタイムステップスケジュールシフト。デフォルト: `4.0`。
 * `--sample_cfg=<float>` – サンプル生成のCFGガイダンススケール。デフォルト: `7.0`。
 * `--sample_steps=<integer>` – サンプル生成のオイラーノイズ除去ステップ数。デフォルト: `40`。
