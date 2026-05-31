@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Union
 import sentencepiece as spm
 import torch
 import torch.nn as nn
+from safetensors import safe_open
 from safetensors.torch import load_file
 from transformers import Gemma3ForCausalLM, Gemma3TextConfig
 
@@ -237,6 +238,24 @@ def load_nanosaur_text_encoder(
 
     tokenizer = NanoSaurSentencePieceTokenizer(spiece_model_tensor, max_length=TEXT_MAX_LENGTH)
     return tokenizer, text_encoder
+
+
+def load_nanosaur_tokenizer(
+    ckpt_path: str, max_length: int = TEXT_MAX_LENGTH
+) -> NanoSaurSentencePieceTokenizer:
+    """
+    Load only the SentencePiece tokenizer (``spiece_model`` key) from the
+    text-encoder safetensors, without loading the heavy Gemma3 weights.
+
+    Needed because sd-scripts' NetworkTrainer creates the tokenize strategy
+    before ``load_target_model`` runs, but the NanoSaur tokenizer is bundled
+    inside the text-encoder file.
+    """
+    with safe_open(ckpt_path, framework="pt", device="cpu") as f:
+        if "spiece_model" not in f.keys():
+            raise KeyError(f"NanoSaur text encoder '{ckpt_path}' is missing the 'spiece_model' tensor")
+        spiece_model_tensor = f.get_tensor("spiece_model")
+    return NanoSaurSentencePieceTokenizer(spiece_model_tensor, max_length=max_length)
 
 
 # VAE wrapper

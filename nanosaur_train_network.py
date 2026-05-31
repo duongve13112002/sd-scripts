@@ -126,6 +126,13 @@ class NanoSaurNetworkTrainer(train_network.NetworkTrainer):
     # Strategy factories
 
     def get_tokenize_strategy(self, args):
+        # NetworkTrainer.train() builds the tokenize strategy BEFORE load_target_model,
+        # so _gemma3_tokenizer may not be set yet. The NanoSaur tokenizer lives inside
+        # the text-encoder file; load just the tokenizer (not the Gemma3 weights) here.
+        if getattr(self, "_gemma3_tokenizer", None) is None:
+            self._gemma3_tokenizer = nanosaur_utils.load_nanosaur_tokenizer(
+                args.text_encoder, nanosaur_models.TEXT_MAX_LENGTH
+            )
         return strategy_nanosaur.NanoSaurTokenizeStrategy(
             tokenizer=self._gemma3_tokenizer,
             max_length=nanosaur_models.TEXT_MAX_LENGTH,

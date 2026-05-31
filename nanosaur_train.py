@@ -43,6 +43,7 @@ from library import (
     deepspeed_utils,
     nanosaur_train_util,
     nanosaur_utils,
+    sai_model_spec,
     strategy_base,
     strategy_nanosaur,
     train_util,
@@ -297,6 +298,10 @@ def train(args: argparse.Namespace) -> None:
             args, accelerator, tokenize_strategy, text_encoding_strategy, gemma3
         )
 
+    # Wire the configured strategies into the dataset (tokenize / latents / TE-cache)
+    # so dataset __getitem__ can tokenize captions (online) or load cached TE outputs.
+    train_dataset_group.set_current_strategies()
+
     # Load diffusion model
 
     logger.info("Loading NanoSaur diffusion model")
@@ -333,8 +338,7 @@ def train(args: argparse.Namespace) -> None:
     attr_lr_map = parse_attr_lr(attr_lr_str) if attr_lr_str else {}
     params_to_optimize = build_param_groups(model, attr_lr_map, args.learning_rate)
 
-    optimizer_name, optimizer_args = train_util.get_optimizer(args)
-    optimizer = train_util.get_optimizer_train(args, params_to_optimize)
+    _, _, optimizer = train_util.get_optimizer(args, params_to_optimize)
 
     # DataLoader
 
@@ -352,8 +356,8 @@ def train(args: argparse.Namespace) -> None:
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-    if args.num_train_epochs is not None:
-        num_train_epochs = args.num_train_epochs
+    if args.max_train_epochs is not None:
+        num_train_epochs = args.max_train_epochs
         args.max_train_steps = num_update_steps_per_epoch * num_train_epochs
 
     lr_scheduler = train_util.get_scheduler_fix(args, optimizer, num_train_epochs * len(train_dataloader))
@@ -571,8 +575,10 @@ def setup_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     train_util.add_sd_models_arguments(parser)
+    sai_model_spec.add_model_spec_arguments(parser)
     train_util.add_dataset_arguments(parser, True, True, True)
     train_util.add_training_arguments(parser, True)
+    deepspeed_utils.add_deepspeed_arguments(parser)
     train_util.add_dit_training_arguments(parser)
     train_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
