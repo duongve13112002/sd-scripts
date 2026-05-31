@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch.nn.functional import scaled_dot_product_attention as attention
+from torch.utils.checkpoint import checkpoint
 
 from library import custom_offloading_utils
 import logging
@@ -52,6 +53,22 @@ LATENT_SHIFT: float = 0.0179
 
 # Disable torch.compile for specific methods that use dynamic shapes / caching
 _compile_disable = torch.compiler.disable if hasattr(torch, "compiler") else torch._dynamo.disable
+
+
+def _to_cuda(x):
+    if isinstance(x, torch.Tensor):
+        return x.cuda()
+    if isinstance(x, (list, tuple)):
+        return type(x)(_to_cuda(e) for e in x)
+    return x
+
+
+def _to_cpu(x):
+    if isinstance(x, torch.Tensor):
+        return x.cpu()
+    if isinstance(x, (list, tuple)):
+        return type(x)(_to_cpu(e) for e in x)
+    return x
 
 
 # Diffusion model building blocks
@@ -317,7 +334,46 @@ class FlattenDiTBlock(nn.Module):
         if not is_encoder_block:
             self.adaLN_modulation = nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
+        self.gradient_checkpointing = False
+        self.cpu_offload_checkpointing = False
+
     def forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        c: torch.Tensor,
+        pos: torch.Tensor,
+        shared_ada_ln: Optional[nn.Module] = None,
+        local_context: Optional["LocalContext2D"] = None,
+        layer_idx: Optional[int] = None,
+        h: Optional[int] = None,
+        w: Optional[int] = None,
+        y_token_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.training and self.gradient_checkpointing:
+            # Only the tensor inputs (x, y, c, pos, y_token_weights) are tracked by
+            # checkpoint; modules/ints (shared_ada_ln, local_context, layer_idx, h, w)
+            # are captured in the closure so their params still receive gradients.
+            def run(x_, y_, c_, pos_, ytw_):
+                return self._forward(
+                    x_, y_, c_, pos_,
+                    shared_ada_ln=shared_ada_ln, local_context=local_context,
+                    layer_idx=layer_idx, h=h, w=w, y_token_weights=ytw_,
+                )
+
+            if self.cpu_offload_checkpointing:
+                def run_offload(*inputs):
+                    return _to_cpu(run(*_to_cuda(inputs)))
+                return checkpoint(run_offload, x, y, c, pos, y_token_weights, use_reentrant=False)
+            return checkpoint(run, x, y, c, pos, y_token_weights, use_reentrant=False)
+
+        return self._forward(
+            x, y, c, pos,
+            shared_ada_ln=shared_ada_ln, local_context=local_context,
+            layer_idx=layer_idx, h=h, w=w, y_token_weights=y_token_weights,
+        )
+
+    def _forward(
         self,
         x: torch.Tensor,
         y: torch.Tensor,
@@ -678,14 +734,16 @@ class NanoSaurTransformer2DModel(nn.Module):
 
     # Gradient checkpointing
 
-    def enable_gradient_checkpointing(self) -> None:
+    def enable_gradient_checkpointing(self, cpu_offload: bool = False) -> None:
         for block in self.blocks:
             block.gradient_checkpointing = True
-        logger.info("NanoSaur: Gradient checkpointing enabled.")
+            block.cpu_offload_checkpointing = cpu_offload
+        logger.info(f"NanoSaur: Gradient checkpointing enabled (cpu_offload={cpu_offload}).")
 
     def disable_gradient_checkpointing(self) -> None:
         for block in self.blocks:
             block.gradient_checkpointing = False
+            block.cpu_offload_checkpointing = False
         logger.info("NanoSaur: Gradient checkpointing disabled.")
 
     def get_block_swap_module_list(self) -> list:

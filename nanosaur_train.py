@@ -420,10 +420,10 @@ def train(args: argparse.Namespace) -> None:
 
                 # Get text encoder conditioning
                 if args.cache_text_encoder_outputs:
-                    # Unpacked from cached storage: [hidden_states, input_ids, attn_mask]
-                    te_outputs = batch.get("text_encoder_outputs", None)
-                    if te_outputs is not None:
-                        # Batch from dataset already stacked
+                    # Cached TE outputs are exposed by the dataset under
+                    # "text_encoder_outputs_list" = [hidden_states, input_ids, attn_mask].
+                    te_outputs = batch.get("text_encoder_outputs_list", None)
+                    if te_outputs is not None and te_outputs[0] is not None:
                         hidden_states = te_outputs[0].to(accelerator.device, dtype=weight_dtype)
                     else:
                         # This should not happen if caching worked
