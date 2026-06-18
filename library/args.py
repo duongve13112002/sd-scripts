@@ -619,6 +619,54 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
             "--prior_loss_weight", type=float, default=1.0, help="loss weight for regularization images / 正則化画像のlossの重み"
         )
 
+    # EMA (Exponential Moving Average) arguments
+    parser.add_argument(
+        "--ema",
+        action="store_true",
+        help="Enable Exponential Moving Average for model weights.",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.9999,
+        help="EMA decay rate. Typical values: 0.999, 0.9999. (default: 0.9999)",
+    )
+    parser.add_argument(
+        "--ema_device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help="Device for EMA shadow parameters. 'cpu' saves GPU VRAM but slower update. (default: cuda)",
+    )
+    parser.add_argument(
+        "--ema_use_num_updates",
+        action="store_true",
+        help="Use warmup schedule for EMA decay: min(decay, (1+num_updates)/(10+num_updates))",
+    )
+    parser.add_argument(
+        "--ema_use_feedback",
+        action="store_true",
+        help="Feed back EMA decay to training parameters (experimental, single-GPU only)",
+    )
+    parser.add_argument(
+        "--ema_param_multiplier",
+        type=float,
+        default=1.0,
+        help="Multiply parameters each EMA update step (experimental, single-GPU only). (default: 1.0, no effect)",
+    )
+    parser.add_argument(
+        "--ema_resume_path",
+        type=str,
+        default=None,
+        help="Path to EMA model safetensors file to resume EMA state from a previous run",
+    )
+    parser.add_argument(
+        "--ema_sample",
+        action="store_true",
+        help="Also sample images using EMA weights during training (in addition to training weights). "
+        "EMA samples are saved with '_ema' suffix. Requires --ema.",
+    )
+
 
 def add_masked_loss_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(

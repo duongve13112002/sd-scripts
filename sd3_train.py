@@ -20,7 +20,7 @@ init_ipex()
 
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler
-from library import deepspeed_utils, sd3_models, sd3_train_utils, sd3_utils, strategy_base, strategy_sd3
+from library import deepspeed_utils, ema as ema_module, sd3_models, sd3_train_utils, sd3_utils, strategy_base, strategy_sd3
 
 import library.sai_model_spec as sai_model_spec
 from library.sdxl_train_util import match_mixed_precision
@@ -704,6 +704,9 @@ def train(args):
     if is_swapping_blocks:
         accelerator.unwrap_model(mmdit).prepare_block_swap_before_forward()
 
+    # Initialize EMA (Exponential Moving Average) over the trainable model parameters
+    ema = ema_module.create_ema_for_full_finetune(args, accelerator, mmdit)
+
     # For --sample_at_first
     optimizer_eval_fn()
     sd3_train_utils.sample_images(accelerator, args, 0, global_step, mmdit, vae, [clip_l, clip_g, t5xxl], sample_prompts_te_outputs)
@@ -892,10 +895,20 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
 
+                # Update EMA after each optimizer step
+                if ema is not None:
+                    ema.update()
+
                 optimizer_eval_fn()
                 sd3_train_utils.sample_images(
                     accelerator, args, None, global_step, mmdit, vae, [clip_l, clip_g, t5xxl], sample_prompts_te_outputs
                 )
+                if ema is not None and getattr(args, "ema_sample", False) and global_step != 0:
+                    with ema.average_parameters():
+                        sd3_train_utils.sample_images(
+                            accelerator, args, None, global_step, mmdit, vae, [clip_l, clip_g, t5xxl],
+                            sample_prompts_te_outputs, filename_suffix="_ema",
+                        )
 
                 # 指定ステップごとにモデルを保存
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
@@ -914,6 +927,7 @@ def train(args):
                             accelerator.unwrap_model(t5xxl) if train_t5xxl else None,
                             accelerator.unwrap_model(mmdit) if train_mmdit else None,
                             vae,
+                            ema=ema,
                         )
                 optimizer_train_fn()
 
@@ -954,11 +968,18 @@ def train(args):
                     accelerator.unwrap_model(t5xxl) if train_t5xxl else None,
                     accelerator.unwrap_model(mmdit) if train_mmdit else None,
                     vae,
+                    ema=ema,
                 )
 
         sd3_train_utils.sample_images(
             accelerator, args, epoch + 1, global_step, mmdit, vae, [clip_l, clip_g, t5xxl], sample_prompts_te_outputs
         )
+        if ema is not None and getattr(args, "ema_sample", False) and global_step != 0:
+            with ema.average_parameters():
+                sd3_train_utils.sample_images(
+                    accelerator, args, epoch + 1, global_step, mmdit, vae, [clip_l, clip_g, t5xxl],
+                    sample_prompts_te_outputs, filename_suffix="_ema",
+                )
 
     is_main_process = accelerator.is_main_process
     # if is_main_process:
@@ -987,6 +1008,7 @@ def train(args):
             t5xxl if train_t5xxl else None,
             mmdit if train_mmdit else None,
             vae,
+            ema=ema,
         )
         logger.info("model saved.")
 

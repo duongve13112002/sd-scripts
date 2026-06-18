@@ -53,6 +53,7 @@ def sample_images(
     text_encoders,
     sample_prompts_te_outputs,
     prompt_replacement=None,
+    filename_suffix="",
 ):
     if steps == 0:
         if not args.sample_at_first:
@@ -113,6 +114,7 @@ def sample_images(
                     steps,
                     sample_prompts_te_outputs,
                     prompt_replacement,
+                    filename_suffix,
                 )
     else:
         # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
@@ -136,6 +138,7 @@ def sample_images(
                         steps,
                         sample_prompts_te_outputs,
                         prompt_replacement,
+                        filename_suffix,
                     )
 
     torch.set_rng_state(rng_state)
@@ -158,6 +161,7 @@ def sample_image_inference(
     steps,
     sample_prompts_te_outputs,
     prompt_replacement,
+    filename_suffix="",
 ):
     assert isinstance(prompt_dict, dict)
     negative_prompt = prompt_dict.get("negative_prompt")
@@ -292,7 +296,7 @@ def sample_image_inference(
     num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
     seed_suffix = "" if seed is None else f"_{seed}"
     i: int = prompt_dict["enum"]
-    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
+    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}{filename_suffix}.png"
     image.save(os.path.join(save_dir, img_filename))
 
     # send images to wandb if enabled
@@ -503,11 +507,14 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
             text_encoders[0].to(vlm_device)
             text_encoders[1].to(vlm_device)
 
-    def sample_images(self, accelerator, args, epoch, global_step, device, ae, tokenizer, text_encoder, flux):
+    def sample_images(self, accelerator, args, epoch, global_step, device, ae, tokenizer, text_encoder, flux, filename_suffix=""):
         text_encoders = text_encoder  # for compatibility
         text_encoders = self.get_models_for_text_encoding(args, accelerator, text_encoders)
 
-        sample_images(accelerator, args, epoch, global_step, flux, ae, text_encoders, self.sample_prompts_te_outputs)
+        sample_images(
+            accelerator, args, epoch, global_step, flux, ae, text_encoders, self.sample_prompts_te_outputs,
+            filename_suffix=filename_suffix,
+        )
 
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
         noise_scheduler = sd3_train_utils.FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.discrete_flow_shift)

@@ -15,7 +15,7 @@ from tqdm import tqdm
 from PIL import Image
 
 from library.device_utils import init_ipex, clean_memory_on_device, synchronize_device
-from library import anima_models, anima_utils, checkpoint_io, sampling, qwen_image_autoencoder_kl
+from library import anima_models, anima_utils, checkpoint_io, ema, sampling, qwen_image_autoencoder_kl
 import library.model_io as model_io
 
 init_ipex()
@@ -197,55 +197,6 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         help="Enable cuDNN benchmark mode (may improve performance) / cuDNNのベンチマークモードを有効にする（パフォーマンスが向上する可能性がある）",
     )
 
-    # EMA (Exponential Moving Average) arguments
-    parser.add_argument(
-        "--ema",
-        action="store_true",
-        help="Enable Exponential Moving Average for model weights.",
-    )
-    parser.add_argument(
-        "--ema_decay",
-        type=float,
-        default=0.9999,
-        help="EMA decay rate. Typical values: 0.999, 0.9999. (default: 0.9999)",
-    )
-    parser.add_argument(
-        "--ema_device",
-        type=str,
-        default="cuda",
-        choices=["cuda", "cpu"],
-        help="Device for EMA shadow parameters. 'cpu' saves GPU VRAM but slower update. (default: cuda)",
-    )
-    parser.add_argument(
-        "--ema_use_num_updates",
-        action="store_true",
-        help="Use warmup schedule for EMA decay: min(decay, (1+num_updates)/(10+num_updates))",
-    )
-    parser.add_argument(
-        "--ema_use_feedback",
-        action="store_true",
-        help="Feed back EMA decay to training parameters (experimental, single-GPU only)",
-    )
-    parser.add_argument(
-        "--ema_param_multiplier",
-        type=float,
-        default=1.0,
-        help="Multiply parameters each EMA update step (experimental, single-GPU only). (default: 1.0, no effect)",
-    )
-    parser.add_argument(
-        "--ema_resume_path",
-        type=str,
-        default=None,
-        help="Path to EMA model safetensors file to resume EMA state from a previous run",
-    )
-    parser.add_argument(
-        "--ema_sample",
-        action="store_true",
-        help="Also sample images using EMA weights during training (in addition to training weights). "
-        "EMA samples are saved with '_ema' suffix. Requires --ema.",
-    )
-
-
 def load_qwen_image_vae(args, device="cpu", disable_mmap: bool = True):
     if getattr(args, "qwen_image_vae_2d", False):
         from library import qwen_image_autoencoder_kl_2d
@@ -413,22 +364,9 @@ def get_anima_param_groups(
     return param_groups
 
 
-# EMA checkpoint helpers
-def _get_ema_filename(ckpt_file: str) -> str:
-    """Get EMA filename by adding ema_ prefix to the basename of a checkpoint file."""
-    dirpath = os.path.dirname(ckpt_file)
-    basename = os.path.basename(ckpt_file)
-    return os.path.join(dirpath, f"ema_{basename}")
-
-
-def _remove_old_ema_file(old_ckpt_file):
-    """Remove old EMA file corresponding to an old checkpoint file (for save_last_n cleanup)."""
-    if old_ckpt_file is None:
-        return
-    old_ema_file = _get_ema_filename(old_ckpt_file)
-    if os.path.exists(old_ema_file):
-        logger.info(f"removing old EMA checkpoint: {old_ema_file}")
-        os.remove(old_ema_file)
+# EMA checkpoint helpers (shared implementation lives in library.ema)
+_get_ema_filename = ema.get_ema_filename
+_remove_old_ema_file = ema.remove_old_ema_file
 
 
 def _save_ema_model(ema, dit, ckpt_file, sai_metadata, save_dtype):

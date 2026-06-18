@@ -257,6 +257,7 @@ def sample_images_common(
     unet_wrapped,
     prompt_replacement=None,
     controlnet=None,
+    filename_suffix="",
 ):
     """
     StableDiffusionLongPromptWeightingPipelineの改造版を使うようにしたので、clip skipおよびプロンプトの重みづけに対応した
@@ -350,7 +351,8 @@ def sample_images_common(
         with torch.no_grad():
             for prompt_dict in prompts:
                 sample_image_inference(
-                    accelerator, args, pipeline, save_dir, prompt_dict, epoch, steps, prompt_replacement, controlnet=controlnet
+                    accelerator, args, pipeline, save_dir, prompt_dict, epoch, steps, prompt_replacement,
+                    controlnet=controlnet, filename_suffix=filename_suffix,
                 )
     else:
         # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
@@ -363,7 +365,8 @@ def sample_images_common(
             with distributed_state.split_between_processes(per_process_prompts) as prompt_dict_lists:
                 for prompt_dict in prompt_dict_lists[0]:
                     sample_image_inference(
-                        accelerator, args, pipeline, save_dir, prompt_dict, epoch, steps, prompt_replacement, controlnet=controlnet
+                        accelerator, args, pipeline, save_dir, prompt_dict, epoch, steps, prompt_replacement,
+                        controlnet=controlnet, filename_suffix=filename_suffix,
                     )
 
     # clear pipeline and cache to reduce vram usage
@@ -387,6 +390,7 @@ def sample_image_inference(
     steps,
     prompt_replacement,
     controlnet=None,
+    filename_suffix="",
 ):
     from library.sdxl_lpw_stable_diffusion import SdxlStableDiffusionLongPromptWeightingPipeline
     assert isinstance(prompt_dict, dict)
@@ -490,7 +494,7 @@ def sample_image_inference(
     num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
     seed_suffix = "" if seed is None else f"_{seed}"
     i: int = prompt_dict["enum"]
-    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
+    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}{filename_suffix}.png"
     image.save(os.path.join(save_dir, img_filename))
 
     # send images to wandb if enabled

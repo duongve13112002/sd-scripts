@@ -14,7 +14,7 @@ from tqdm import tqdm
 from PIL import Image
 from safetensors.torch import save_file
 
-from library import lumina_models, strategy_base, strategy_lumina, checkpoint_io, sampling
+from library import lumina_models, strategy_base, strategy_lumina, checkpoint_io, ema as ema_module, sampling
 import library.model_io as model_io
 from library.flux_models import AutoEncoder
 from library.device_utils import init_ipex, clean_memory_on_device
@@ -111,6 +111,7 @@ def sample_images(
     sample_prompts_gemma2_outputs: dict[str, Tuple[Tensor, Tensor, Tensor]],
     prompt_replacement: Optional[Tuple[str, str]] = None,
     controlnet=None,
+    filename_suffix="",
 ):
     """
     Generate sample images using the NextDiT model.
@@ -211,6 +212,7 @@ def sample_images(
                 sample_prompts_gemma2_outputs,
                 prompt_replacement,
                 controlnet,
+                filename_suffix,
             )
     else:
         # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
@@ -237,6 +239,7 @@ def sample_images(
                     sample_prompts_gemma2_outputs,
                     prompt_replacement,
                     controlnet,
+                    filename_suffix,
                 )
 
     torch.set_rng_state(rng_state)
@@ -260,6 +263,7 @@ def sample_image_inference(
     sample_prompts_gemma2_outputs: dict[str, Tuple[Tensor, Tensor, Tensor]],
     prompt_replacement: Optional[Tuple[str, str]] = None,
     controlnet=None,
+    filename_suffix="",
 ):
     """
     Generates sample images
@@ -460,7 +464,7 @@ def sample_image_inference(
         num_suffix = f"e{epoch:06d}" if epoch is not None else f"{global_step:06d}"
         seed_suffix = "" if seed is None else f"_{seed}"
         i: int = int(prompt_dict.get("enum", 0))
-        img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
+        img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}{filename_suffix}.png"
         image.save(os.path.join(save_dir, img_filename))
 
         # send images to wandb if enabled
@@ -950,6 +954,7 @@ def save_lumina_model_on_train_end(
     epoch: int,
     global_step: int,
     lumina: lumina_models.NextDiT,
+    ema=None,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
         sai_metadata = model_io.get_sai_model_spec(
@@ -962,6 +967,12 @@ def save_lumina_model_on_train_end(
             lumina="lumina2",
         )
         save_models(ckpt_file, lumina, sai_metadata, save_dtype, args.mem_eff_save)
+
+        # Save the EMA model alongside the normal checkpoint
+        if ema is not None:
+            ema_module.save_ema_full_finetune(
+                ema, lumina, ckpt_file, lambda f: save_models(f, lumina, sai_metadata, save_dtype, args.mem_eff_save)
+            )
 
     checkpoint_io.save_sd_model_on_train_end_common(
         args, True, True, epoch, global_step, sd_saver, None
@@ -979,6 +990,7 @@ def save_lumina_model_on_epoch_end_or_stepwise(
     num_train_epochs: int,
     global_step: int,
     lumina: lumina_models.NextDiT,
+    ema=None,
 ):
     """
     Save the model to the checkpoint path.
@@ -1005,6 +1017,21 @@ def save_lumina_model_on_epoch_end_or_stepwise(
             lumina="lumina2",
         )
         save_models(ckpt_file, lumina, sai_metadata, save_dtype, args.mem_eff_save)
+
+        # Save the EMA model alongside and clean up old EMA files
+        if ema is not None:
+            ema_module.save_ema_full_finetune(
+                ema, lumina, ckpt_file, lambda f: save_models(f, lumina, sai_metadata, save_dtype, args.mem_eff_save)
+            )
+            ext = ".safetensors"
+            if on_epoch_end:
+                remove_no = checkpoint_io.get_remove_epoch_no(args, epoch_no)
+                if remove_no is not None:
+                    ema_module.remove_old_ema_file(os.path.join(args.output_dir, checkpoint_io.get_epoch_ckpt_name(args, ext, remove_no)))
+            else:
+                remove_no = checkpoint_io.get_remove_step_no(args, global_step)
+                if remove_no is not None:
+                    ema_module.remove_old_ema_file(os.path.join(args.output_dir, checkpoint_io.get_step_ckpt_name(args, ext, remove_no)))
 
     checkpoint_io.save_sd_model_on_epoch_end_or_stepwise_common(
         args,

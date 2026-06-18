@@ -11,7 +11,7 @@ init_ipex()
 from accelerate import init_empty_weights
 from tqdm import tqdm
 from transformers import CLIPTokenizer
-from library import model_util, sdxl_model_util, checkpoint_io, sampling, sdxl_original_unet
+from library import model_util, sdxl_model_util, checkpoint_io, ema as ema_module, sampling, sdxl_original_unet
 import library.model_io as model_io
 from .utils import setup_logging
 
@@ -241,6 +241,7 @@ def save_sd_model_on_train_end(
     vae,
     logit_scale,
     ckpt_info,
+    ema=None,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
         sai_metadata = model_io.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
@@ -257,6 +258,16 @@ def save_sd_model_on_train_end(
             sai_metadata,
             save_dtype,
         )
+        # EMA copy (covers the U-Net) in the same stable-diffusion format
+        if ema is not None:
+            ema_module.save_ema_full_finetune(
+                ema,
+                unet,
+                ckpt_file,
+                lambda f: sdxl_model_util.save_stable_diffusion_checkpoint(
+                    f, text_encoder1, text_encoder2, unet, epoch_no, global_step, ckpt_info, vae, logit_scale, sai_metadata, save_dtype
+                ),
+            )
 
     def diffusers_saver(out_dir):
         sdxl_model_util.save_diffusers_checkpoint(
@@ -269,6 +280,15 @@ def save_sd_model_on_train_end(
             use_safetensors=use_safetensors,
             save_dtype=save_dtype,
         )
+        if ema is not None:
+            ema_module.save_ema_full_finetune(
+                ema,
+                unet,
+                out_dir,
+                lambda d: sdxl_model_util.save_diffusers_checkpoint(
+                    d, text_encoder1, text_encoder2, unet, src_path, vae, use_safetensors=use_safetensors, save_dtype=save_dtype
+                ),
+            )
 
     checkpoint_io.save_sd_model_on_train_end_common(
         args, save_stable_diffusion_format, use_safetensors, epoch, global_step, sd_saver, diffusers_saver
@@ -294,6 +314,7 @@ def save_sd_model_on_epoch_end_or_stepwise(
     vae,
     logit_scale,
     ckpt_info,
+    ema=None,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
         sai_metadata = model_io.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
@@ -310,6 +331,25 @@ def save_sd_model_on_epoch_end_or_stepwise(
             sai_metadata,
             save_dtype,
         )
+        if ema is not None:
+            ema_module.save_ema_full_finetune(
+                ema,
+                unet,
+                ckpt_file,
+                lambda f: sdxl_model_util.save_stable_diffusion_checkpoint(
+                    f, text_encoder1, text_encoder2, unet, epoch_no, global_step, ckpt_info, vae, logit_scale, sai_metadata, save_dtype
+                ),
+            )
+            # Clean up the matching old EMA file (stable-diffusion format)
+            ext = "." + args.save_model_as
+            if on_epoch_end:
+                remove_no = checkpoint_io.get_remove_epoch_no(args, epoch_no)
+                if remove_no is not None:
+                    ema_module.remove_old_ema_file(os.path.join(args.output_dir, checkpoint_io.get_epoch_ckpt_name(args, ext, remove_no)))
+            else:
+                remove_no = checkpoint_io.get_remove_step_no(args, global_step)
+                if remove_no is not None:
+                    ema_module.remove_old_ema_file(os.path.join(args.output_dir, checkpoint_io.get_step_ckpt_name(args, ext, remove_no)))
 
     def diffusers_saver(out_dir):
         sdxl_model_util.save_diffusers_checkpoint(
@@ -322,6 +362,15 @@ def save_sd_model_on_epoch_end_or_stepwise(
             use_safetensors=use_safetensors,
             save_dtype=save_dtype,
         )
+        if ema is not None:
+            ema_module.save_ema_full_finetune(
+                ema,
+                unet,
+                out_dir,
+                lambda d: sdxl_model_util.save_diffusers_checkpoint(
+                    d, text_encoder1, text_encoder2, unet, src_path, vae, use_safetensors=use_safetensors, save_dtype=save_dtype
+                ),
+            )
 
     checkpoint_io.save_sd_model_on_epoch_end_or_stepwise_common(
         args,

@@ -17,7 +17,7 @@ init_ipex()
 
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler
-from library import deepspeed_utils, sdxl_model_util, strategy_base, strategy_sd, strategy_sdxl, sai_model_spec
+from library import deepspeed_utils, ema as ema_module, sdxl_model_util, strategy_base, strategy_sd, strategy_sdxl, sai_model_spec
 
 import library.accelerator_setup as accelerator_setup
 import library.args as args_util
@@ -621,6 +621,9 @@ def train(args):
             init_kwargs=init_kwargs,
         )
 
+    # Initialize EMA (Exponential Moving Average) over the trainable U-Net parameters
+    ema = ema_module.create_ema_for_full_finetune(args, accelerator, unet)
+
     # For --sample_at_first
     sdxl_train_util.sample_images(
         accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, [text_encoder1, text_encoder2], unet
@@ -781,6 +784,10 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
 
+                # Update EMA after each optimizer step
+                if ema is not None:
+                    ema.update()
+
                 sdxl_train_util.sample_images(
                     accelerator,
                     args,
@@ -792,6 +799,12 @@ def train(args):
                     [text_encoder1, text_encoder2],
                     unet,
                 )
+                if ema is not None and getattr(args, "ema_sample", False) and global_step != 0:
+                    with ema.average_parameters():
+                        sdxl_train_util.sample_images(
+                            accelerator, args, None, global_step, accelerator.device, vae, tokenizers,
+                            [text_encoder1, text_encoder2], unet, filename_suffix="_ema",
+                        )
 
                 # 指定ステップごとにモデルを保存
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
@@ -815,6 +828,7 @@ def train(args):
                             vae,
                             logit_scale,
                             ckpt_info,
+                            ema=ema,
                         )
 
             current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
@@ -861,6 +875,7 @@ def train(args):
                     vae,
                     logit_scale,
                     ckpt_info,
+                    ema=ema,
                 )
 
         sdxl_train_util.sample_images(
@@ -874,6 +889,12 @@ def train(args):
             [text_encoder1, text_encoder2],
             unet,
         )
+        if ema is not None and getattr(args, "ema_sample", False) and global_step != 0:
+            with ema.average_parameters():
+                sdxl_train_util.sample_images(
+                    accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers,
+                    [text_encoder1, text_encoder2], unet, filename_suffix="_ema",
+                )
 
     is_main_process = accelerator.is_main_process
     # if is_main_process:
@@ -904,6 +925,7 @@ def train(args):
             vae,
             logit_scale,
             ckpt_info,
+            ema=ema,
         )
         logger.info("model saved.")
 

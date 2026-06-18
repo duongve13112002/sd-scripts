@@ -28,7 +28,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from library import sd3_models, sd3_utils, strategy_base, checkpoint_io, sampling
+from library import sd3_models, sd3_utils, strategy_base, checkpoint_io, ema as ema_module, sampling
 import library.model_io as model_io
 
 
@@ -96,12 +96,19 @@ def save_sd3_model_on_train_end(
     t5xxl: Optional[T5EncoderModel],
     mmdit: sd3_models.MMDiT,
     vae: sd3_models.SDVAE,
+    ema=None,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
         sai_metadata = model_io.get_sai_model_spec(
             None, args, False, False, False, is_stable_diffusion_ckpt=True, sd3=mmdit.model_type
         )
         save_models(ckpt_file, mmdit, vae, clip_l, clip_g, t5xxl, sai_metadata, save_dtype)
+
+        # Save the EMA model alongside (EMA covers the MMDiT transformer)
+        if ema is not None:
+            ema_module.save_ema_full_finetune(
+                ema, mmdit, ckpt_file, lambda f: save_models(f, mmdit, vae, clip_l, clip_g, t5xxl, sai_metadata, save_dtype)
+            )
 
     checkpoint_io.save_sd_model_on_train_end_common(args, True, True, epoch, global_step, sd_saver, None)
 
@@ -121,12 +128,28 @@ def save_sd3_model_on_epoch_end_or_stepwise(
     t5xxl: Optional[T5EncoderModel],
     mmdit: sd3_models.MMDiT,
     vae: sd3_models.SDVAE,
+    ema=None,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
         sai_metadata = model_io.get_sai_model_spec(
             None, args, False, False, False, is_stable_diffusion_ckpt=True, sd3=mmdit.model_type
         )
         save_models(ckpt_file, mmdit, vae, clip_l, clip_g, t5xxl, sai_metadata, save_dtype)
+
+        # Save the EMA model alongside and clean up old EMA files (EMA covers the MMDiT transformer)
+        if ema is not None:
+            ema_module.save_ema_full_finetune(
+                ema, mmdit, ckpt_file, lambda f: save_models(f, mmdit, vae, clip_l, clip_g, t5xxl, sai_metadata, save_dtype)
+            )
+            ext = ".safetensors"
+            if on_epoch_end:
+                remove_no = checkpoint_io.get_remove_epoch_no(args, epoch_no)
+                if remove_no is not None:
+                    ema_module.remove_old_ema_file(os.path.join(args.output_dir, checkpoint_io.get_epoch_ckpt_name(args, ext, remove_no)))
+            else:
+                remove_no = checkpoint_io.get_remove_step_no(args, global_step)
+                if remove_no is not None:
+                    ema_module.remove_old_ema_file(os.path.join(args.output_dir, checkpoint_io.get_step_ckpt_name(args, ext, remove_no)))
 
     checkpoint_io.save_sd_model_on_epoch_end_or_stepwise_common(
         args,
@@ -382,6 +405,7 @@ def sample_images(
     text_encoders,
     sample_prompts_te_outputs,
     prompt_replacement=None,
+    filename_suffix="",
 ):
     if steps == 0:
         if not args.sample_at_first:
@@ -439,6 +463,7 @@ def sample_images(
                     steps,
                     sample_prompts_te_outputs,
                     prompt_replacement,
+                    filename_suffix,
                 )
     else:
         # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
@@ -462,6 +487,7 @@ def sample_images(
                         steps,
                         sample_prompts_te_outputs,
                         prompt_replacement,
+                        filename_suffix,
                     )
 
     torch.set_rng_state(rng_state)
@@ -483,6 +509,7 @@ def sample_image_inference(
     steps,
     sample_prompts_te_outputs,
     prompt_replacement,
+    filename_suffix="",
 ):
     assert isinstance(prompt_dict, dict)
     negative_prompt = prompt_dict.get("negative_prompt")
@@ -583,7 +610,7 @@ def sample_image_inference(
     num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
     seed_suffix = "" if seed is None else f"_{seed}"
     i: int = prompt_dict["enum"]
-    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
+    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}{filename_suffix}.png"
     image.save(os.path.join(save_dir, img_filename))
 
     # send images to wandb if enabled

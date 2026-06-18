@@ -30,7 +30,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 init_ipex()
 
 from accelerate.utils import set_seed
-from library import deepspeed_utils, flux_train_utils, flux_utils, strategy_base, strategy_flux, sai_model_spec
+from library import deepspeed_utils, ema as ema_module, flux_train_utils, flux_utils, strategy_base, strategy_flux, sai_model_spec
 from library.sd3_train_utils import FlowMatchEulerDiscreteScheduler
 
 import library.accelerator_setup as accelerator_setup
@@ -564,6 +564,9 @@ def train(args):
     noise_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.discrete_flow_shift)
     noise_scheduler_copy = copy.deepcopy(noise_scheduler)
 
+    # Initialize EMA (Exponential Moving Average) over the trainable model parameters
+    ema = ema_module.create_ema_for_full_finetune(args, accelerator, flux)
+
     if accelerator.is_main_process:
         init_kwargs = {}
         if args.wandb_run_name:
@@ -713,10 +716,20 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
 
+                # Update EMA after each optimizer step
+                if ema is not None:
+                    ema.update()
+
                 optimizer_eval_fn()
                 flux_train_utils.sample_images(
                     accelerator, args, None, global_step, flux, ae, [clip_l, t5xxl], sample_prompts_te_outputs
                 )
+                if ema is not None and getattr(args, "ema_sample", False) and global_step != 0:
+                    with ema.average_parameters():
+                        flux_train_utils.sample_images(
+                            accelerator, args, None, global_step, flux, ae, [clip_l, t5xxl],
+                            sample_prompts_te_outputs, filename_suffix="_ema",
+                        )
 
                 # 指定ステップごとにモデルを保存
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
@@ -731,6 +744,7 @@ def train(args):
                             num_train_epochs,
                             global_step,
                             accelerator.unwrap_model(flux),
+                            ema=ema,
                         )
                 optimizer_train_fn()
 
@@ -767,11 +781,18 @@ def train(args):
                     num_train_epochs,
                     global_step,
                     accelerator.unwrap_model(flux),
+                    ema=ema,
                 )
 
         flux_train_utils.sample_images(
             accelerator, args, epoch + 1, global_step, flux, ae, [clip_l, t5xxl], sample_prompts_te_outputs
         )
+        if ema is not None and getattr(args, "ema_sample", False) and global_step != 0:
+            with ema.average_parameters():
+                flux_train_utils.sample_images(
+                    accelerator, args, epoch + 1, global_step, flux, ae, [clip_l, t5xxl],
+                    sample_prompts_te_outputs, filename_suffix="_ema",
+                )
         optimizer_train_fn()
 
     is_main_process = accelerator.is_main_process
@@ -787,7 +808,7 @@ def train(args):
     del accelerator  # この後メモリを使うのでこれは消す
 
     if is_main_process:
-        flux_train_utils.save_flux_model_on_train_end(args, save_dtype, epoch, global_step, flux)
+        flux_train_utils.save_flux_model_on_train_end(args, save_dtype, epoch, global_step, flux, ema=ema)
         logger.info("model saved.")
 
 

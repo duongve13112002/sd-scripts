@@ -295,12 +295,13 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             text_encoders[0].to(accelerator.device, dtype=weight_dtype)
             text_encoders[1].to(accelerator.device)
 
-    def sample_images(self, accelerator, args, epoch, global_step, device, ae, tokenizer, text_encoder, flux):
+    def sample_images(self, accelerator, args, epoch, global_step, device, ae, tokenizer, text_encoder, flux, filename_suffix=""):
         text_encoders = text_encoder  # for compatibility
         text_encoders = self.get_models_for_text_encoding(args, accelerator, text_encoders)
 
         flux_train_utils.sample_images(
-            accelerator, args, epoch, global_step, flux, ae, text_encoders, self.sample_prompts_te_outputs
+            accelerator, args, epoch, global_step, flux, ae, text_encoders, self.sample_prompts_te_outputs,
+            filename_suffix=filename_suffix,
         )
 
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:

@@ -4,6 +4,7 @@ These are intentionally lightweight so they run on a CPU-only machine. They exer
 EMA math and the filename helpers, not any real training.
 """
 
+import argparse
 import os
 
 import pytest
@@ -92,3 +93,61 @@ def test_remove_old_ema_file(tmp_path):
 
     anima_train_utils._remove_old_ema_file(str(ckpt))
     assert not ema_file.exists()
+
+
+class _FakeSingleProcessAccelerator:
+    """Minimal stand-in for an Accelerator on a single CPU process."""
+
+    device = torch.device("cpu")
+    num_processes = 1
+    is_main_process = True
+
+    def unwrap_model(self, m):
+        return m
+
+    def print(self, *args, **kwargs):
+        pass
+
+
+def test_create_ema_for_full_finetune_opt_in():
+    from library import ema as ema_module
+
+    acc = _FakeSingleProcessAccelerator()
+    model = _make_model()
+    args = argparse.Namespace(
+        ema=False, ema_decay=0.9, ema_device="cpu", ema_use_num_updates=False,
+        ema_use_feedback=False, ema_param_multiplier=1.0, ema_resume_path=None,
+    )
+    assert ema_module.create_ema_for_full_finetune(args, acc, model) is None
+    args.ema = True
+    ema = ema_module.create_ema_for_full_finetune(args, acc, model)
+    assert ema is not None and len(ema.shadow_params) == len(list(model.parameters()))
+
+
+def test_save_ema_full_finetune_swaps_then_restores(tmp_path):
+    from library import ema as ema_module
+
+    acc = _FakeSingleProcessAccelerator()
+    model = _make_model()
+    args = argparse.Namespace(
+        ema=True, ema_decay=0.9, ema_device="cpu", ema_use_num_updates=False,
+        ema_use_feedback=False, ema_param_multiplier=1.0, ema_resume_path=None,
+    )
+    ema = ema_module.create_ema_for_full_finetune(args, acc, model)
+    with torch.no_grad():
+        model.weight.add_(1.0)
+    ema.update()
+
+    live = model.weight.detach().clone()
+    seen = {}
+
+    def save_fn(ema_file):
+        seen["file"] = ema_file
+        seen["weight"] = model.weight.detach().clone()
+
+    ckpt = str(tmp_path / "m-step10.safetensors")
+    ema_module.save_ema_full_finetune(ema, model, ckpt, save_fn)
+
+    assert os.path.basename(seen["file"]) == "ema_m-step10.safetensors"
+    assert torch.allclose(seen["weight"], ema.shadow_params[0])  # save saw EMA weights
+    assert torch.allclose(model.weight.detach(), live)  # live weights restored after save

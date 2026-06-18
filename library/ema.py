@@ -2,12 +2,142 @@ from __future__ import division
 from __future__ import unicode_literals
 
 from typing import Iterable, Optional
+import os
+import logging
 import weakref
 import copy
 import contextlib
 from .optimizers.optimizer_utils import copy_stochastic
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def get_ema_filename(ckpt_file: str) -> str:
+    """Return the EMA checkpoint path for a checkpoint, by adding an ema_ prefix to the basename."""
+    dirpath = os.path.dirname(ckpt_file)
+    basename = os.path.basename(ckpt_file)
+    return os.path.join(dirpath, f"ema_{basename}")
+
+
+def remove_old_ema_file(old_ckpt_file):
+    """Remove the EMA file matching an old checkpoint during save_last_n cleanup (no-op if missing)."""
+    if old_ckpt_file is None:
+        return
+    old_ema_file = get_ema_filename(old_ckpt_file)
+    if os.path.exists(old_ema_file):
+        logger.info(f"removing old EMA checkpoint: {old_ema_file}")
+        os.remove(old_ema_file)
+
+
+def create_ema_for_full_finetune(args, accelerator, model, resume_strip_prefix=""):
+    """Create EMA over a full fine-tune model's trainable params (used by the {model}_train.py scripts).
+
+    Returns None when --ema is off. When --ema_resume_path is given, shadow params are loaded by
+    matching parameter names, optionally stripping resume_strip_prefix from the saved keys so a
+    checkpoint saved with a prefix (e.g. "net." for the ComfyUI-format Anima save) maps back.
+    """
+    if not getattr(args, "ema", False):
+        return None
+
+    ema_device_str = getattr(args, "ema_device", "cuda")
+    ema_device = accelerator.device if ema_device_str == "cuda" else torch.device("cpu")
+
+    unwrapped = accelerator.unwrap_model(model)
+    ema_params = [p for p in unwrapped.parameters() if p.requires_grad]
+    if len(ema_params) == 0:
+        logger.warning("No trainable parameters found, skipping EMA creation")
+        return None
+
+    ema_use_feedback = getattr(args, "ema_use_feedback", False)
+    ema_param_multiplier = getattr(args, "ema_param_multiplier", 1.0)
+    # use_feedback and param_multiplier modify params on the main process only, which would
+    # desync DDP replicas in multi-GPU training.
+    if accelerator.num_processes > 1:
+        if ema_use_feedback:
+            raise ValueError(
+                "--ema_use_feedback is not compatible with multi-GPU DDP training. "
+                "It modifies parameters only on the main process, causing param desync across GPUs."
+            )
+        if ema_param_multiplier != 1.0:
+            raise ValueError(
+                "--ema_param_multiplier != 1.0 is not compatible with multi-GPU DDP training. "
+                "It modifies parameters only on the main process, causing param desync across GPUs."
+            )
+
+    ema = ExponentialMovingAverage(
+        parameters=ema_params,
+        decay=args.ema_decay,
+        use_num_updates=getattr(args, "ema_use_num_updates", False),
+        use_feedback=ema_use_feedback,
+        param_multiplier=ema_param_multiplier,
+        device=ema_device,
+        accelerator=accelerator,
+    )
+
+    ema_resume_path = getattr(args, "ema_resume_path", None)
+    if ema_resume_path is not None and accelerator.is_main_process:
+        from safetensors.torch import load_file as load_safetensors
+
+        accelerator.print(f"Loading EMA weights from {ema_resume_path}")
+        ema_sd = load_safetensors(ema_resume_path, device="cpu")
+        if resume_strip_prefix:
+            ema_sd = {
+                (k[len(resume_strip_prefix):] if k.startswith(resume_strip_prefix) else k): v for k, v in ema_sd.items()
+            }
+
+        param_name_to_idx = {}
+        trainable_idx = 0
+        for name, p in unwrapped.named_parameters():
+            if p.requires_grad:
+                param_name_to_idx[name] = trainable_idx
+                trainable_idx += 1
+
+        loaded_count = 0
+        for name, idx in param_name_to_idx.items():
+            if name in ema_sd:
+                ema.shadow_params[idx] = ema_sd[name].to(ema_device)
+                loaded_count += 1
+            else:
+                accelerator.print(f"  Warning: EMA key not found: {name}")
+        accelerator.print(f"Loaded EMA weights: {loaded_count}/{len(param_name_to_idx)} params")
+        del ema_sd
+
+    accelerator.print(
+        f"EMA enabled: decay={args.ema_decay}, device={ema_device_str}, params={sum(p.numel() for p in ema_params):,}"
+    )
+    return ema
+
+
+def save_ema_full_finetune(ema, model, ckpt_file, save_fn):
+    """Save the EMA copy of a full fine-tune model with an ema_ filename prefix.
+
+    Temporarily swaps the trainable params with the EMA shadow params, calls save_fn(ema_file)
+    to write using the model's own saver, then restores the originals (even if saving raises).
+    Runs on the main process during the save barrier, so the swap is safe.
+    """
+    if ema is None or ema.shadow_params is None:
+        return
+
+    ema_file = get_ema_filename(ckpt_file)
+    original_params = []
+    trainable_idx = 0
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            original_params.append(p.data.clone())
+            p.data.copy_(ema.shadow_params[trainable_idx].data.to(p.device))
+            trainable_idx += 1
+    try:
+        save_fn(ema_file)
+        logger.info(f"EMA model saved: {ema_file}")
+    finally:
+        trainable_idx = 0
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(original_params[trainable_idx])
+                trainable_idx += 1
+        del original_params
 
 
 # Partially based on:

@@ -48,7 +48,7 @@ If you find this project helpful, please consider supporting its development via
 ### Change History
 
 - **Unreleased (2026-06-18):**
-    - Added EMA (Exponential Moving Average) support for Anima full fine-tuning and LoRA training, with optional EMA sampling. An EMA checkpoint is saved alongside each regular checkpoint with an `ema_` prefix. See the [documentation](./docs/anima_train_network.md#ema-exponential-moving-average) for the `--ema*` options.
+    - Added EMA (Exponential Moving Average) support across all model families, for both LoRA/network training (SD1.x, SDXL, SD3/3.5, FLUX.1, Lumina, HunyuanImage, Anima) and full fine-tuning (SDXL, SD3/3.5, FLUX.1, Lumina, Anima), with optional EMA sampling. An EMA checkpoint is saved alongside each regular checkpoint with an `ema_` prefix, and EMA samples use an `_ema` filename suffix. The `--ema*` options are shared training arguments; see the [documentation](./docs/anima_train_network.md#ema-exponential-moving-average) for details. For full fine-tuning of multi-model families (SD3/SDXL), EMA covers the main transformer (MMDiT / U-Net).
     - Optimized disk caching to overlap GPU encoding with asynchronous disk writes for VAE latents and all text-encoder output caching strategies. This is automatic whenever caching to disk is enabled; there are no new options.
     - Added `anima_train_adapter.py`, a standalone training script for the Anima DiT adapter.
 

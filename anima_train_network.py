@@ -233,7 +233,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             # move text encoder to device for encoding during training/validation
             text_encoders[0].to(accelerator.device)
 
-    def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
+    def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet, filename_suffix=""):
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]  # compatibility
         te = self.get_models_for_text_encoding(args, accelerator, text_encoders)
         qwen3_te = te[0] if te is not None else None
@@ -251,150 +251,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             tokenize_strategy,
             text_encoding_strategy,
             self.sample_prompts_te_outputs,
+            filename_suffix=filename_suffix,
         )
-
-    # EMA overrides for LoRA / network training
-    def create_ema(self, args, accelerator, unet, network):
-        """Create EMA over the network's trainable (LoRA) parameters."""
-        if not getattr(args, "ema", False):
-            return None
-
-        from library.ema import ExponentialMovingAverage
-
-        ema_device_str = getattr(args, "ema_device", "cuda")
-        ema_device = accelerator.device if ema_device_str == "cuda" else torch.device("cpu")
-
-        unwrapped_nw = accelerator.unwrap_model(network)
-        ema_params = [p for p in unwrapped_nw.parameters() if p.requires_grad]
-        if len(ema_params) == 0:
-            logger.warning("No trainable parameters found in network, skipping EMA creation")
-            return None
-
-        ema_use_feedback = getattr(args, "ema_use_feedback", False)
-        ema_param_multiplier = getattr(args, "ema_param_multiplier", 1.0)
-
-        # use_feedback and param_multiplier modify params on the main process only,
-        # which would desync DDP replicas in multi-GPU training.
-        if accelerator.num_processes > 1:
-            if ema_use_feedback:
-                raise ValueError(
-                    "--ema_use_feedback is not compatible with multi-GPU DDP training. "
-                    "It modifies parameters only on the main process, causing param desync across GPUs."
-                )
-            if ema_param_multiplier != 1.0:
-                raise ValueError(
-                    "--ema_param_multiplier != 1.0 is not compatible with multi-GPU DDP training. "
-                    "It modifies parameters only on the main process, causing param desync across GPUs."
-                )
-
-        ema = ExponentialMovingAverage(
-            parameters=ema_params,
-            decay=args.ema_decay,
-            use_num_updates=getattr(args, "ema_use_num_updates", False),
-            use_feedback=ema_use_feedback,
-            param_multiplier=ema_param_multiplier,
-            device=ema_device,
-            accelerator=accelerator,
-        )
-
-        ema_resume_path = getattr(args, "ema_resume_path", None)
-        if ema_resume_path is not None and accelerator.is_main_process:
-            from safetensors.torch import load_file as load_safetensors
-
-            accelerator.print(f"Loading EMA LoRA weights from {ema_resume_path}")
-            ema_sd = load_safetensors(ema_resume_path, device="cpu")
-
-            # Map trainable param names to their shadow-param index, in parameter order
-            param_name_to_idx = {}
-            trainable_idx = 0
-            for name, p in unwrapped_nw.named_parameters():
-                if p.requires_grad:
-                    param_name_to_idx[name] = trainable_idx
-                    trainable_idx += 1
-
-            loaded_count = 0
-            for name, idx in param_name_to_idx.items():
-                if name in ema_sd:
-                    ema.shadow_params[idx] = ema_sd[name].to(ema_device)
-                    loaded_count += 1
-                else:
-                    accelerator.print(f"  Warning: EMA key not found: {name}")
-            accelerator.print(f"Loaded EMA LoRA weights: {loaded_count}/{len(param_name_to_idx)} params")
-
-            del ema_sd
-            clean_memory_on_device(accelerator.device)
-
-        accelerator.print(
-            f"EMA enabled for LoRA: decay={args.ema_decay}, device={ema_device_str}, "
-            f"params={sum(p.numel() for p in ema_params):,}"
-        )
-
-        return ema
-
-    def save_ema_network(self, ema, ckpt_file, network, save_dtype, metadata):
-        """Save the EMA copy of the LoRA weights using the network's own save format.
-
-        Temporarily swaps the network's trainable params with the EMA shadow params,
-        saves, then restores the originals (even if saving raises).
-        """
-        if ema is None or ema.shadow_params is None:
-            return
-
-        ema_file = anima_train_utils._get_ema_filename(ckpt_file)
-
-        original_params = []
-        trainable_idx = 0
-        for name, p in network.named_parameters():
-            if p.requires_grad:
-                original_params.append(p.data.clone())
-                p.data.copy_(ema.shadow_params[trainable_idx].data.to(p.device))
-                trainable_idx += 1
-
-        try:
-            network.save_weights(ema_file, save_dtype, metadata)
-            logger.info(f"EMA LoRA saved: {ema_file}")
-        finally:
-            trainable_idx = 0
-            for name, p in network.named_parameters():
-                if p.requires_grad:
-                    p.data.copy_(original_params[trainable_idx])
-                    trainable_idx += 1
-            del original_params
-
-    def remove_ema_network(self, old_ckpt_file):
-        """Remove the old EMA LoRA file during checkpoint cleanup."""
-        anima_train_utils._remove_old_ema_file(old_ckpt_file)
-
-    def sample_ema_images(self, ema, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoder, unet):
-        """Sample images with the EMA weights, saving them with an '_ema' suffix."""
-        if ema is None or not getattr(args, "ema_sample", False):
-            return
-        # Skip step 0, before the EMA has accumulated any updates
-        if global_step == 0:
-            return
-
-        logger.info(f"Generating EMA sample images at step {global_step}")
-        text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
-        te = self.get_models_for_text_encoding(args, accelerator, text_encoders)
-        qwen3_te = te[0] if te is not None else None
-
-        text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
-        tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
-
-        with ema.average_parameters():
-            anima_train_utils.sample_images(
-                accelerator,
-                args,
-                epoch,
-                global_step,
-                unet,
-                vae,
-                qwen3_te,
-                tokenize_strategy,
-                text_encoding_strategy,
-                self.sample_prompts_te_outputs,
-                filename_suffix="_ema",
-            )
 
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
         noise_scheduler = sd3_train_utils.FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.discrete_flow_shift)

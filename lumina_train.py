@@ -27,6 +27,7 @@ init_ipex()
 from accelerate.utils import set_seed
 from library import (
     deepspeed_utils,
+    ema as ema_module,
     lumina_train_util,
     lumina_util,
     strategy_base,
@@ -661,6 +662,9 @@ def train(args):
     if is_swapping_blocks:
         accelerator.unwrap_model(nextdit).prepare_block_swap_before_forward()
 
+    # Initialize EMA (Exponential Moving Average) over the trainable model parameters
+    ema = ema_module.create_ema_for_full_finetune(args, accelerator, nextdit)
+
     # For --sample_at_first
     optimizer_eval_fn()
     lumina_train_util.sample_images(
@@ -814,6 +818,10 @@ def train(args):
                 progress_bar.update(1)
                 global_step += 1
 
+                # Update EMA after each optimizer step
+                if ema is not None:
+                    ema.update()
+
                 optimizer_eval_fn()
                 lumina_train_util.sample_images(
                     accelerator,
@@ -825,6 +833,12 @@ def train(args):
                     gemma2,
                     sample_prompts_te_outputs,
                 )
+                if ema is not None and getattr(args, "ema_sample", False) and global_step != 0:
+                    with ema.average_parameters():
+                        lumina_train_util.sample_images(
+                            accelerator, args, None, global_step, nextdit, ae, gemma2,
+                            sample_prompts_te_outputs, filename_suffix="_ema",
+                        )
 
                 # 指定ステップごとにモデルを保存
                 if (
@@ -842,6 +856,7 @@ def train(args):
                             num_train_epochs,
                             global_step,
                             accelerator.unwrap_model(nextdit),
+                            ema=ema,
                         )
                 optimizer_train_fn()
 
@@ -880,6 +895,7 @@ def train(args):
                     num_train_epochs,
                     global_step,
                     accelerator.unwrap_model(nextdit),
+                    ema=ema,
                 )
 
         lumina_train_util.sample_images(
@@ -892,6 +908,12 @@ def train(args):
             gemma2,
             sample_prompts_te_outputs,
         )
+        if ema is not None and getattr(args, "ema_sample", False) and global_step != 0:
+            with ema.average_parameters():
+                lumina_train_util.sample_images(
+                    accelerator, args, epoch + 1, global_step, nextdit, ae, gemma2,
+                    sample_prompts_te_outputs, filename_suffix="_ema",
+                )
         optimizer_train_fn()
 
     is_main_process = accelerator.is_main_process
@@ -908,7 +930,7 @@ def train(args):
 
     if is_main_process:
         lumina_train_util.save_lumina_model_on_train_end(
-            args, save_dtype, epoch, global_step, nextdit
+            args, save_dtype, epoch, global_step, nextdit, ema=ema
         )
         logger.info("model saved.")
 

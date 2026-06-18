@@ -210,6 +210,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         tokenizer,
         text_encoder,
         lumina,
+        filename_suffix="",
     ):
         lumina_train_util.sample_images(
             accelerator,
@@ -220,6 +221,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
             vae,
             self.get_models_for_text_encoding(args, accelerator, text_encoder),
             self.sample_prompts_te_outputs,
+            filename_suffix=filename_suffix,
         )
 
     # Remaining methods maintain similar structure to flux implementation
