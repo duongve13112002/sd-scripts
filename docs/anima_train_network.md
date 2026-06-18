@@ -526,6 +526,61 @@ Caption dropout uses the `caption_dropout_rate` setting from the dataset configu
 
 Note: Currently, only Anima supports combining `caption_dropout_rate` with text encoder output caching.
 
+#### EMA (Exponential Moving Average)
+
+EMA maintains a shadow copy of the model parameters, averaging them over training steps. This produces smoother, more stable weights that often generalize better than the final training checkpoint. EMA is supported for both full fine-tuning (`anima_train.py`) and LoRA training (`anima_train_network.py`).
+
+* `--ema`
+  - Enable EMA. When enabled, an EMA model is saved alongside each regular checkpoint with an `ema_` prefix on the filename (e.g., `ema_anima-000010.safetensors`). The EMA model has the same format as the regular model and can be used directly for inference.
+* `--ema_decay=<float>` (default: `0.9999`)
+  - Decay rate for EMA. Higher values produce smoother weights but adapt more slowly to new training data. Typical values range from `0.999` to `0.99999`.
+* `--ema_device=<choice>` (default: `cuda`)
+  - Device to store EMA shadow parameters. Choose `cuda` or `cpu`. Using `cpu` significantly reduces GPU VRAM usage (shadow params use the same amount of memory as the model) but makes EMA updates slower due to CPU-GPU data transfer.
+* `--ema_use_num_updates`
+  - Automatically adjust the EMA decay based on the number of update steps. The effective decay is calculated as `min(decay, (1 + num_updates) / (10 + num_updates))`. This makes the EMA warm up faster in early training steps.
+* `--ema_sample`
+  - Also generate sample images with the EMA weights in addition to the training weights. EMA sample images are saved with a `_ema` suffix (e.g., `image_0000_000010_ema.png`). EMA sampling is skipped at step 0 since the EMA has not accumulated meaningful averages yet. This works together with the existing `--sample_every_n_steps`, `--sample_every_n_epochs`, and `--sample_prompts` arguments.
+* `--ema_resume_path=<path>` *[Optional]*
+  - Path to a previously saved EMA model (`.safetensors`) to resume the EMA state from. For full fine-tuning the file should be a saved EMA DiT model; for LoRA training it should be a saved EMA LoRA file.
+* `--ema_use_feedback` *[Experimental]*
+  - Feed EMA parameters back into the training model after each update. This is experimental and is **not compatible with multi-GPU DDP training** (it modifies parameters only on the main process, causing parameter desynchronization across GPUs).
+* `--ema_param_multiplier=<float>` (default: `1.0`) *[Experimental]*
+  - Multiply shadow parameters by this value after each EMA update. This is experimental and is **not compatible with multi-GPU DDP training** when set to a value other than `1.0`.
+
+**Example — LoRA training with EMA:**
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 anima_train_network.py \
+  --pretrained_model_name_or_path="<path to Anima DiT model>" \
+  --qwen3="<path to Qwen3-0.6B model>" \
+  --vae="<path to Qwen-Image VAE model>" \
+  --dataset_config="my_anima_dataset_config.toml" \
+  --output_dir="<output directory>" \
+  --output_name="my_anima_lora" \
+  --save_model_as=safetensors \
+  --network_module=networks.lora_anima \
+  --network_dim=8 \
+  --learning_rate=1e-4 \
+  --optimizer_type="AdamW8bit" \
+  --max_train_epochs=10 \
+  --save_every_n_epochs=1 \
+  --mixed_precision="bf16" \
+  --gradient_checkpointing \
+  --cache_latents \
+  --cache_text_encoder_outputs \
+  --ema \
+  --ema_decay=0.9999 \
+  --ema_device=cuda \
+  --ema_sample \
+  --sample_every_n_epochs=1 \
+  --sample_prompts="<path to prompt file>"
+```
+
+**Notes:**
+* When `--ema_device=cpu` is used, EMA shadow parameters are stored in system RAM instead of GPU VRAM. This helps with large models where VRAM is limited, but EMA updates are slower.
+* For multi-GPU training, `--ema_use_feedback` and `--ema_param_multiplier` (when not `1.0`) are not supported and will raise an error. Other EMA features work correctly with multi-GPU DDP.
+* The EMA model file uses the same format as the regular model. For LoRA, the EMA LoRA file can be loaded the same way as a regular LoRA file.
+
 <details>
 <summary>日本語</summary>
 

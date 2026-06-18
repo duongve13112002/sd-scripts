@@ -18,6 +18,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _write_npz(npz_path: str, kwargs: dict):
+    np.savez(npz_path, **kwargs)
+
+
 class TokenizeStrategy:
     _strategy = None  # strategy instance: actual strategy class
 
@@ -369,6 +373,40 @@ class TextEncoderOutputsCachingStrategy:
     def is_disk_cached_outputs_expected(self, npz_path: str) -> bool:
         raise NotImplementedError
 
+    def set_async_write_executor(self, executor):
+        """Set a ThreadPoolExecutor for async disk writes. Pass None to disable."""
+        self._write_executor = executor
+        self._write_futures = []
+
+    def wait_for_async_writes(self):
+        """Wait for all pending async disk writes to complete, re-raising any write errors."""
+        futures = getattr(self, "_write_futures", [])
+        for f in futures:
+            f.result()
+        self._write_futures = []
+
+    def submit_async_write(self, fn, *args):
+        """Submit a disk write to the background executor if available, else run it inline."""
+        executor = getattr(self, "_write_executor", None)
+        if executor is not None:
+            if not hasattr(self, "_write_futures"):
+                self._write_futures = []
+            future = executor.submit(fn, *args)
+            self._write_futures.append(future)
+            # Prune already-completed futures to avoid unbounded list growth
+            self._write_futures = [f for f in self._write_futures if not f.done()]
+        else:
+            fn(*args)
+
+    def save_outputs_npz(self, npz_path: str, **kwargs):
+        """Save text encoder outputs to an npz file, async if an executor is set.
+
+        Numpy arrays are copied before handoff so the calling thread can reuse its
+        encode buffers immediately without data races with the write thread.
+        """
+        safe_kwargs = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in kwargs.items()}
+        self.submit_async_write(_write_npz, npz_path, safe_kwargs)
+
     def cache_batch_outputs(
         self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, batch: List
     ):
@@ -605,6 +643,18 @@ class LatentsCachingStrategy:
         alpha_mask = npz["alpha_mask" + key_reso_suffix] if "alpha_mask" + key_reso_suffix in npz else None
         return latents, original_size, crop_ltrb, flipped_latents, alpha_mask
 
+    def set_async_write_executor(self, executor):
+        """Set a ThreadPoolExecutor for async disk writes. Pass None to disable."""
+        self._write_executor = executor
+        self._write_futures = []
+
+    def wait_for_async_writes(self):
+        """Wait for all pending async disk writes to complete, re-raising any write errors."""
+        futures = getattr(self, "_write_futures", [])
+        for f in futures:
+            f.result()  # re-raises any exception from the write thread
+        self._write_futures = []
+
     def save_latents_to_disk(
         self,
         npz_path,
@@ -628,6 +678,50 @@ class LatentsCachingStrategy:
         Returns:
             None
         """
+        executor = getattr(self, "_write_executor", None)
+        if executor is not None:
+            # Clone tensors to CPU before handing off to the write thread; the main thread
+            # may start the next GPU encode as soon as this call returns.
+            latents_copy = latents_tensor.float().cpu().clone()
+            flipped_copy = flipped_latents_tensor.float().cpu().clone() if flipped_latents_tensor is not None else None
+            alpha_copy = alpha_mask.float().cpu().clone() if alpha_mask is not None else None
+
+            if not hasattr(self, "_write_futures"):
+                self._write_futures = []
+            future = executor.submit(
+                self._save_latents_to_disk_impl,
+                npz_path,
+                latents_copy,
+                original_size,
+                crop_ltrb,
+                flipped_copy,
+                alpha_copy,
+                key_reso_suffix,
+            )
+            self._write_futures.append(future)
+            # Prune already-completed futures to avoid unbounded list growth
+            self._write_futures = [f for f in self._write_futures if not f.done()]
+        else:
+            self._save_latents_to_disk_impl(
+                npz_path,
+                latents_tensor,
+                original_size,
+                crop_ltrb,
+                flipped_latents_tensor,
+                alpha_mask,
+                key_reso_suffix,
+            )
+
+    def _save_latents_to_disk_impl(
+        self,
+        npz_path,
+        latents_tensor,
+        original_size,
+        crop_ltrb,
+        flipped_latents_tensor=None,
+        alpha_mask=None,
+        key_reso_suffix="",
+    ):
         kwargs = {}
 
         if os.path.exists(npz_path):
@@ -636,7 +730,7 @@ class LatentsCachingStrategy:
             for key in npz.files:
                 kwargs[key] = npz[key]
 
-        # TODO float() is needed if vae is in bfloat16. Remove it if vae is float16.
+        # float() is needed if vae is in bfloat16; harmless when it is float16.
         kwargs["latents" + key_reso_suffix] = latents_tensor.float().cpu().numpy()
         kwargs["original_size" + key_reso_suffix] = np.array(original_size)
         kwargs["crop_ltrb" + key_reso_suffix] = np.array(crop_ltrb)

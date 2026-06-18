@@ -797,6 +797,17 @@ class BaseDataset(torch.utils.data.Dataset):
         max_workers = min(max_workers, caching_strategy.batch_size)  # max_workers should be less than batch_size
         executor = ThreadPoolExecutor(max_workers)
 
+        # Use a separate thread pool for disk writes so the GPU can encode the next batch while the
+        # previous one is written to disk (overlaps I/O with compute). Workers are capped by
+        # (cpu_count / num_processes) so multiple GPU processes don't oversubscribe the CPU, and by
+        # batch_size since that bounds the number of concurrent writes.
+        write_executor = None
+        if caching_strategy.cache_to_disk:
+            write_workers = max(1, os.cpu_count() // num_processes)
+            write_workers = min(write_workers, caching_strategy.batch_size)
+            write_executor = ThreadPoolExecutor(max_workers=write_workers)
+            caching_strategy.set_async_write_executor(write_executor)
+
         try:
             # iterate images
             logger.info("caching latents...")
@@ -848,8 +859,15 @@ class BaseDataset(torch.utils.data.Dataset):
             if len(batch) > 0:
                 submit_batch(batch, current_condition)
 
+            # Wait for all pending async disk writes to finish before returning
+            if write_executor is not None:
+                caching_strategy.wait_for_async_writes()
+
         finally:
             executor.shutdown()
+            if write_executor is not None:
+                caching_strategy.set_async_write_executor(None)
+                write_executor.shutdown(wait=True)
 
     def new_cache_text_encoder_outputs(self, models: List[Any], accelerator: Accelerator):
         r"""
@@ -901,10 +919,26 @@ class BaseDataset(torch.utils.data.Dataset):
             logger.info("no Text Encoder outputs to cache")
             return
 
-        # iterate batches
-        logger.info("caching Text Encoder outputs...")
-        for batch in tqdm(batches, smoothing=1, total=len(batches)):
-            caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
+        # Set up an async write executor to overlap GPU encoding with disk I/O
+        write_executor = None
+        if caching_strategy.cache_to_disk:
+            write_workers = max(1, os.cpu_count() // num_processes)
+            write_workers = min(write_workers, batch_size)
+            write_executor = ThreadPoolExecutor(max_workers=write_workers)
+            caching_strategy.set_async_write_executor(write_executor)
+
+        try:
+            # iterate batches
+            logger.info("caching Text Encoder outputs...")
+            for batch in tqdm(batches, smoothing=1, total=len(batches)):
+                caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
+
+            if write_executor is not None:
+                caching_strategy.wait_for_async_writes()
+        finally:
+            if write_executor is not None:
+                caching_strategy.set_async_write_executor(None)
+                write_executor.shutdown(wait=True)
 
     def get_image_size(self, image_path):
         if image_path.endswith(".jxl") or image_path.endswith(".JXL"):

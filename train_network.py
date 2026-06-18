@@ -230,6 +230,24 @@ class NetworkTrainer:
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoder, unet):
         sampling.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizers[0], text_encoder, unet)
 
+    # EMA (Exponential Moving Average) hooks. The base trainer leaves them as no-ops;
+    # subclasses that support EMA override them to opt in.
+    def create_ema(self, args, accelerator, unet, network):
+        """Create an EMA instance. Override in a subclass to enable EMA. Return None to disable."""
+        return None
+
+    def save_ema_network(self, ema, ckpt_file, network, save_dtype, metadata):
+        """Save the EMA version of the network weights. Override in a subclass."""
+        pass
+
+    def remove_ema_network(self, old_ckpt_file):
+        """Remove the old EMA network file during checkpoint cleanup. Override in a subclass."""
+        pass
+
+    def sample_ema_images(self, ema, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoder, unet):
+        """Sample images using the EMA weights. Override in a subclass."""
+        pass
+
     # region SD/SDXL
 
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
@@ -872,6 +890,7 @@ class NetworkTrainer:
         steps: int,
         epoch_no: int,
         force_sync_upload: bool = False,
+        ema=None,
     ):
         os.makedirs(args.output_dir, exist_ok=True)
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
@@ -889,11 +908,18 @@ class NetworkTrainer:
         if args.huggingface_repo_id is not None:
             huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
-    def _remove_model(self, *, args: argparse.Namespace, accelerator: Accelerator, old_ckpt_name: str):
+        # Save the EMA network alongside the normal checkpoint when a subclass provides one
+        if ema is not None:
+            self.save_ema_network(ema, ckpt_file, unwrapped_nw, save_dtype, metadata_to_save)
+
+    def _remove_model(self, *, args: argparse.Namespace, accelerator: Accelerator, old_ckpt_name: str, ema=None):
         old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
         if os.path.exists(old_ckpt_file):
             accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
             os.remove(old_ckpt_file)
+        # Also remove the matching EMA file when a subclass provides one
+        if ema is not None:
+            self.remove_ema_network(old_ckpt_file)
 
     def train(self, args):
         session_id = random.randint(0, 2**32)
@@ -1488,6 +1514,9 @@ class NetworkTrainer:
         else:
             on_step_start_for_network = lambda *args, **kwargs: None
 
+        # Create EMA if the subclass supports it (returns None otherwise)
+        ema = self.create_ema(args, accelerator, unet, network)
+
         # if text_encoder is not needed for training, delete it to save memory.
         # TODO this can be automated after SDXL sample prompt cache is implemented
         if self.is_text_encoder_not_needed_for_training(args):
@@ -1659,10 +1688,19 @@ class NetworkTrainer:
                     progress_bar.update(1)
                     global_step += 1
 
+                    # Update EMA after each optimizer step
+                    if ema is not None:
+                        ema.update()
+
                     optimizer_eval_fn()
                     self.sample_images(
                         accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
                     )
+                    # EMA sampling (the subclass decides whether anything happens)
+                    if ema is not None:
+                        self.sample_ema_images(
+                            ema, accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
+                        )
                     progress_bar.unpause()
 
                     # 指定ステップごとにモデルを保存
@@ -1678,6 +1716,7 @@ class NetworkTrainer:
                                 unwrapped_nw=accelerator.unwrap_model(network),
                                 steps=global_step,
                                 epoch_no=epoch,
+                                ema=ema,
                             )
 
                             if args.save_state:
@@ -1686,7 +1725,7 @@ class NetworkTrainer:
                             remove_step_no = checkpoint_io.get_remove_step_no(args, global_step)
                             if remove_step_no is not None:
                                 remove_ckpt_name = checkpoint_io.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
-                                self._remove_model(args=args, accelerator=accelerator, old_ckpt_name=remove_ckpt_name)
+                                self._remove_model(args=args, accelerator=accelerator, old_ckpt_name=remove_ckpt_name, ema=ema)
                     optimizer_train_fn()
 
                 current_loss = loss.detach().item()
@@ -1819,17 +1858,22 @@ class NetworkTrainer:
                         unwrapped_nw=accelerator.unwrap_model(network),
                         steps=global_step,
                         epoch_no=epoch + 1,
+                        ema=ema,
                     )
 
                     remove_epoch_no = checkpoint_io.get_remove_epoch_no(args, epoch + 1)
                     if remove_epoch_no is not None:
                         remove_ckpt_name = checkpoint_io.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no)
-                        self._remove_model(args=args, accelerator=accelerator, old_ckpt_name=remove_ckpt_name)
+                        self._remove_model(args=args, accelerator=accelerator, old_ckpt_name=remove_ckpt_name, ema=ema)
 
                     if args.save_state:
                         checkpoint_io.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
             self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+            if ema is not None:
+                self.sample_ema_images(
+                    ema, accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
+                )
             progress_bar.unpause()
             optimizer_train_fn()
 
@@ -1858,6 +1902,7 @@ class NetworkTrainer:
                 steps=global_step,
                 epoch_no=num_train_epochs,
                 force_sync_upload=True,
+                ema=ema,
             )
 
             logger.info("model saved.")

@@ -47,6 +47,11 @@ If you find this project helpful, please consider supporting its development via
 
 ### Change History
 
+- **Unreleased (2026-06-18):**
+    - Added EMA (Exponential Moving Average) support for Anima full fine-tuning and LoRA training, with optional EMA sampling. An EMA checkpoint is saved alongside each regular checkpoint with an `ema_` prefix. See the [documentation](./docs/anima_train_network.md#ema-exponential-moving-average) for the `--ema*` options.
+    - Optimized disk caching to overlap GPU encoding with asynchronous disk writes for VAE latents and all text-encoder output caching strategies. This is automatic whenever caching to disk is enabled; there are no new options.
+    - Added `anima_train_adapter.py`, a standalone training script for the Anima DiT adapter.
+
 - **Version 0.11.1 (2026-06-16):**
     - Added support for torch.compile in Anima LoRA/LLLite training. [PR #2379](https://github.com/kohya-ss/sd-scripts/pull/2379)
         - It seems to speed up training by about 20%. It requires Triton and MSVC compiler. For details, please refer to the [documentation](./docs/anima_torch_compile.md).
