@@ -22,6 +22,7 @@ from library import (
     sampling,
 )
 import library.args as args_util
+import library.distillation as distillation
 import library.model_io as model_io
 from library.dataset import DatasetGroup, MinimalDataset
 from library.utils import setup_logging
@@ -437,7 +438,30 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 )
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
-        return model_pred, target, timesteps, weighting
+        # output distillation: pull the student toward the base (adapter-disabled) prediction
+        distill_loss = None
+        if distillation.is_enabled(args):
+            network.set_multiplier(0.0)
+            unet.prepare_block_swap_before_forward()
+            with torch.no_grad():
+                teacher_pred = call_dit(
+                    img=packed_noisy_model_input,
+                    img_ids=img_ids,
+                    t5_out=t5_out,
+                    txt_ids=txt_ids,
+                    l_pooled=l_pooled,
+                    timesteps=timesteps,
+                    guidance_vec=guidance_vec,
+                    t5_attn_mask=t5_attn_mask,
+                    mod_vectors=mod_vectors,
+                )
+            network.set_multiplier(1.0)
+            teacher_pred = flux_utils.unpack_latents(teacher_pred, packed_latent_height, packed_latent_width)
+            teacher_pred, _ = flux_train_utils.apply_model_prediction_type(args, teacher_pred, noisy_model_input, sigmas)
+            noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
+            distill_loss = distillation.distillation_loss(model_pred, teacher_pred, noise_level, batch["loss_weights"], args)
+
+        return model_pred, target, timesteps, weighting, distill_loss
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         return loss

@@ -14,6 +14,7 @@ from accelerate import Accelerator, PartialState
 
 from library import flux_utils, hunyuan_image_models, hunyuan_image_vae, strategy_base, sampling
 import library.args as args_util
+import library.distillation as distillation
 import library.model_io as model_io
 from library.dataset import DatasetGroup, MinimalDataset
 from library.device_utils import clean_memory_on_device, init_ipex
@@ -583,7 +584,18 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
 
         # differential output preservation is not used for HunyuanImage-2.1 currently
 
-        return model_pred, target, timesteps, weighting
+        # output distillation: pull the student toward the base (adapter-disabled) prediction
+        distill_loss = None
+        if distillation.is_enabled(args):
+            network.set_multiplier(0.0)
+            with torch.no_grad(), accelerator.autocast():
+                teacher_pred = unet(noisy_model_input, timesteps, vlm_embed, vlm_mask, byt5_embed, byt5_mask)
+            network.set_multiplier(1.0)
+            teacher_pred, _ = flux_train_utils.apply_model_prediction_type(args, teacher_pred, noisy_model_input, sigmas)
+            noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
+            distill_loss = distillation.distillation_loss(model_pred, teacher_pred, noise_level, batch["loss_weights"], args)
+
+        return model_pred, target, timesteps, weighting, distill_loss
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         return loss

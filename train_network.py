@@ -37,6 +37,7 @@ from library.dreambooth_dataset import DreamBoothDataset
 from library.model_io import SS_METADATA_MINIMUM_KEYS
 import library.logging_util as logging_util
 import library.loss as loss_util
+import library.distillation as distillation
 import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
 import library.config_util as config_util
@@ -453,7 +454,23 @@ class NetworkTrainer:
                 network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
                 target[diff_output_pr_indices] = noise_pred_prior.to(target.dtype)
 
-        return noise_pred, target, timesteps, None
+        # output distillation: pull the student toward the base (adapter-disabled) prediction
+        distill_loss = None
+        if distillation.is_enabled(args):
+            network.set_multiplier(0.0)
+            with torch.no_grad(), accelerator.autocast():
+                teacher_pred = self.call_unet(
+                    args, accelerator, unet, unet_latents, timesteps, text_encoder_conds, batch, weight_dtype
+                )
+            network.set_multiplier(1.0)
+            noise_level = distillation.normalized_noise_level_from_timesteps(
+                timesteps, noise_scheduler.config.num_train_timesteps
+            )
+            distill_loss = distillation.distillation_loss(
+                noise_pred, teacher_pred, noise_level, batch["loss_weights"], args
+            )
+
+        return noise_pred, target, timesteps, None, distill_loss
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler) -> torch.FloatTensor:
         if args.min_snr_gamma:
@@ -585,7 +602,7 @@ class NetworkTrainer:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
         # sample noise, call unet, get target
-        noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
+        noise_pred, target, timesteps, weighting, distill_loss = self.get_noise_pred_and_target(
             args,
             accelerator,
             noise_scheduler,
@@ -612,7 +629,10 @@ class NetworkTrainer:
 
         loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
 
-        return loss.mean()
+        loss = loss.mean()
+        if distill_loss is not None:
+            loss = loss + distill_loss
+        return loss
 
     def cast_text_encoder(self, args):
         return True  # default for other than HunyuanImage

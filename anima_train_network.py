@@ -23,6 +23,7 @@ from library import (
 )
 import library.args as args_util
 import library.compile_utils as compile_utils
+import library.distillation as distillation
 import library.model_io as model_io
 from library.dataset import DatasetGroup, MinimalDataset
 import train_network
@@ -337,7 +338,26 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Loss weighting
         weighting = anima_train_utils.compute_loss_weighting_for_anima(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
-        return model_pred, target, timesteps, weighting
+        # output distillation: pull the student toward the base (adapter-disabled) prediction
+        distill_loss = None
+        if distillation.is_enabled(args):
+            network.set_multiplier(0.0)
+            with torch.no_grad(), accelerator.autocast():
+                teacher_pred = anima(
+                    noisy_model_input,
+                    timesteps,
+                    prompt_embeds,
+                    padding_mask=padding_mask,
+                    target_input_ids=t5_input_ids,
+                    target_attention_mask=t5_attn_mask,
+                    source_attention_mask=attn_mask,
+                )
+            network.set_multiplier(1.0)
+            teacher_pred = teacher_pred.squeeze(2)  # 5D to 4D, [B, C, 1, H, W] -> [B, C, H, W]
+            noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
+            distill_loss = distillation.distillation_loss(model_pred, teacher_pred, noise_level, batch["loss_weights"], args)
+
+        return model_pred, target, timesteps, weighting, distill_loss
 
     def process_batch(
         self,

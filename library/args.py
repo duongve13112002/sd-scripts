@@ -667,6 +667,35 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "EMA samples are saved with '_ema' suffix. Requires --ema.",
     )
 
+    # Output distillation (anti catastrophic-forgetting) arguments
+    parser.add_argument(
+        "--distillation_weight_high",
+        type=float,
+        default=0.0,
+        help="Distillation weight at high noise (noise level 1). Pulls the student prediction toward the "
+        "base/teacher prediction to preserve knowledge. 0 disables distillation. (default: 0.0)",
+    )
+    parser.add_argument(
+        "--distillation_weight_low",
+        type=float,
+        default=0.0,
+        help="Distillation weight at low noise (noise level 0). Lower than --distillation_weight_high lets the "
+        "model learn fine detail/style freely while anchoring concepts at high noise. (default: 0.0)",
+    )
+    parser.add_argument(
+        "--distillation_loss_type",
+        type=str,
+        default="l2",
+        choices=["l2", "huber"],
+        help="Distance used between student and teacher predictions for distillation. (default: l2)",
+    )
+    parser.add_argument(
+        "--distillation_huber_c",
+        type=float,
+        default=1.0,
+        help="Delta (transition point) for Huber distillation loss when --distillation_loss_type huber. (default: 1.0)",
+    )
+
 
 def add_masked_loss_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(

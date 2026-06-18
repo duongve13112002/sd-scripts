@@ -14,6 +14,7 @@ init_ipex()
 
 from library import flux_models, flux_train_utils, flux_utils, sd3_train_utils, sd3_utils, strategy_base, strategy_sd3, sampling
 import library.args as args_util
+import library.distillation as distillation
 import library.model_io as model_io
 from library.dataset import DatasetGroup, MinimalDataset
 import train_network
@@ -394,7 +395,18 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
 
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
-        return model_pred, target, timesteps, weighting
+        # output distillation: pull the student toward the base (adapter-disabled) prediction
+        distill_loss = None
+        if distillation.is_enabled(args):
+            network.set_multiplier(0.0)
+            with torch.no_grad(), accelerator.autocast():
+                teacher_pred = unet(noisy_model_input, timesteps, context=context, y=lg_pooled)
+            network.set_multiplier(1.0)
+            teacher_pred = teacher_pred * (-sigmas) + noisy_model_input
+            noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
+            distill_loss = distillation.distillation_loss(model_pred, teacher_pred, noise_level, batch["loss_weights"], args)
+
+        return model_pred, target, timesteps, weighting, distill_loss
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         return loss

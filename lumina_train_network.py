@@ -23,6 +23,7 @@ from library import (
     sampling,
 )
 import library.args as args_util
+import library.distillation as distillation
 import library.model_io as model_io
 from library.utils import setup_logging
 
@@ -323,7 +324,23 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 )
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
-        return model_pred, target, timesteps, weighting
+        # output distillation: pull the student toward the base (adapter-disabled) prediction
+        distill_loss = None
+        if distillation.is_enabled(args):
+            network.set_multiplier(0.0)
+            with torch.no_grad():
+                teacher_pred = call_dit(
+                    img=noisy_model_input,
+                    gemma2_hidden_states=gemma2_hidden_states,
+                    gemma2_attn_mask=gemma2_attn_mask,
+                    timesteps=timesteps,
+                )
+            network.set_multiplier(1.0)
+            teacher_pred, _ = lumina_train_util.apply_model_prediction_type(args, teacher_pred, noisy_model_input, sigmas)
+            noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
+            distill_loss = distillation.distillation_loss(model_pred, teacher_pred, noise_level, batch["loss_weights"], args)
+
+        return model_pred, target, timesteps, weighting, distill_loss
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         return loss
