@@ -39,6 +39,7 @@ import library.dataset as dataset_util
 import library.optimizer as optimizer_util
 import library.logging_util as logging_util
 import library.loss as loss_util
+import library.distillation as distillation
 import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
 
@@ -312,6 +313,17 @@ def train(args):
         # This idea is based on 2kpr's great work. Thank you!
         logger.info(f"enable block swap: blocks_to_swap={args.blocks_to_swap}")
         flux.enable_block_swap(args.blocks_to_swap, accelerator.device)
+
+    # distillation teacher (frozen base) for full fine-tune output distillation
+    distill_teacher = None
+    distill_teacher_swapping = False
+    if distillation.is_enabled(args):
+        _, distill_teacher = flux_utils.load_flow_model(
+            distillation.teacher_path(args), weight_dtype, "cpu", args.disable_mmap_load_safetensors, model_type="flux"
+        )
+        distill_teacher, distill_teacher_swapping = distillation.prepare_teacher(
+            distill_teacher, args, accelerator.device, supports_block_swap=True, supports_fp8=True
+        )
 
     if not cache_latents:
         # load VAE here if not cached
@@ -690,6 +702,25 @@ def train(args):
                 loss_weights = batch["loss_weights"]  # 各sampleごとのweight
                 loss = loss * loss_weights
                 loss = loss.mean()
+
+                # output distillation: pull the student toward the frozen base (teacher) prediction
+                if distill_teacher is not None:
+                    distillation.before_teacher_forward(distill_teacher, distill_teacher_swapping)
+                    with torch.no_grad(), accelerator.autocast():
+                        teacher_pred = distill_teacher(
+                            img=packed_noisy_model_input,
+                            img_ids=img_ids,
+                            txt=t5_out,
+                            txt_ids=txt_ids,
+                            y=l_pooled,
+                            timesteps=timesteps / 1000,
+                            guidance=guidance_vec,
+                            txt_attention_mask=t5_attn_mask,
+                        )
+                    teacher_pred = flux_utils.unpack_latents(teacher_pred, packed_latent_height, packed_latent_width)
+                    teacher_pred, _ = flux_train_utils.apply_model_prediction_type(args, teacher_pred, noisy_model_input, sigmas)
+                    noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
+                    loss = loss + distillation.distillation_loss(model_pred, teacher_pred, noise_level, loss_weights, args)
 
                 # backward
                 accelerator.backward(loss)

@@ -42,6 +42,7 @@ import library.dataset as dataset_util
 import library.optimizer as optimizer_util
 import library.logging_util as logging_util
 import library.loss as loss_util
+import library.distillation as distillation
 import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
 
@@ -315,6 +316,21 @@ def train(args):
         )
 
     nextdit.requires_grad_(True)
+
+    # distillation teacher (frozen base) for full fine-tune output distillation
+    distill_teacher = None
+    distill_teacher_swapping = False
+    if distillation.is_enabled(args):
+        distill_teacher = lumina_util.load_lumina_model(
+            distillation.teacher_path(args),
+            weight_dtype,
+            torch.device("cpu"),
+            disable_mmap=args.disable_mmap_load_safetensors,
+            use_flash_attn=args.use_flash_attn,
+        )
+        distill_teacher, distill_teacher_swapping = distillation.prepare_teacher(
+            distill_teacher, args, accelerator.device, supports_block_swap=True, supports_fp8=True
+        )
 
     # block swap
 
@@ -792,6 +808,20 @@ def train(args):
                 loss_weights = batch["loss_weights"]  # 各sampleごとのweight
                 loss = loss * loss_weights
                 loss = loss.mean()
+
+                # output distillation: pull the student toward the frozen base (teacher) prediction
+                if distill_teacher is not None:
+                    distillation.before_teacher_forward(distill_teacher, distill_teacher_swapping)
+                    with torch.no_grad(), accelerator.autocast():
+                        teacher_pred = distill_teacher(
+                            x=noisy_model_input,
+                            t=1 - timesteps / 1000,
+                            cap_feats=gemma2_hidden_states,
+                            cap_mask=gemma2_attn_mask.to(dtype=torch.int32),
+                        )
+                    teacher_pred, _ = lumina_train_util.apply_model_prediction_type(args, teacher_pred, noisy_model_input, sigmas)
+                    noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
+                    loss = loss + distillation.distillation_loss(model_pred, teacher_pred, noise_level, loss_weights, args)
 
                 # backward
                 accelerator.backward(loss)

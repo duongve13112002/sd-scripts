@@ -26,6 +26,7 @@ import library.model_io as model_io
 import library.optimizer as optimizer_util
 import library.logging_util as logging_util
 import library.loss as loss_util
+import library.distillation as distillation
 import library.checkpoint_io as checkpoint_io
 
 from library.utils import setup_logging, add_logging_arguments
@@ -293,6 +294,27 @@ def train(args):
     train_unet = args.learning_rate != 0
     train_text_encoder1 = False
     train_text_encoder2 = False
+
+    # distillation teacher (frozen base U-Net) for full fine-tune output distillation
+    distill_unet = None
+    distill_teacher_swapping = False
+    if distillation.is_enabled(args):
+        teacher_model_dtype = sdxl_train_util.match_mixed_precision(args, weight_dtype)
+        teacher_models = sdxl_train_util._load_target_model(
+            distillation.teacher_path(args),
+            args.vae,
+            "sdxl",
+            weight_dtype,
+            accelerator.device if args.lowram else "cpu",
+            teacher_model_dtype,
+            args.disable_mmap_load_safetensors,
+        )
+        distill_unet = teacher_models[4]  # (sd_format, te1, te2, vae, unet, logit_scale, ckpt_info)
+        del teacher_models
+        # SDXL U-Net has no block swap / fp8 monkey-patch path here, so it is just frozen and placed on device.
+        distill_unet, distill_teacher_swapping = distillation.prepare_teacher(
+            distill_unet, args, accelerator.device, supports_block_swap=False, supports_fp8=False
+        )
 
     text_encoding_strategy = strategy_sdxl.SdxlTextEncodingStrategy()
     strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
@@ -759,6 +781,18 @@ def train(args):
                     loss = loss.mean()  # mean over batch dimension
                 else:
                     loss = loss_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "mean", huber_c)
+
+                # output distillation: pull the student toward the frozen base (teacher) prediction
+                if distill_unet is not None:
+                    distillation.before_teacher_forward(distill_unet, distill_teacher_swapping)
+                    with torch.no_grad(), accelerator.autocast():
+                        teacher_pred = distill_unet(noisy_latents, timesteps, text_embedding, vector_embedding)
+                    noise_level = distillation.normalized_noise_level_from_timesteps(
+                        timesteps, noise_scheduler.config.num_train_timesteps
+                    )
+                    loss = loss + distillation.distillation_loss(
+                        noise_pred, teacher_pred, noise_level, batch["loss_weights"], args
+                    )
 
                 accelerator.backward(loss)
 

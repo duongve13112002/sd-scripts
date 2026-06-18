@@ -28,6 +28,7 @@ import library.dataset as dataset_util
 import library.optimizer as optimizer_util
 import library.logging_util as logging_util
 import library.loss as loss_util
+import library.distillation as distillation
 import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
 
@@ -260,6 +261,18 @@ def train(args):
     dit.requires_grad_(train_dit)
     if not train_dit:
         dit.to(accelerator.device, dtype=weight_dtype)
+
+    # distillation teacher (frozen base) for full fine-tune output distillation
+    distill_teacher = None
+    distill_teacher_swapping = False
+    if distillation.is_enabled(args):
+        distill_teacher = anima_utils.load_anima_model(
+            "cpu", distillation.teacher_path(args), args.attn_mode, args.split_attn, "cpu", dit_weight_dtype=weight_dtype
+        )
+        # Anima DiT does not support fp8 (see anima_train_network.py); block swap is supported.
+        distill_teacher, distill_teacher_swapping = distillation.prepare_teacher(
+            distill_teacher, args, accelerator.device, supports_block_swap=True, supports_fp8=False
+        )
 
     # Block swap
     is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
@@ -594,6 +607,23 @@ def train(args):
                 loss_weights = batch["loss_weights"]
                 loss = loss * loss_weights
                 loss = loss.mean()
+
+                # output distillation: pull the student toward the frozen base (teacher) prediction
+                if distill_teacher is not None:
+                    distillation.before_teacher_forward(distill_teacher, distill_teacher_swapping)
+                    with torch.no_grad(), accelerator.autocast():
+                        teacher_pred = distill_teacher(
+                            noisy_model_input,
+                            timesteps,
+                            prompt_embeds,
+                            padding_mask=padding_mask,
+                            source_attention_mask=attn_mask,
+                            t5_input_ids=t5_input_ids,
+                            t5_attn_mask=t5_attn_mask,
+                        )
+                    teacher_pred = teacher_pred.squeeze(2)  # 5D to 4D, (B, C, H, W)
+                    noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
+                    loss = loss + distillation.distillation_loss(model_pred, teacher_pred, noise_level, loss_weights, args)
 
                 accelerator.backward(loss)
 

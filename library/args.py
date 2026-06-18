@@ -695,6 +695,27 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         default=1.0,
         help="Delta (transition point) for Huber distillation loss when --distillation_loss_type huber. (default: 1.0)",
     )
+    parser.add_argument(
+        "--distillation_teacher_path",
+        type=str,
+        default=None,
+        help="Checkpoint for the distillation teacher (full fine-tuning only). Defaults to "
+        "--pretrained_model_name_or_path, the base being fine-tuned. LoRA/network training does not use this "
+        "(its teacher is the same model with the adapter disabled).",
+    )
+    parser.add_argument(
+        "--distillation_teacher_fp8",
+        action="store_true",
+        help="Load the full fine-tune distillation teacher in fp8 to save VRAM (generic per-Linear fp8). "
+        "Ignored for models that do not support fp8.",
+    )
+    parser.add_argument(
+        "--distillation_teacher_blocks_to_swap",
+        type=int,
+        default=0,
+        help="Block-swap this many teacher blocks to CPU to save VRAM during full fine-tune distillation "
+        "(transformer models only; ignored otherwise). (default: 0, no swap)",
+    )
 
 
 def add_masked_loss_arguments(parser: argparse.ArgumentParser):

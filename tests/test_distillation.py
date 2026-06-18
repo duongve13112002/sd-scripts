@@ -115,6 +115,65 @@ def test_noise_level_from_timesteps_normalizes():
     assert torch.allclose(level, torch.tensor([0.0, 0.5, 0.999]))
 
 
+def test_teacher_path_defaults_to_pretrained():
+    args = argparse.Namespace(distillation_teacher_path=None, pretrained_model_name_or_path="/base.safetensors")
+    assert distillation.teacher_path(args) == "/base.safetensors"
+    args.distillation_teacher_path = "/other.safetensors"
+    assert distillation.teacher_path(args) == "/other.safetensors"
+
+
+def _teacher_args(fp8=False, blocks=0):
+    return argparse.Namespace(distillation_teacher_fp8=fp8, distillation_teacher_blocks_to_swap=blocks)
+
+
+def test_prepare_teacher_freezes_and_places_on_device():
+    teacher = torch.nn.Linear(4, 4)
+    out, is_swapping = distillation.prepare_teacher(
+        teacher, _teacher_args(), torch.device("cpu"), supports_block_swap=False, supports_fp8=False
+    )
+    assert out is teacher
+    assert not is_swapping
+    assert not any(p.requires_grad for p in teacher.parameters())
+    assert not teacher.training  # eval()
+
+
+def test_prepare_teacher_block_swap_unsupported_falls_back():
+    teacher = torch.nn.Linear(4, 4)
+    # request block swap on a model that does not support it -> warn + plain placement
+    _, is_swapping = distillation.prepare_teacher(
+        teacher, _teacher_args(blocks=4), torch.device("cpu"), supports_block_swap=False, supports_fp8=False
+    )
+    assert not is_swapping
+
+
+def test_prepare_teacher_block_swap_supported():
+    class _Swappable(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = torch.nn.Linear(4, 4)
+            self.calls = {"enable": 0, "move": 0, "prepare": 0}
+
+        def enable_block_swap(self, n, device):
+            self.calls["enable"] = n
+
+        def move_to_device_except_swap_blocks(self, device):
+            self.calls["move"] += 1
+
+        def prepare_block_swap_before_forward(self):
+            self.calls["prepare"] += 1
+
+    teacher = _Swappable()
+    out, is_swapping = distillation.prepare_teacher(
+        teacher, _teacher_args(blocks=3), torch.device("cpu"), supports_block_swap=True, supports_fp8=False
+    )
+    assert is_swapping and out.calls["enable"] == 3 and out.calls["move"] == 1
+    distillation.before_teacher_forward(out, is_swapping)
+    assert out.calls["prepare"] == 1
+    # no-op when not swapping
+    distillation.before_teacher_forward(out, False)
+    assert out.calls["prepare"] == 1
+
+
 def test_distillation_args_registered_on_training_parser():
     # add_training_arguments is called by every network trainer's setup_parser
     # (and by the full-FT scripts), so registering here covers all families.
@@ -132,5 +191,14 @@ def test_distillation_args_registered_on_training_parser():
     assert args.distillation_loss_type == "huber"
     assert args.distillation_huber_c == 1.0
     assert distillation.is_enabled(args)
+    # full fine-tune teacher options are registered too
+    teacher = parser.parse_args(["--distillation_teacher_path", "/t.safetensors", "--distillation_teacher_fp8",
+                                 "--distillation_teacher_blocks_to_swap", "8"])
+    assert teacher.distillation_teacher_path == "/t.safetensors"
+    assert teacher.distillation_teacher_fp8 is True
+    assert teacher.distillation_teacher_blocks_to_swap == 8
     # defaults keep distillation disabled
-    assert not distillation.is_enabled(parser.parse_args([]))
+    defaults = parser.parse_args([])
+    assert not distillation.is_enabled(defaults)
+    assert distillation.teacher_path(argparse.Namespace(distillation_teacher_path=defaults.distillation_teacher_path,
+                                                        pretrained_model_name_or_path="/base")) == "/base"

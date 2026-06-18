@@ -26,10 +26,14 @@ anchors concepts to the base while leaving detail learning free.
 """
 
 import argparse
-from typing import Optional
+import logging
+from typing import Optional, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 def is_enabled(args: argparse.Namespace) -> bool:
@@ -97,3 +101,61 @@ def normalized_noise_level_from_sigmas(sigmas: torch.Tensor) -> torch.Tensor:
 def normalized_noise_level_from_timesteps(timesteps: torch.Tensor, num_train_timesteps: int) -> torch.Tensor:
     """DDPM noise level: normalize discrete timesteps to [0, 1] (1 = most noise)."""
     return timesteps.detach().float().reshape(timesteps.shape[0]) / float(num_train_timesteps)
+
+
+def teacher_path(args: argparse.Namespace) -> str:
+    """Where the full fine-tune teacher is loaded from (defaults to the base being fine-tuned)."""
+    return getattr(args, "distillation_teacher_path", None) or args.pretrained_model_name_or_path
+
+
+def prepare_teacher(
+    teacher: nn.Module,
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    supports_block_swap: bool,
+    supports_fp8: bool,
+) -> Tuple[nn.Module, bool]:
+    """Freeze a full fine-tune teacher denoiser and apply optional fp8 / block-swap for VRAM.
+
+    The teacher is used only for no-grad forward passes, so it is set to eval and has grad
+    disabled. fp8 (generic per-Linear) and block swap are opt-in VRAM savers; both fall back to a
+    plain device placement (with a warning) for models that do not support them. Only the denoiser
+    is duplicated here; the VAE and text encoders are already frozen and shared by the caller.
+
+    Returns the (frozen) teacher and whether block swapping is active.
+    """
+    teacher.eval()
+    teacher.requires_grad_(False)
+
+    if getattr(args, "distillation_teacher_fp8", False):
+        if not supports_fp8:
+            logger.warning("--distillation_teacher_fp8 is not supported for this model; keeping the teacher in its loaded dtype")
+        else:
+            from library import fp8_optimization_utils
+
+            sd = teacher.state_dict()
+            sd = fp8_optimization_utils.optimize_state_dict_with_fp8(sd, device, None, None, move_to_device=True)
+            fp8_optimization_utils.apply_fp8_monkey_patch(teacher, sd, use_scaled_mm=False)
+            teacher.load_state_dict(sd, strict=False, assign=True)
+
+    blocks = int(getattr(args, "distillation_teacher_blocks_to_swap", 0) or 0)
+    is_swapping = False
+    if blocks > 0 and supports_block_swap:
+        logger.info(f"distillation teacher: enable block swap, blocks_to_swap={blocks}")
+        teacher.enable_block_swap(blocks, device)
+        teacher.move_to_device_except_swap_blocks(device)
+        is_swapping = True
+    else:
+        if blocks > 0 and not supports_block_swap:
+            logger.warning(
+                "--distillation_teacher_blocks_to_swap is not supported for this model; placing the whole teacher on the device"
+            )
+        teacher.to(device)
+    return teacher, is_swapping
+
+
+def before_teacher_forward(teacher: nn.Module, is_swapping: bool) -> None:
+    """Call before each teacher forward when block swapping is active."""
+    if is_swapping:
+        teacher.prepare_block_swap_before_forward()

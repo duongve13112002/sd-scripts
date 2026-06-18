@@ -93,6 +93,13 @@ def main():
     parser.add_argument("--t5_tokenizer_path", type=str, default=None)
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--loss_type", type=str, default="l2", choices=["l2", "huber"])
+    parser.add_argument("--only", type=str, default=None, choices=["lora", "finetune"])
+    parser.add_argument(
+        "--teacher_blocks_to_swap",
+        type=int,
+        default=0,
+        help="Exercise the full-FT teacher block-swap path (full fine-tune case only)",
+    )
     parser.add_argument("--timeout", type=int, default=600, help="Timeout per test in seconds")
     args = parser.parse_args()
 
@@ -110,20 +117,15 @@ def main():
     toml_path = create_dataset_toml(args.image_dir, args.resolution, os.path.join(tmp_dir, "dataset.toml"))
     python = sys.executable
 
-    out = os.path.join(tmp_dir, "lora")
-    os.makedirs(out, exist_ok=True)
-    cmd = [
-        python, "anima_train_network.py",
+    # shared training args + distillation knobs (anchor concepts at high noise, free detail at low noise)
+    common = [
         "--dit_path", args.dit_path,
         "--qwen3_path", args.qwen3_path,
         "--vae_path", args.vae_path,
         "--pretrained_model_name_or_path", args.dit_path,
         "--dataset_config", toml_path,
-        "--output_dir", out,
-        "--output_name", "distill_lora",
         "--max_train_steps", "2",
         "--save_every_n_steps", "2",
-        "--learning_rate", "1e-4",
         "--mixed_precision", "bf16",
         "--max_data_loader_n_workers", "0",
         "--logging_dir", os.path.join(tmp_dir, "logs"),
@@ -132,30 +134,56 @@ def main():
         "--cache_text_encoder_outputs",
         "--cache_text_encoder_outputs_to_disk",
         "--optimizer_type", "AdamW8bit",
-        "--network_module", "networks.lora_anima",
-        "--network_dim", "4",
-        "--network_alpha", "1",
-        # distillation: anchor concepts at high noise, free detail at low noise
         "--distillation_weight_high", "1.0",
         "--distillation_weight_low", "0.0",
         "--distillation_loss_type", args.loss_type,
     ]
     if args.t5_tokenizer_path:
-        cmd += ["--t5_tokenizer_path", args.t5_tokenizer_path]
+        common += ["--t5_tokenizer_path", args.t5_tokenizer_path]
 
-    result = run_test("anima_train_network.py LoRA with distillation", cmd, out, args.timeout)
+    results = {}
+
+    if args.only in (None, "lora"):
+        out = os.path.join(tmp_dir, "lora")
+        os.makedirs(out, exist_ok=True)
+        cmd = [python, "anima_train_network.py"] + common + [
+            "--output_dir", out,
+            "--output_name", "distill_lora",
+            "--learning_rate", "1e-4",
+            "--network_module", "networks.lora_anima",
+            "--network_dim", "4",
+            "--network_alpha", "1",
+        ]
+        results["lora_distillation"] = run_test("anima_train_network.py LoRA with distillation", cmd, out, args.timeout)
+
+    if args.only in (None, "finetune"):
+        out = os.path.join(tmp_dir, "ft")
+        os.makedirs(out, exist_ok=True)
+        # Full fine-tune loads a separate frozen teacher denoiser; optionally exercise its block-swap path.
+        cmd = [python, "anima_train.py"] + common + [
+            "--output_dir", out,
+            "--output_name", "distill_ft",
+            "--learning_rate", "1e-5",
+        ]
+        if args.teacher_blocks_to_swap > 0:
+            cmd += ["--distillation_teacher_blocks_to_swap", str(args.teacher_blocks_to_swap)]
+        results["finetune_distillation"] = run_test("anima_train.py full finetune with distillation", cmd, out, args.timeout)
 
     print(f"\n{'#' * 70}\nSUMMARY")
-    print(f"  [{result['status']:7s}] lora_distillation: {result['detail']}")
+    all_pass = True
+    for name, result in results.items():
+        if result["status"] != "PASS":
+            all_pass = False
+        print(f"  [{result['status']:7s}] {name}: {result['detail']}")
 
     try:
         shutil.rmtree(tmp_dir)
     except Exception:
         print(f"Note: could not clean up {tmp_dir}")
 
-    if result["status"] != "PASS":
+    if not all_pass:
         sys.exit(1)
-    print("\nDistillation smoke test PASSED!")
+    print("\nDistillation smoke tests PASSED!")
 
 
 if __name__ == "__main__":
