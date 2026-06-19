@@ -324,8 +324,10 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 )
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
-        # output distillation: pull the student toward the base (adapter-disabled) prediction
-        distill_loss = None
+        # output distillation: capture the base (adapter-disabled) prediction; the loss is
+        # assembled in process_batch so it reuses the task loss type and Huber threshold.
+        teacher_pred = None
+        distill_noise_level = None
         if distillation.is_enabled(args):
             network.set_multiplier(0.0)
             with torch.no_grad():
@@ -337,10 +339,9 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 )
             network.set_multiplier(1.0)
             teacher_pred, _ = lumina_train_util.apply_model_prediction_type(args, teacher_pred, noisy_model_input, sigmas)
-            noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
-            distill_loss = distillation.distillation_loss(model_pred, teacher_pred, noise_level, batch["loss_weights"], args)
+            distill_noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
 
-        return model_pred, target, timesteps, weighting, distill_loss
+        return model_pred, target, timesteps, weighting, teacher_pred, distill_noise_level
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         return loss

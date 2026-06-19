@@ -720,7 +720,7 @@ def train(args):
                     teacher_pred = flux_utils.unpack_latents(teacher_pred, packed_latent_height, packed_latent_width)
                     teacher_pred, _ = flux_train_utils.apply_model_prediction_type(args, teacher_pred, noisy_model_input, sigmas)
                     noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
-                    loss = loss + distillation.distillation_loss(model_pred, teacher_pred, noise_level, loss_weights, args)
+                    loss = loss + distillation.distillation_loss(model_pred, teacher_pred, noise_level, loss_weights, args, huber_c)
 
                 # backward
                 accelerator.backward(loss)

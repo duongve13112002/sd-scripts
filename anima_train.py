@@ -623,7 +623,7 @@ def train(args):
                         )
                     teacher_pred = teacher_pred.squeeze(2)  # 5D to 4D, (B, C, H, W)
                     noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
-                    loss = loss + distillation.distillation_loss(model_pred, teacher_pred, noise_level, loss_weights, args)
+                    loss = loss + distillation.distillation_loss(model_pred, teacher_pred, noise_level, loss_weights, args, huber_c)
 
                 accelerator.backward(loss)
 

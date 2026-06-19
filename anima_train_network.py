@@ -338,8 +338,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Loss weighting
         weighting = anima_train_utils.compute_loss_weighting_for_anima(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
-        # output distillation: pull the student toward the base (adapter-disabled) prediction
-        distill_loss = None
+        # output distillation: capture the base (adapter-disabled) prediction; the loss is
+        # assembled in process_batch so it reuses the task loss type and Huber threshold.
+        teacher_pred = None
+        distill_noise_level = None
         if distillation.is_enabled(args):
             network.set_multiplier(0.0)
             with torch.no_grad(), accelerator.autocast():
@@ -354,10 +356,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 )
             network.set_multiplier(1.0)
             teacher_pred = teacher_pred.squeeze(2)  # 5D to 4D, [B, C, 1, H, W] -> [B, C, H, W]
-            noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
-            distill_loss = distillation.distillation_loss(model_pred, teacher_pred, noise_level, batch["loss_weights"], args)
+            distill_noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
 
-        return model_pred, target, timesteps, weighting, distill_loss
+        return model_pred, target, timesteps, weighting, teacher_pred, distill_noise_level
 
     def process_batch(
         self,

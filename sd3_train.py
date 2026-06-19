@@ -890,7 +890,7 @@ def train(args):
                         teacher_pred = distill_teacher(noisy_model_input, timesteps, context=context, y=lg_pooled)
                     teacher_pred = teacher_pred * (-sigmas) + noisy_model_input
                     noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
-                    loss = loss + distillation.distillation_loss(model_pred, teacher_pred, noise_level, loss_weights, args)
+                    loss = loss + distillation.distillation_loss(model_pred, teacher_pred, noise_level, loss_weights, args, huber_c)
 
                 accelerator.backward(loss)
 

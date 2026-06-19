@@ -136,7 +136,7 @@ def main():
         "--optimizer_type", "AdamW8bit",
         "--distillation_weight_high", "1.0",
         "--distillation_weight_low", "0.0",
-        "--distillation_loss_type", args.loss_type,
+        "--loss_type", args.loss_type,
     ]
     if args.t5_tokenizer_path:
         common += ["--t5_tokenizer_path", args.t5_tokenizer_path]

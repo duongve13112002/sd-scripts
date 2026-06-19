@@ -454,8 +454,10 @@ class NetworkTrainer:
                 network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
                 target[diff_output_pr_indices] = noise_pred_prior.to(target.dtype)
 
-        # output distillation: pull the student toward the base (adapter-disabled) prediction
-        distill_loss = None
+        # output distillation: capture the base (adapter-disabled) prediction. The loss is
+        # assembled in process_batch so it reuses the task loss type and Huber threshold.
+        teacher_pred = None
+        distill_noise_level = None
         if distillation.is_enabled(args):
             network.set_multiplier(0.0)
             with torch.no_grad(), accelerator.autocast():
@@ -463,14 +465,11 @@ class NetworkTrainer:
                     args, accelerator, unet, unet_latents, timesteps, text_encoder_conds, batch, weight_dtype
                 )
             network.set_multiplier(1.0)
-            noise_level = distillation.normalized_noise_level_from_timesteps(
+            distill_noise_level = distillation.normalized_noise_level_from_timesteps(
                 timesteps, noise_scheduler.config.num_train_timesteps
             )
-            distill_loss = distillation.distillation_loss(
-                noise_pred, teacher_pred, noise_level, batch["loss_weights"], args
-            )
 
-        return noise_pred, target, timesteps, None, distill_loss
+        return noise_pred, target, timesteps, None, teacher_pred, distill_noise_level
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler) -> torch.FloatTensor:
         if args.min_snr_gamma:
@@ -602,7 +601,7 @@ class NetworkTrainer:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
         # sample noise, call unet, get target
-        noise_pred, target, timesteps, weighting, distill_loss = self.get_noise_pred_and_target(
+        noise_pred, target, timesteps, weighting, teacher_pred, distill_noise_level = self.get_noise_pred_and_target(
             args,
             accelerator,
             noise_scheduler,
@@ -630,8 +629,10 @@ class NetworkTrainer:
         loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
 
         loss = loss.mean()
-        if distill_loss is not None:
-            loss = loss + distill_loss
+        if teacher_pred is not None:
+            loss = loss + distillation.distillation_loss(
+                noise_pred, teacher_pred, distill_noise_level, batch["loss_weights"], args, huber_c
+            )
         return loss
 
     def cast_text_encoder(self, args):

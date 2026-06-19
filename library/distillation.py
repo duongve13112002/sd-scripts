@@ -31,7 +31,8 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from library import loss as loss_util
 
 logger = logging.getLogger(__name__)
 
@@ -63,26 +64,23 @@ def distillation_loss(
     noise_level: torch.Tensor,
     loss_weights: torch.Tensor,
     args: argparse.Namespace,
+    huber_c: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Scalar distillation loss for one batch.
 
-    The teacher prediction is detached so gradients only flow through the
-    student. The per-element distance is reduced over all non-batch dims, then
-    weighted per sample by ``lambda(noise_level)`` and the dataset's
-    ``loss_weights`` before averaging over the batch. This term is intentionally
-    kept out of ``post_process_loss`` (min-SNR etc.) because it carries its own
-    noise-dependent weighting.
+    The distance between the student and teacher predictions uses the same
+    ``--loss_type`` (and Huber threshold ``huber_c``) as the task loss, so the
+    two terms are always consistent. The teacher prediction is detached so
+    gradients only flow through the student. The per-element distance is reduced
+    over all non-batch dims, then weighted per sample by ``lambda(noise_level)``
+    and the dataset's ``loss_weights`` before averaging over the batch. This term
+    is intentionally kept out of ``post_process_loss`` (min-SNR etc.) because it
+    carries its own noise-dependent weighting.
     """
     student = student_pred.float()
     teacher = teacher_pred.float().detach()
 
-    loss_type = getattr(args, "distillation_loss_type", "l2")
-    if loss_type == "huber":
-        delta = float(getattr(args, "distillation_huber_c", 1.0))
-        per_element = F.huber_loss(student, teacher, reduction="none", delta=delta)
-    else:
-        per_element = (student - teacher) ** 2
-
+    per_element = loss_util.conditional_loss(student, teacher, args.loss_type, "none", huber_c)
     per_sample = per_element.mean(dim=list(range(1, per_element.ndim)))  # [B]
 
     lam = lambda_for_noise_level(noise_level.to(per_sample.device).float(), args)

@@ -791,7 +791,7 @@ def train(args):
                         timesteps, noise_scheduler.config.num_train_timesteps
                     )
                     loss = loss + distillation.distillation_loss(
-                        noise_pred, teacher_pred, noise_level, batch["loss_weights"], args
+                        noise_pred, teacher_pred, noise_level, batch["loss_weights"], args, huber_c
                     )
 
                 accelerator.backward(loss)

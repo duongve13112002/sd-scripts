@@ -14,12 +14,12 @@ import torch
 from library import distillation
 
 
-def _args(high=0.0, low=0.0, loss_type="l2", huber_c=1.0):
+def _args(high=0.0, low=0.0, loss_type="l2"):
+    # distillation reuses the task --loss_type, so the namespace carries loss_type
     return argparse.Namespace(
         distillation_weight_high=high,
         distillation_weight_low=low,
-        distillation_loss_type=loss_type,
-        distillation_huber_c=huber_c,
+        loss_type=loss_type,
     )
 
 
@@ -91,15 +91,20 @@ def test_loss_weights_scale_the_term():
     assert scaled.item() == pytest.approx(2.0 * base.item(), rel=1e-5)
 
 
-def test_huber_matches_l2_for_small_diff():
-    # For |diff| < delta, Huber == 0.5 * diff^2, so it is half the plain L2 term.
+def test_distillation_uses_task_loss_type():
+    # l2 distance equals plain MSE (lambda = weights = 1)
     student = torch.zeros(2, 3, 4, 4)
     teacher = torch.full((2, 3, 4, 4), 0.5)
     l2 = distillation.distillation_loss(student, teacher, torch.ones(2), torch.ones(2), _args(1.0, 1.0, "l2"))
-    huber = distillation.distillation_loss(
-        student, teacher, torch.ones(2), torch.ones(2), _args(1.0, 1.0, "huber", huber_c=1.0)
-    )
-    assert huber.item() == pytest.approx(0.5 * l2.item(), rel=1e-5)
+    assert l2.item() == pytest.approx(0.25, abs=1e-6)  # 0.5**2
+
+    # huber delegates to the same conditional_loss the task uses (with the task huber_c)
+    import library.loss as loss_util
+
+    huber_c = torch.tensor(1.0)
+    got = distillation.distillation_loss(student, teacher, torch.ones(2), torch.ones(2), _args(1.0, 1.0, "huber"), huber_c)
+    manual = loss_util.conditional_loss(student.float(), teacher.float(), "huber", "none", huber_c).mean(dim=[1, 2, 3]).mean()
+    assert got.item() == pytest.approx(manual.item(), rel=1e-5)
 
 
 def test_noise_level_from_sigmas_collapses_to_batch():
@@ -183,13 +188,11 @@ def test_distillation_args_registered_on_training_parser():
 
     parser = _argparse.ArgumentParser()
     args_util.add_training_arguments(parser, False)
-    args = parser.parse_args(
-        ["--distillation_weight_high", "1.0", "--distillation_weight_low", "0.1", "--distillation_loss_type", "huber"]
-    )
+    args = parser.parse_args(["--distillation_weight_high", "1.0", "--distillation_weight_low", "0.1"])
     assert args.distillation_weight_high == 1.0
     assert args.distillation_weight_low == 0.1
-    assert args.distillation_loss_type == "huber"
-    assert args.distillation_huber_c == 1.0
+    # distillation reuses the task --loss_type, so there is no separate distillation loss-type arg
+    assert not hasattr(args, "distillation_loss_type")
     assert distillation.is_enabled(args)
     # full fine-tune teacher options are registered too
     teacher = parser.parse_args(["--distillation_teacher_path", "/t.safetensors", "--distillation_teacher_fp8",

@@ -52,10 +52,8 @@ teacher の予測は detach されるため、勾配は student のみを通り�
 
 - `--distillation_weight_high`: Weight at high noise (noise level `1`). Anchors concepts/global structure to the base. `0` disables distillation (default: `0.0`).
 - `--distillation_weight_low`: Weight at low noise (noise level `0`). Set lower than `high` to let the model learn detail/style freely (default: `0.0`).
-- `--distillation_loss_type`: Distance between student and teacher predictions, `l2` or `huber` (default: `l2`).
-- `--distillation_huber_c`: Huber transition point (delta) when using `huber` (default: `1.0`).
 
-Distillation is enabled when either weight is greater than `0`. Use equal `high` and `low` for a constant weight across noise levels.
+The distance between the student and teacher predictions reuses the task `--loss_type` (and the same Huber threshold), so the two loss terms are always consistent; there is no separate distillation loss-type option. Distillation is enabled when either weight is greater than `0`. Use equal `high` and `low` for a constant weight across noise levels.
 
 ### Full fine-tune teacher options / フルFT の teacher オプション
 
@@ -72,8 +70,8 @@ These only apply to full fine-tuning (LoRA reuses the adapter-disabled model and
 
 - `--distillation_weight_high`: 高ノイズ（ノイズレベル `1`）での重み。概念・大域構造をベースに固定します。`0` で蒸留を無効化（デフォルト: `0.0`）。
 - `--distillation_weight_low`: 低ノイズ（ノイズレベル `0`）での重み。`high` より小さくすると細部・スタイルを自由に学習できます（デフォルト: `0.0`）。
-- `--distillation_loss_type`: student と teacher の予測間の距離。`l2` または `huber`（デフォルト: `l2`）。
-- `--distillation_huber_c`: `huber` 使用時の遷移点（delta）（デフォルト: `1.0`）。
+
+student と teacher の予測間の距離はタスクの `--loss_type`（および同じ Huber しきい値）を再利用するため、2 つの損失項は常に一貫します。蒸留専用の loss-type オプションはありません。
 
 いずれかの重みが `0` より大きいとき蒸留が有効になります。`high` と `low` を同じ値にするとノイズレベルに依らない一定の重みになります。
 
@@ -98,8 +96,7 @@ accelerate launch --mixed_precision bf16 flux_train_network.py \
   --output_dir path/to/output --output_name my_lora \
   (... other training args ...) \
   --distillation_weight_high 1.0 \
-  --distillation_weight_low 0.0 \
-  --distillation_loss_type l2
+  --distillation_weight_low 0.0
 ```
 
 Full fine-tuning (a frozen teacher copy is loaded; offload it to save VRAM):
@@ -177,10 +174,9 @@ Distillation works on both single-GPU and multi-GPU (DDP) runs.
 ## 7. Recommended Settings / 推奨設定
 
 ```bash
-# keep concepts, adapt style/detail
+# keep concepts, adapt style/detail (the distance follows the task --loss_type)
 --distillation_weight_high 1.0 \
---distillation_weight_low 0.0 \
---distillation_loss_type l2
+--distillation_weight_low 0.0
 
 # full fine-tuning of a large model, save teacher VRAM
 --distillation_teacher_fp8 \
