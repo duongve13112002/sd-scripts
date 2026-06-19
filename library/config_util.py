@@ -77,6 +77,7 @@ class BaseSubsetParams:
     validation_seed: int = 0
     validation_split: float = 0.0
     resize_interpolation: Optional[str] = None
+    is_replay: bool = False
 
 
 @dataclass
@@ -201,6 +202,7 @@ class ConfigSanitizer:
         "caption_suffix": str,
         "custom_attributes": dict,
         "resize_interpolation": str,
+        "is_replay": bool,
     }
     # DO means DropOut
     DO_SUBSET_ASCENDABLE_SCHEMA = {
@@ -476,7 +478,61 @@ class BlueprintGenerator:
 
         return default_value
 
-def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlueprint) -> Tuple[DatasetGroup, Optional[DatasetGroup]]:
+def apply_replay_ratio(datasets: Sequence, replay_ratio: float) -> None:
+    """Scale the effective repeats of replay images so that, over an epoch, about
+    ``replay_ratio`` of all sampled images come from replay subsets (the base/original
+    data slice kept to fight catastrophic forgetting).
+
+    Replay is an epoch-level rate, not a per-batch guarantee: a batch is a slice of a
+    single resolution bucket, so replay and new images need not share a batch. The rate
+    is realized through ``num_repeats`` (the existing per-image sampling lever) and is
+    therefore approximate (repeats are integers). Applied globally across the given
+    training datasets, before buckets are built. Mutates ``ImageInfo.num_repeats``.
+    """
+    if replay_ratio <= 0.0:
+        return
+    if replay_ratio >= 1.0:
+        raise ValueError(f"replay_ratio must be in [0, 1); got {replay_ratio}")
+
+    replay_infos = []
+    new_repeats_total = 0
+    replay_repeats_total = 0
+    for dataset in datasets:
+        for info in dataset.image_data.values():
+            if info.is_replay:
+                replay_infos.append(info)
+                replay_repeats_total += info.num_repeats
+            else:
+                new_repeats_total += info.num_repeats
+
+    if replay_repeats_total == 0:
+        raise ValueError(
+            "replay_ratio > 0 but no subset is marked is_replay=true. "
+            "Mark the original/base data slice with is_replay = true in the dataset config."
+        )
+    if new_repeats_total == 0:
+        raise ValueError("replay_ratio > 0 but there are no non-replay (new) images to train on.")
+
+    # target replay sample count so that replay / (replay + new) == replay_ratio
+    target_replay_repeats = replay_ratio / (1.0 - replay_ratio) * new_repeats_total
+    scale = target_replay_repeats / replay_repeats_total
+
+    scaled_replay_repeats = 0
+    for info in replay_infos:
+        info.num_repeats = max(1, round(info.num_repeats * scale))
+        scaled_replay_repeats += info.num_repeats
+
+    achieved = scaled_replay_repeats / (scaled_replay_repeats + new_repeats_total)
+    logger.info(
+        f"replay enabled: replay_ratio target {replay_ratio:.3f}, achieved ~{achieved:.3f} "
+        f"(replay repeats {replay_repeats_total} -> {scaled_replay_repeats}, new repeats {new_repeats_total}). "
+        f"Effective epoch size grows; set max_train_steps accordingly."
+    )
+
+
+def generate_dataset_group_by_blueprint(
+    dataset_group_blueprint: DatasetGroupBlueprint, replay_ratio: float = 0.0
+) -> Tuple[DatasetGroup, Optional[DatasetGroup]]:
     datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
 
     for dataset_blueprint in dataset_group_blueprint.datasets:
@@ -590,6 +646,9 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
 
     if len(val_datasets) > 0:
         print_info(val_datasets, "Validation Dataset")
+
+    # scale replay repeats before buckets are built (buckets bake in num_repeats)
+    apply_replay_ratio(datasets, replay_ratio)
 
     # make buckets first because it determines the length of dataset
     # and set the same seed for all datasets

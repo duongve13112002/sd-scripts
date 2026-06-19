@@ -184,7 +184,7 @@ def train(args):
                 }
 
         blueprint = blueprint_generator.generate(user_config, args)
-        train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group, replay_ratio=args.replay_ratio)
     else:
         train_dataset_group = dataset_util.load_arbitrary_dataset(args)
         val_dataset_group = None

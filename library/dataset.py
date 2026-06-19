@@ -153,6 +153,7 @@ class ImageInfo:
         self.is_reg: bool = is_reg
         self.absolute_path: str = absolute_path
         self.caption_dropout_rate: float = caption_dropout_rate
+        self.is_replay: bool = False  # set from the owning subset; replay images keep base knowledge
         self.image_size: Tuple[int, int] = None
         self.resized_size: Tuple[int, int] = None
         self.bucket_reso: Tuple[int, int] = None

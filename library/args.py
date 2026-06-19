@@ -974,6 +974,15 @@ def add_dataset_arguments(
         "--train_data_dir", type=str, default=None, help="directory for train images / 学習画像データのディレクトリ"
     )
     parser.add_argument(
+        "--replay_ratio",
+        type=float,
+        default=0.0,
+        help="anti-forgetting replay: target fraction (0-1, 0 disables) of sampled images that come from subsets marked"
+        + " is_replay=true (the original/base data slice). Realized via num_repeats over an epoch, so it is approximate"
+        + " and increases effective epoch size."
+        + " / 破滅的忘却対策のリプレイ: is_replay=true のサブセット（元データ）からサンプリングする目標割合（0-1、0で無効）。",
+    )
+    parser.add_argument(
         "--cache_info",
         action="store_true",
         help="cache meta information (caption and image size) for faster dataset loading. only available for DreamBooth"

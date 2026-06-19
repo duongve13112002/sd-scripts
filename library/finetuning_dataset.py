@@ -207,6 +207,7 @@ class FineTuningDataset(BaseDataset):
                     caption = ""
 
                 image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path, subset.caption_dropout_rate)
+                image_info.is_replay = subset.is_replay
                 image_info.resize_interpolation = (
                     subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
                 )
