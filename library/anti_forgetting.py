@@ -69,6 +69,17 @@ def verify_anti_forgetting_args(args: argparse.Namespace) -> None:
         args.distillation_weight_high = 0.0
         args.distillation_weight_low = 0.0
 
+    # Quality conflict: LoRA OPLoRA supersedes distillation (hard top-k guarantee, no teacher
+    # forward), so keep OPLoRA and disable distillation. getattr-guarded so it is a no-op on
+    # full fine-tune runs, where --oplora is not even a registered argument.
+    if getattr(args, "oplora", False) and distillation.is_enabled(args):
+        logger.warning(
+            "OPLoRA and output distillation are both enabled; OPLoRA supersedes distillation "
+            "(hard orthogonal guarantee, no teacher forward), so disabling distillation."
+        )
+        args.distillation_weight_high = 0.0
+        args.distillation_weight_low = 0.0
+
     if is_adaptive_lambda_enabled(args) and not _has_soft_penalty(args):
         logger.warning(
             "adaptive_lambda is enabled but no soft-penalty method (output distillation) is active, "

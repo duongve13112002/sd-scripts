@@ -5,6 +5,7 @@ This document collects the techniques for keeping a model's base knowledge while
 - **Replay (`--replay_ratio`)** — rehearse a slice of the original/base data alongside the new data.
 - **Adaptive λ (`--adaptive_lambda`)** — auto-tune the strength of a soft penalty (output distillation or Rank-1 EWC) over time.
 - **Rank-1 EWC (`--ewc_lambda`)** — penalize weight drift along the dominant Fisher direction (full fine-tuning only).
+- **OPLoRA (`--oplora`)** — confine LoRA updates to the orthogonal complement of the base's top-k singular subspace (LoRA training only).
 
 Related: [Output Distillation](./distillation.md) pulls the student's prediction toward the frozen base prediction. Replay and distillation are complementary (data-space vs output-space) and may be used together.
 
@@ -228,5 +229,86 @@ accelerate launch --mixed_precision bf16 flux_train.py \
 - EWC は学習対象重みと同サイズの fp32 バッファを 2 つ（`theta*` と `u`）保持します。GPU（既定）ではおよそパラメータ 2 倍のメモリですが毎ステップは軽量、CPU では VRAM を解放する代わりに毎ステップ転送が発生します。SDXL/SD3/Lumina では余裕があり、FLUX.1（12B）では重くなります。
 - EWC は **`--fused_backward_pass` / `--blockwise_fused_optimizers` と非互換** です（オプティマイザが backward フック内でステップし、Fisher フェーズ中に重みを更新してしまうため）。同時指定はエラーになります。
 - シングル/マルチ GPU 対応: `u` はランク間で平均されるため、全プロセスが同じペナルティを適用します（DDP 一貫）。
+
+</details>
+
+## OPLoRA (`--oplora`)
+
+### How It Works / 仕組み
+
+OPLoRA (orthogonal-projection LoRA) keeps a LoRA adapter from ever writing over the base model's most important directions. A base weight `W = U S V^T` has its strongest behavior in the top-k singular directions (`U_k`, `V_k`). If the LoRA update `ΔW = up·down` has a component along those directions it overwrites base knowledge. OPLoRA projects every update into the **orthogonal complement** of that top-k subspace:
+
+```
+ΔW' = P_L ΔW P_R,   P_L = I - U_k U_k^T,   P_R = I - V_k V_k^T
+```
+
+which factors into a cheap low-rank correction of the LoRA factors, applied after each optimizer step:
+
+```
+up'  = up   - U_k (U_k^T up)
+down' = down - (down V_k) V_k^T
+```
+
+After projection `U_k^T up' = 0` and `down' V_k = 0`, so `W + ΔW'` keeps `W`'s top-k singular triples **exactly** unchanged — a hard mathematical guarantee, unlike the soft pull of distillation. There is **no teacher and no extra forward pass**: the bases `U_k`, `V_k` are computed once by SVD of each base weight at startup (before the adapter is attached), and the per-step projection is a few small matmuls.
+
+OPLoRA is **LoRA/network training only** (it operates on the LoRA factors); its arguments are not registered by the full fine-tune scripts, so passing them there is rejected. It has no `λ` to tune — its knob is the subspace size `--oplora_rank` — so adaptive λ does not apply to it. When both OPLoRA and output distillation are enabled, **OPLoRA supersedes distillation** (hard guarantee, no teacher forward) and distillation is disabled with a warning.
+
+<details>
+<summary>日本語</summary>
+
+OPLoRA（直交射影 LoRA）は、LoRA アダプターがベースモデルの最も重要な方向を上書きしないようにします。ベース重み `W = U S V^T` は上位 k 個の特異方向（`U_k`, `V_k`）に最も強い振る舞いを持ちます。LoRA 更新 `ΔW = up·down` がその方向に成分を持つとベース知識を上書きします。OPLoRA は更新をその上位 k 部分空間の **直交補空間** に射影します。
+
+```
+ΔW' = P_L ΔW P_R,   P_L = I - U_k U_k^T,   P_R = I - V_k V_k^T
+```
+
+これは LoRA 因子の安価な低ランク補正に分解でき、各オプティマイザステップ後に適用します。
+
+```
+up'  = up   - U_k (U_k^T up)
+down' = down - (down V_k) V_k^T
+```
+
+射影後は `U_k^T up' = 0`、`down' V_k = 0` となり、`W + ΔW'` は `W` の上位 k 特異三つ組を **厳密に** 保持します（蒸留のソフトな引き戻しと異なり、ハードな数学的保証）。**teacher も追加 forward も不要** で、基底 `U_k`, `V_k` は起動時（アダプター接続前）に各ベース重みの SVD で一度だけ計算し、毎ステップの射影は小さな行列積数回です。
+
+OPLoRA は **LoRA/ネットワーク学習専用** です（LoRA 因子に作用するため）。引数はフルファインチューニングのスクリプトには登録されないため、そこへ渡すと拒否されます。調整する `λ` はなく、つまみは部分空間サイズ `--oplora_rank` なので、adaptive λ は適用されません。OPLoRA と出力蒸留を同時に有効にした場合は **OPLoRA が蒸留より優先**（ハード保証、teacher forward 不要）され、蒸留は警告とともに無効化されます。
+
+</details>
+
+### Configuration / 設定
+
+- `--oplora` (flag, default off): enable orthogonal projection (LoRA training only).
+- `--oplora_rank` (int, required when `--oplora` is set): the top-k singular subspace of each base weight to protect. Larger preserves more base knowledge but leaves less room to learn the new task.
+- `--oplora_full_svd` (flag, default off): use full SVD instead of fast randomized low-rank SVD when building the bases (slower and more exact).
+
+Notes:
+
+- The one-time SVD of every target weight at startup adds some startup time on large models; randomized SVD (the default) keeps it fast.
+- Split-qkv LoRA modules (FLUX, when `split_dims` is used) cannot be projected exactly and are left unprojected (logged at startup).
+- Works on single and multi-GPU: the projection is applied identically on every rank after the synchronized optimizer step.
+
+Example (FLUX.1 LoRA with OPLoRA):
+
+```bash
+accelerate launch --mixed_precision bf16 flux_train_network.py \
+  --pretrained_model_name_or_path model.safetensors \
+  --dataset_config config.toml \
+  --output_dir output --output_name my_lora \
+  --network_module networks.lora_flux --network_dim 16 \
+  --oplora --oplora_rank 16
+```
+
+<details>
+<summary>日本語</summary>
+
+- `--oplora`（フラグ、既定オフ）: 直交射影を有効化（LoRA 学習専用）。
+- `--oplora_rank`（int、`--oplora` 指定時は必須）: 各ベース重みで保護する上位 k 特異部分空間。大きいほどベース知識を多く保持しますが、新タスク学習の余地は減ります。
+- `--oplora_full_svd`（フラグ、既定オフ）: 基底計算に高速なランダム化低ランク SVD ではなくフル SVD を使う（遅く、より厳密）。
+
+補足:
+
+- 起動時に全対象重みの SVD を一度行うため、大きいモデルでは起動が少し遅くなります。既定のランダム化 SVD で高速に保てます。
+- split-qkv LoRA モジュール（FLUX で `split_dims` 使用時）は厳密に射影できないため、射影せずに残します（起動時にログ出力）。
+- シングル/マルチ GPU 対応: 同期されたオプティマイザステップ後に、全ランクで同一の射影を適用します。
 
 </details>

@@ -39,6 +39,7 @@ import library.logging_util as logging_util
 import library.loss as loss_util
 import library.distillation as distillation
 import library.anti_forgetting as anti_forgetting
+import networks.oplora as oplora
 import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
 import library.config_util as config_util
@@ -1282,6 +1283,10 @@ class NetworkTrainer:
         # apply network to unet and text_encoder
         train_unet = not args.network_train_text_encoder_only
         train_text_encoder = self.is_train_text_encoder(args)
+
+        # OPLoRA: build orthogonal-projection bases from the base weights before apply_to deletes org_module
+        oplora_manager = oplora.create_oplora_manager(args, network)
+
         network.apply_to(text_encoder, unet, train_text_encoder, train_unet)
 
         if args.network_weights is not None:
@@ -1802,6 +1807,10 @@ class NetworkTrainer:
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
+                    # OPLoRA: re-project the updated LoRA factors into the base's orthogonal complement
+                    if oplora_manager is not None and accelerator.sync_gradients:
+                        oplora_manager.project()
+
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
                         args.scale_weight_norms, accelerator.device
@@ -2070,6 +2079,27 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="[EXPERIMENTAL] enable offloading of tensors to CPU during checkpointing for U-Net or DiT, if supported"
         " / 勾配チェックポイント時にテンソルをCPUにオフロードする（U-NetまたはDiTのみ、サポートされている場合）",
+    )
+
+    # OPLoRA (anti catastrophic-forgetting, LoRA/network training only)
+    parser.add_argument(
+        "--oplora",
+        action="store_true",
+        help="Constrain each LoRA update to the orthogonal complement of the base weight's top-k singular "
+        "subspace, preserving the base's dominant directions with no teacher and no extra forward pass.",
+    )
+    parser.add_argument(
+        "--oplora_rank",
+        type=int,
+        default=0,
+        help="OPLoRA: size of the top-k singular subspace of each base weight to protect (required when "
+        "--oplora is set). Larger preserves more base knowledge but leaves less room to learn.",
+    )
+    parser.add_argument(
+        "--oplora_full_svd",
+        action="store_true",
+        help="OPLoRA: use full SVD instead of fast randomized low-rank SVD when computing the bases "
+        "(slower and more exact; default uses randomized SVD).",
     )
     parser.add_argument(
         "--no_metadata", action="store_true", help="do not save metadata in output model / メタデータを出力先モデルに保存しない"

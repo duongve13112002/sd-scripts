@@ -110,6 +110,11 @@ def main():
         action="store_true",
         help="Also run a Rank-1 EWC full fine-tune case (Fisher phase + penalty; full fine-tune only)",
     )
+    parser.add_argument(
+        "--oplora",
+        action="store_true",
+        help="Also run a LoRA case with OPLoRA orthogonal projection (LoRA only)",
+    )
     parser.add_argument("--timeout", type=int, default=600, help="Timeout per test in seconds")
     args = parser.parse_args()
 
@@ -167,6 +172,22 @@ def main():
             "--network_alpha", "1",
         ]
         results["lora_distillation"] = run_test("anima_train_network.py LoRA with distillation", cmd, out, args.timeout)
+
+        # OPLoRA: orthogonal-projection LoRA (supersedes distillation). Small rank for the smoke run.
+        if args.oplora:
+            out_op = os.path.join(tmp_dir, "lora_oplora")
+            os.makedirs(out_op, exist_ok=True)
+            cmd = [python, "anima_train_network.py"] + common + [
+                "--output_dir", out_op,
+                "--output_name", "oplora_lora",
+                "--learning_rate", "1e-4",
+                "--network_module", "networks.lora_anima",
+                "--network_dim", "4",
+                "--network_alpha", "1",
+                "--oplora",
+                "--oplora_rank", "4",
+            ]
+            results["lora_oplora"] = run_test("anima_train_network.py LoRA with OPLoRA", cmd, out_op, args.timeout)
 
     if args.only in (None, "finetune"):
         out = os.path.join(tmp_dir, "ft")

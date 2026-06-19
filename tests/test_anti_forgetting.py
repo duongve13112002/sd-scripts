@@ -230,6 +230,21 @@ def test_validator_allows_ewc_normal_optimizer():
     anti_forgetting.verify_anti_forgetting_args(args)  # must not raise
 
 
+def test_validator_oplora_supersedes_distillation():
+    args = _penalty_args(high=1.0, low=0.5, adaptive=False)
+    args.oplora = True
+    anti_forgetting.verify_anti_forgetting_args(args)
+    assert args.distillation_weight_high == 0.0 and args.distillation_weight_low == 0.0
+
+
+def test_validator_disables_adaptive_lambda_with_oplora_only():
+    # OPLoRA has no lambda to scale, so adaptive lambda with only OPLoRA active is disabled
+    args = _penalty_args(high=0.0, low=0.0, adaptive=True)
+    args.oplora = True
+    anti_forgetting.verify_anti_forgetting_args(args)
+    assert args.adaptive_lambda is False
+
+
 def test_ewc_args_registered():
     import library.args as args_util
 
