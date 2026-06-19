@@ -205,7 +205,8 @@ Memory and compatibility notes:
 
 - EWC keeps two extra fp32 buffers the size of the trainable weights (`theta*` and `u`). On GPU (default) this costs roughly 2× the parameter memory but every step is cheap; on CPU it frees VRAM but transfers those buffers each step. This is comfortable for SDXL/SD3/Lumina and heavy for FLUX.1 (12B).
 - EWC is **incompatible with `--fused_backward_pass` / `--blockwise_fused_optimizers`** (the optimizer steps inside the backward hook, which would update weights during the Fisher phase); enabling both raises an error.
-- Works on single and multi-GPU: `u` is averaged across ranks, so every process applies the same penalty (DDP-consistent).
+- Works on single and multi-GPU (standard DDP). The Fisher direction `u` is averaged across ranks, so every process applies the same penalty.
+- On resume, the Fisher phase re-runs and re-anchors `theta*` to the resumed weights (the EWC state is not checkpointed), so for a strict anchor to the original base, run EWC in a single training run.
 
 Example (FLUX.1 full fine-tuning with EWC):
 
@@ -285,7 +286,7 @@ Notes:
 
 - The one-time SVD of every target weight at startup adds some startup time on large models; randomized SVD (the default) keeps it fast.
 - Split-qkv LoRA modules (FLUX, when `split_dims` is used) cannot be projected exactly and are left unprojected (logged at startup).
-- Works on single and multi-GPU: the projection is applied identically on every rank after the synchronized optimizer step.
+- Works on single and multi-GPU (standard DDP): the projection is applied identically on every rank after the synchronized optimizer step. The bases come from the unchanging base weights, so it is also safe across resume.
 
 Example (FLUX.1 LoRA with OPLoRA):
 

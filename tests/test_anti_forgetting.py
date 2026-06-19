@@ -201,7 +201,7 @@ def test_validator_ewc_supersedes_distillation():
     assert args.distillation_weight_high == 0.0 and args.distillation_weight_low == 0.0
 
 
-def _ewc_args(lam=0.5, fisher_samples=100, fused=False, blockwise=False):
+def _ewc_args(lam=0.5, fisher_samples=100, fused=False, blockwise=False, blocks_to_swap=0):
     return argparse.Namespace(
         ewc_lambda=lam,
         ewc_fisher_samples=fisher_samples,
@@ -210,6 +210,7 @@ def _ewc_args(lam=0.5, fisher_samples=100, fused=False, blockwise=False):
         adaptive_lambda=False,
         fused_backward_pass=fused,
         blockwise_fused_optimizers=blockwise,
+        blocks_to_swap=blocks_to_swap,
     )
 
 
@@ -225,8 +226,13 @@ def test_validator_rejects_ewc_with_fused_optimizer():
         anti_forgetting.verify_anti_forgetting_args(_ewc_args(blockwise=True))
 
 
+def test_validator_rejects_ewc_with_block_swap():
+    with pytest.raises(ValueError):
+        anti_forgetting.verify_anti_forgetting_args(_ewc_args(blocks_to_swap=10))
+
+
 def test_validator_allows_ewc_normal_optimizer():
-    args = _ewc_args(fused=False, blockwise=False)
+    args = _ewc_args(fused=False, blockwise=False, blocks_to_swap=0)
     anti_forgetting.verify_anti_forgetting_args(args)  # must not raise
 
 

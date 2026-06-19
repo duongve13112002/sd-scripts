@@ -82,6 +82,9 @@ class OPLoRAManager:
             org_module = getattr(lora, "org_module", None)
             if org_module is None or not hasattr(org_module, "weight"):
                 continue
+            # OPLoRA only applies to standard up/down LoRA factors; skip other adapters (OFT/LoKr/...)
+            if not (hasattr(lora, "lora_up") and hasattr(lora, "lora_down")):
+                continue
             basis = _compute_basis(org_module.weight, rank, use_lowrank_svd)
             if basis is not None:
                 self.bases[id(lora)] = basis
@@ -89,6 +92,11 @@ class OPLoRAManager:
         if skipped_split:
             msg += f", {skipped_split} split-qkv modules left unprojected"
         logger.info(msg)
+        if not self.bases:
+            logger.warning(
+                "OPLoRA: no projectable LoRA modules were found (the network may not use standard up/down "
+                "LoRA factors); OPLoRA will have no effect."
+            )
 
     @torch.no_grad()
     def project(self) -> None:

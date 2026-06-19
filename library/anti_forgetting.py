@@ -44,9 +44,10 @@ def verify_anti_forgetting_args(args: argparse.Namespace) -> None:
     better method with a warning; mode mismatches fail fast. Called from
     ``verify_training_args`` so it runs for every trainer.
 
-    OPLoRA-vs-distillation precedence is added together with that feature, since its
-    arguments do not exist yet. The LoRA-mode rejection of EWC lives in the LoRA trainer,
-    which knows it is a network trainer.
+    Mode rejections that need to know the training mode live where the mode is known:
+    EWC-on-LoRA in the LoRA trainer, and OPLoRA-on-full-fine-tune via argparse (the OPLoRA
+    arguments are only registered by the LoRA parser). The OPLoRA precedence here is
+    getattr-guarded, so it is a no-op when those arguments are absent (full fine-tune).
     """
     # EWC configuration validation (full fine-tune feature; LoRA is rejected in the LoRA trainer).
     if is_ewc_enabled(args):
@@ -57,6 +58,11 @@ def verify_anti_forgetting_args(args: argparse.Namespace) -> None:
                 "Rank-1 EWC is incompatible with --fused_backward_pass / --blockwise_fused_optimizers: the optimizer "
                 "steps inside the backward hook, which would update weights during the EWC Fisher phase. "
                 "Disable EWC or the fused optimizer."
+            )
+        if int(getattr(args, "blocks_to_swap", 0) or 0) > 0:
+            raise ValueError(
+                "Rank-1 EWC is incompatible with --blocks_to_swap: block swapping leaves the trainable weights "
+                "split across CPU and GPU, so the EWC penalty cannot be summed across them. Disable one of them."
             )
 
     # Quality conflict: full fine-tune EWC supersedes distillation (parameter-space, no
