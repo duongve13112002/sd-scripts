@@ -1062,6 +1062,12 @@ class NetworkTrainer:
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
         args_util.verify_training_args(args)
+
+        if anti_forgetting.is_ewc_enabled(args):
+            raise ValueError(
+                "Rank-1 EWC (--ewc_lambda) is full fine-tune only; it has no effect on LoRA/network training. "
+                "For LoRA, use --replay_ratio (and output distillation)."
+            )
         accelerator_setup.prepare_dataset_args(args, True)
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)

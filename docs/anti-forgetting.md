@@ -3,7 +3,8 @@
 This document collects the techniques for keeping a model's base knowledge while fine-tuning on new data. They are independent and can be combined. Currently documented here:
 
 - **Replay (`--replay_ratio`)** — rehearse a slice of the original/base data alongside the new data.
-- **Adaptive λ (`--adaptive_lambda`)** — auto-tune the strength of a soft penalty (output distillation; later Rank-1 EWC) over time.
+- **Adaptive λ (`--adaptive_lambda`)** — auto-tune the strength of a soft penalty (output distillation or Rank-1 EWC) over time.
+- **Rank-1 EWC (`--ewc_lambda`)** — penalize weight drift along the dominant Fisher direction (full fine-tuning only).
 
 Related: [Output Distillation](./distillation.md) pulls the student's prediction toward the frozen base prediction. Replay and distillation are complementary (data-space vs output-space) and may be used together.
 
@@ -157,5 +158,75 @@ accelerate launch --mixed_precision bf16 flux_train.py \
 - `--adaptive_lambda_ema`（既定 `0.99`）: 損失比平滑化の EMA 減衰。
 - `--adaptive_lambda_base`（既定 `1.0`）: ベース倍率。`1.0` は開始時にペナルティを設定値付近に保ちます。
 - `--adaptive_lambda_min` / `--adaptive_lambda_max`（既定 `0.0` / `10.0`）: 係数のクランプ範囲。
+
+</details>
+
+## Rank-1 EWC (`--ewc_lambda`)
+
+### How It Works / 仕組み
+
+Elastic Weight Consolidation penalizes drift of important weights away from their pre-trained values. In diffusion, per-sample gradients are strongly collinear at low SNR, so the empirical Fisher information is approximately rank-1, `F ~ u u^T`, where `u` is the mean gradient. The penalty then collapses to a single global scalar:
+
+```
+L_ewc = lambda * (u^T (theta - theta*))^2
+```
+
+where `theta*` is a snapshot of the initial weights. Unlike output distillation, EWC constrains the **parameter space** directly and needs **no teacher model and no extra forward pass** at train time — only one inner product.
+
+`u` is estimated up front during a short **Fisher phase**: the first `--ewc_fisher_samples` micro-batches run the normal training loss and backward, their gradients are averaged (and reduced across ranks), and no optimizer step is taken (so `theta*` stays at the initial weights). After that, training proceeds normally with the EWC penalty added to the loss each step.
+
+EWC is **full fine-tuning only** — it lives in base-weight space, whereas LoRA optimizes a separate low-rank delta, so passing `--ewc_lambda` to LoRA/network training raises an error. When both EWC and output distillation are enabled, **EWC supersedes distillation** (parameter-space penalty with no resident teacher), and distillation is disabled with a warning. Adaptive λ (`--adaptive_lambda`) can drive the EWC strength over time, just as it does for distillation.
+
+<details>
+<summary>日本語</summary>
+
+EWC（Elastic Weight Consolidation）は、重要な重みが事前学習時の値から離れることを抑制します。拡散モデルでは低 SNR でサンプルごとの勾配が強く同一方向に揃うため、経験的フィッシャー情報はほぼランク1（`F ~ u u^T`、`u` は平均勾配）になります。よってペナルティは単一のグローバルスカラーに帰着します。
+
+```
+L_ewc = lambda * (u^T (theta - theta*))^2
+```
+
+ここで `theta*` は初期重みのスナップショットです。出力蒸留と異なり、EWC は **パラメータ空間** を直接制約し、学習時に **teacher モデルも追加の forward も不要** で、内積1回だけです。
+
+`u` は学習開始前の短い **Fisher フェーズ** で推定します。最初の `--ewc_fisher_samples` 個のマイクロバッチで通常の学習損失と backward を行い、その勾配を平均（ランク間でも平均）し、オプティマイザのステップは踏みません（`theta*` は初期重みのまま）。以降は通常学習に EWC ペナルティを毎ステップ加えます。
+
+EWC は **フルファインチューニング専用** です（ベース重み空間で動作するため）。LoRA/ネットワーク学習に `--ewc_lambda` を渡すとエラーになります。EWC と出力蒸留を同時に有効にした場合は **EWC が蒸留より優先**（teacher 常駐不要のパラメータ空間ペナルティ）され、蒸留は警告とともに無効化されます。Adaptive λ（`--adaptive_lambda`）は蒸留と同様に EWC の強度も時間方向に調整できます。
+
+</details>
+
+### Configuration / 設定
+
+- `--ewc_lambda` (float, default `0.0` = off): EWC penalty weight (full fine-tuning only).
+- `--ewc_fisher_samples` (int, default `100`): number of micro-batches used to estimate the Fisher direction before training. Must be smaller than your total steps so the Fisher phase finishes.
+- `--ewc_buffers_on_cpu` (flag, default off): store the reference weights (`theta*`) and Fisher vector (`u`) on CPU to save VRAM. This adds a per-step host-device transfer, so it is slower; recommended only for very large models.
+
+Memory and compatibility notes:
+
+- EWC keeps two extra fp32 buffers the size of the trainable weights (`theta*` and `u`). On GPU (default) this costs roughly 2× the parameter memory but every step is cheap; on CPU it frees VRAM but transfers those buffers each step. This is comfortable for SDXL/SD3/Lumina and heavy for FLUX.1 (12B).
+- EWC is **incompatible with `--fused_backward_pass` / `--blockwise_fused_optimizers`** (the optimizer steps inside the backward hook, which would update weights during the Fisher phase); enabling both raises an error.
+- Works on single and multi-GPU: `u` is averaged across ranks, so every process applies the same penalty (DDP-consistent).
+
+Example (FLUX.1 full fine-tuning with EWC):
+
+```bash
+accelerate launch --mixed_precision bf16 flux_train.py \
+  --pretrained_model_name_or_path model.safetensors \
+  --dataset_config config.toml \
+  --output_dir output --output_name my_model \
+  --ewc_lambda 0.1 --ewc_fisher_samples 100 --ewc_buffers_on_cpu
+```
+
+<details>
+<summary>日本語</summary>
+
+- `--ewc_lambda`（float、既定 `0.0` = 無効）: EWC ペナルティ重み（フルファインチューニング専用）。
+- `--ewc_fisher_samples`（int、既定 `100`）: 学習前に Fisher 方向を推定するマイクロバッチ数。Fisher フェーズが終わるよう、総ステップ数より小さくしてください。
+- `--ewc_buffers_on_cpu`（フラグ、既定オフ）: 参照重み（`theta*`）と Fisher ベクトル（`u`）を CPU に置いて VRAM を節約します。毎ステップの転送が増えるため遅くなります。非常に大きいモデルにのみ推奨。
+
+メモリ・互換性:
+
+- EWC は学習対象重みと同サイズの fp32 バッファを 2 つ（`theta*` と `u`）保持します。GPU（既定）ではおよそパラメータ 2 倍のメモリですが毎ステップは軽量、CPU では VRAM を解放する代わりに毎ステップ転送が発生します。SDXL/SD3/Lumina では余裕があり、FLUX.1（12B）では重くなります。
+- EWC は **`--fused_backward_pass` / `--blockwise_fused_optimizers` と非互換** です（オプティマイザが backward フック内でステップし、Fisher フェーズ中に重みを更新してしまうため）。同時指定はエラーになります。
+- シングル/マルチ GPU 対応: `u` はランク間で平均されるため、全プロセスが同じペナルティを適用します（DDP 一貫）。
 
 </details>

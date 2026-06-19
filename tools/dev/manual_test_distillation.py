@@ -105,6 +105,11 @@ def main():
         action="store_true",
         help="Also enable adaptive lambda (auto-tunes the distillation strength from the preserve/task ratio)",
     )
+    parser.add_argument(
+        "--ewc",
+        action="store_true",
+        help="Also run a Rank-1 EWC full fine-tune case (Fisher phase + penalty; full fine-tune only)",
+    )
     parser.add_argument("--timeout", type=int, default=600, help="Timeout per test in seconds")
     args = parser.parse_args()
 
@@ -175,6 +180,21 @@ def main():
         if args.teacher_blocks_to_swap > 0:
             cmd += ["--distillation_teacher_blocks_to_swap", str(args.teacher_blocks_to_swap)]
         results["finetune_distillation"] = run_test("anima_train.py full finetune with distillation", cmd, out, args.timeout)
+
+        # Rank-1 EWC full fine-tune: exercises the Fisher phase + penalty (EWC supersedes distillation).
+        # fisher_samples=1 so the Fisher phase finishes quickly within the 2-step smoke run.
+        if args.ewc:
+            out_ewc = os.path.join(tmp_dir, "ft_ewc")
+            os.makedirs(out_ewc, exist_ok=True)
+            cmd = [python, "anima_train.py"] + common + [
+                "--output_dir", out_ewc,
+                "--output_name", "ewc_ft",
+                "--learning_rate", "1e-5",
+                "--ewc_lambda", "0.5",
+                "--ewc_fisher_samples", "1",
+                "--ewc_buffers_on_cpu",
+            ]
+            results["finetune_ewc"] = run_test("anima_train.py full finetune with Rank-1 EWC", cmd, out_ewc, args.timeout)
 
     print(f"\n{'#' * 70}\nSUMMARY")
     all_pass = True

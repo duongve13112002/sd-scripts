@@ -738,6 +738,29 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="Upper clamp for the adaptive-lambda coefficient. (default: 10.0)",
     )
 
+    # Rank-1 EWC (anti catastrophic-forgetting, full fine-tuning only)
+    parser.add_argument(
+        "--ewc_lambda",
+        type=float,
+        default=0.0,
+        help="Rank-1 EWC penalty weight (full fine-tuning only; 0 disables). Penalizes weight drift along "
+        "the dominant Fisher direction to preserve base knowledge, with no teacher model. Ignored by "
+        "LoRA/network training.",
+    )
+    parser.add_argument(
+        "--ewc_fisher_samples",
+        type=int,
+        default=100,
+        help="Number of micro-batches used to estimate the Rank-1 Fisher direction before training begins "
+        "(the Fisher phase). (default: 100)",
+    )
+    parser.add_argument(
+        "--ewc_buffers_on_cpu",
+        action="store_true",
+        help="Store the EWC reference weights and Fisher vector on CPU to save VRAM (adds a per-step "
+        "host-device transfer). Recommended for very large models.",
+    )
+
 
 def add_masked_loss_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(

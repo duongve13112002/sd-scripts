@@ -606,6 +606,10 @@ def train(args):
 
     loss_recorder = logging_util.LossRecorder()
     epoch = 0  # avoid error when max_train_steps is 0
+
+    # Rank-1 EWC: snapshot initial weights and prepare the Fisher accumulator before training
+    ewc = anti_forgetting.create_ewc_regularizer(args, training_models, accelerator)
+
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
         current_epoch.value = epoch + 1
@@ -705,6 +709,14 @@ def train(args):
                 loss = loss * loss_weights
                 loss = loss.mean()
 
+                # EWC Fisher phase: collect the mean gradient over the first batches, then skip the step
+                if ewc is not None and ewc.collecting:
+                    accelerator.backward(loss)
+                    ewc.accumulate()
+                    optimizer.zero_grad(set_to_none=True)
+                    ewc.maybe_finalize(accelerator)
+                    continue
+
                 # output distillation: pull the student toward the frozen base (teacher) prediction
                 if distill_teacher is not None:
                     distillation.before_teacher_forward(distill_teacher, distill_teacher_swapping)
@@ -724,6 +736,10 @@ def train(args):
                     noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
                     distill_term = distillation.distillation_loss(model_pred, teacher_pred, noise_level, loss_weights, args, huber_c)
                     loss = anti_forgetting.add_adaptive_penalty(loss, distill_term, adaptive_lambda_controller, accelerator)
+
+                # Rank-1 EWC penalty: pull the weights back along the dominant Fisher direction
+                if ewc is not None and ewc.ready:
+                    loss = anti_forgetting.add_adaptive_penalty(loss, ewc.penalty(), adaptive_lambda_controller, accelerator)
 
                 # backward
                 accelerator.backward(loss)

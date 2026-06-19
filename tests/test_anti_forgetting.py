@@ -9,6 +9,7 @@ import argparse
 
 import pytest
 import torch
+import torch.nn as nn
 
 from library import anti_forgetting
 
@@ -33,6 +34,9 @@ def _penalty_args(high=0.0, low=0.0, adaptive=False, ewc_lambda=0.0):
         adaptive_lambda_min=0.0,
         adaptive_lambda_max=10.0,
         ewc_lambda=ewc_lambda,
+        ewc_fisher_samples=100,
+        fused_backward_pass=False,
+        blockwise_fused_optimizers=False,
     )
 
 
@@ -108,6 +112,135 @@ def test_validator_keeps_adaptive_lambda_with_ewc():
     args = _penalty_args(high=0.0, low=0.0, adaptive=True, ewc_lambda=0.5)
     anti_forgetting.verify_anti_forgetting_args(args)
     assert args.adaptive_lambda is True
+
+
+def test_ewc_penalty_math_and_gradient():
+    m = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        m.weight.fill_(0.0)  # theta* = 0
+    reg = anti_forgetting.EWCRegularizer(m.named_parameters(), lam=2.0, num_fisher_samples=0, store_on_cpu=True)
+    reg.u["weight"] = torch.tensor([[3.0]])
+    reg.ready = True
+    with torch.no_grad():
+        m.weight.fill_(5.0)  # delta = 5, s = u*delta = 15
+    pen = reg.penalty()
+    assert pen.item() == pytest.approx(2.0 * 15.0**2, abs=1e-4)  # lam * s^2 = 450
+    pen.backward()
+    # d/dtheta [lam s^2] = 2 lam s u = 2*2*15*3 = 180
+    assert m.weight.grad.item() == pytest.approx(180.0, abs=1e-3)
+
+
+def test_ewc_penalty_zero_at_init():
+    m = nn.Linear(2, 2)
+    reg = anti_forgetting.EWCRegularizer(m.named_parameters(), lam=1.0, num_fisher_samples=0, store_on_cpu=True)
+    reg.u = {n: torch.ones_like(v) for n, v in reg.u.items()}
+    reg.ready = True
+    # theta == theta* (no update yet) -> penalty 0 regardless of u
+    assert reg.penalty().item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_ewc_accumulate_and_finalize_averages():
+    m = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        m.weight.fill_(0.0)
+    reg = anti_forgetting.EWCRegularizer(m.named_parameters(), lam=1.0, num_fisher_samples=2, store_on_cpu=True)
+    assert reg.collecting and not reg.ready
+    m.weight.grad = torch.tensor([[2.0]])
+    reg.accumulate()
+    assert reg.count == 1 and not reg.maybe_finalize()  # not enough samples yet
+    m.weight.grad = torch.tensor([[4.0]])
+    reg.accumulate()
+    assert reg.maybe_finalize()  # count == 2 -> finalize
+    assert reg.ready and not reg.collecting
+    assert reg.u["weight"].item() == pytest.approx(3.0, abs=1e-6)  # (2 + 4) / 2
+
+
+def test_ewc_end_to_end_fisher_then_penalty():
+    torch.manual_seed(0)
+    m = nn.Linear(4, 4, bias=False)
+    reg = anti_forgetting.EWCRegularizer(m.named_parameters(), lam=10.0, num_fisher_samples=3, store_on_cpu=True)
+    # Fisher phase: accumulate gradients over a few batches, then finalize
+    for _ in range(3):
+        m(torch.randn(8, 4)).sum().backward()
+        reg.accumulate()
+        m.weight.grad = None
+    assert reg.maybe_finalize() and reg.ready
+    # no drift yet -> penalty is exactly zero
+    assert reg.penalty().item() == pytest.approx(0.0, abs=1e-6)
+    # drift the weights; penalty becomes positive and produces a gradient that opposes the drift
+    with torch.no_grad():
+        m.weight += 1.0
+    pen = reg.penalty()
+    assert pen.item() > 0.0
+    pen.backward()
+    assert m.weight.grad is not None and torch.any(m.weight.grad != 0)
+
+
+def test_create_ewc_regularizer_respects_enable_and_spans_models():
+    m1, m2 = nn.Linear(2, 2), nn.Linear(3, 3)
+    off = argparse.Namespace(ewc_lambda=0.0, ewc_fisher_samples=10, ewc_buffers_on_cpu=True)
+    assert anti_forgetting.create_ewc_regularizer(off, [m1, m2]) is None
+    on = argparse.Namespace(ewc_lambda=0.5, ewc_fisher_samples=10, ewc_buffers_on_cpu=True)
+    reg = anti_forgetting.create_ewc_regularizer(on, [m1, m2])
+    assert reg is not None
+    # params from both models are tracked
+    assert len(reg.params) == len(list(m1.parameters())) + len(list(m2.parameters()))
+
+
+def test_is_ewc_enabled():
+    assert anti_forgetting.is_ewc_enabled(argparse.Namespace()) is False
+    assert anti_forgetting.is_ewc_enabled(argparse.Namespace(ewc_lambda=0.0)) is False
+    assert anti_forgetting.is_ewc_enabled(argparse.Namespace(ewc_lambda=0.3)) is True
+
+
+def test_validator_ewc_supersedes_distillation():
+    args = _penalty_args(high=1.0, low=0.5, adaptive=False, ewc_lambda=0.5)
+    args.ewc_fisher_samples = 100
+    anti_forgetting.verify_anti_forgetting_args(args)
+    # EWC wins: distillation weights zeroed
+    assert args.distillation_weight_high == 0.0 and args.distillation_weight_low == 0.0
+
+
+def _ewc_args(lam=0.5, fisher_samples=100, fused=False, blockwise=False):
+    return argparse.Namespace(
+        ewc_lambda=lam,
+        ewc_fisher_samples=fisher_samples,
+        distillation_weight_high=0.0,
+        distillation_weight_low=0.0,
+        adaptive_lambda=False,
+        fused_backward_pass=fused,
+        blockwise_fused_optimizers=blockwise,
+    )
+
+
+def test_validator_rejects_ewc_with_zero_fisher_samples():
+    with pytest.raises(ValueError):
+        anti_forgetting.verify_anti_forgetting_args(_ewc_args(fisher_samples=0))
+
+
+def test_validator_rejects_ewc_with_fused_optimizer():
+    with pytest.raises(ValueError):
+        anti_forgetting.verify_anti_forgetting_args(_ewc_args(fused=True))
+    with pytest.raises(ValueError):
+        anti_forgetting.verify_anti_forgetting_args(_ewc_args(blockwise=True))
+
+
+def test_validator_allows_ewc_normal_optimizer():
+    args = _ewc_args(fused=False, blockwise=False)
+    anti_forgetting.verify_anti_forgetting_args(args)  # must not raise
+
+
+def test_ewc_args_registered():
+    import library.args as args_util
+
+    parser = argparse.ArgumentParser()
+    args_util.add_training_arguments(parser, False)
+    defaults = parser.parse_args([])
+    assert defaults.ewc_lambda == 0.0
+    assert defaults.ewc_fisher_samples == 100
+    assert defaults.ewc_buffers_on_cpu is False
+    on = parser.parse_args(["--ewc_lambda", "0.5", "--ewc_fisher_samples", "50", "--ewc_buffers_on_cpu"])
+    assert on.ewc_lambda == 0.5 and on.ewc_fisher_samples == 50 and on.ewc_buffers_on_cpu is True
 
 
 def test_adaptive_lambda_args_registered():
