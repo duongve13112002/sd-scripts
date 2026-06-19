@@ -27,6 +27,7 @@ import library.optimizer as optimizer_util
 import library.logging_util as logging_util
 import library.loss as loss_util
 import library.distillation as distillation
+import library.anti_forgetting as anti_forgetting
 import library.checkpoint_io as checkpoint_io
 
 from library.utils import setup_logging, add_logging_arguments
@@ -298,6 +299,7 @@ def train(args):
     # distillation teacher (frozen base U-Net) for full fine-tune output distillation
     distill_unet = None
     distill_teacher_swapping = False
+    adaptive_lambda_controller = anti_forgetting.create_adaptive_lambda_controller(args)
     if distillation.is_enabled(args):
         teacher_model_dtype = sdxl_train_util.match_mixed_precision(args, weight_dtype)
         teacher_models = sdxl_train_util._load_target_model(
@@ -790,9 +792,10 @@ def train(args):
                     noise_level = distillation.normalized_noise_level_from_timesteps(
                         timesteps, noise_scheduler.config.num_train_timesteps
                     )
-                    loss = loss + distillation.distillation_loss(
+                    distill_term = distillation.distillation_loss(
                         noise_pred, teacher_pred, noise_level, batch["loss_weights"], args, huber_c
                     )
+                    loss = anti_forgetting.add_adaptive_penalty(loss, distill_term, adaptive_lambda_controller, accelerator)
 
                 accelerator.backward(loss)
 

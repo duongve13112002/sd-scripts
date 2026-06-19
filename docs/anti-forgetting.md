@@ -3,6 +3,7 @@
 This document collects the techniques for keeping a model's base knowledge while fine-tuning on new data. They are independent and can be combined. Currently documented here:
 
 - **Replay (`--replay_ratio`)** — rehearse a slice of the original/base data alongside the new data.
+- **Adaptive λ (`--adaptive_lambda`)** — auto-tune the strength of a soft penalty (output distillation; later Rank-1 EWC) over time.
 
 Related: [Output Distillation](./distillation.md) pulls the student's prediction toward the frozen base prediction. Replay and distillation are complementary (data-space vs output-space) and may be used together.
 
@@ -95,5 +96,66 @@ The same `--replay_ratio` flag works for LoRA/network training (`*_train_network
 
 - リプレイ画像は学習解像度をカバーしているのが望ましいです。新規データと対応しないバケットに入る画像も学習されますが、そのバケットのバッチ構成はリプレイのみになります。
 - リプレイは最もシンプルで頑健な忘却抑制手法であり、ベースデータの一部を既に持っているなら低コストです。[出力蒸留](./distillation.md) とよく組み合わせられます。
+
+</details>
+
+## Adaptive λ (`--adaptive_lambda`)
+
+### How It Works / 仕組み
+
+A static preservation weight is a poor compromise: too high and the model cannot learn the new task; too low and it forgets. The right value also changes during training. Adaptive λ is a thermostat for the soft-penalty strength. Each step it tracks the ratio of the preservation (penalty) loss to the task loss, smooths it with an EMA, and produces a coefficient:
+
+```
+r       = preserve_loss / task_loss
+r_bar   = ema * r_bar + (1 - ema) * r
+coeff   = clamp(base * r_bar, min, max)
+```
+
+The coefficient **multiplies the existing penalty**, so the noise profile from `--distillation_weight_high/low` is preserved; the controller only modulates the overall strength over time. When forgetting grows (preservation loss rises relative to the task), `coeff` rises to protect the base; when the new task is hard (task loss large), `coeff` falls to give the model room to learn. The two loss scalars are averaged across ranks before the ratio is computed, so every process applies the same coefficient (DDP-consistent).
+
+Adaptive λ needs an active soft penalty to scale. It currently drives **output distillation** (and, in a later step, Rank-1 EWC). If `--adaptive_lambda` is set with no soft penalty active, it is disabled with a warning (e.g. it cannot drive OPLoRA, which has no λ — its knob is the projection rank).
+
+<details>
+<summary>日本語</summary>
+
+固定の保存重みは妥協的です。高すぎると新タスクを学習できず、低すぎると忘却します。適切な値は学習中にも変化します。Adaptive λ はソフトペナルティ強度の「サーモスタット」です。各ステップで保存（ペナルティ）損失とタスク損失の比を追跡し、EMA で平滑化して係数を算出します。
+
+```
+r       = preserve_loss / task_loss
+r_bar   = ema * r_bar + (1 - ema) * r
+coeff   = clamp(base * r_bar, min, max)
+```
+
+係数は **既存のペナルティに乗算** されるため、`--distillation_weight_high/low` によるノイズプロファイルは保持され、全体強度のみを時間方向に調整します。忘却が進む（保存損失がタスクに対して上昇）と `coeff` が上がってベースを保護し、新タスクが難しい（タスク損失が大きい）と `coeff` が下がって学習の余地を与えます。2 つの損失スカラーは比の計算前にランク間で平均されるため、全プロセスが同じ係数を適用します（DDP 一貫）。
+
+Adaptive λ はスケール対象のソフトペナルティが必要です。現在は **出力蒸留**（および後のステップで Rank-1 EWC）を駆動します。ソフトペナルティが無効なまま `--adaptive_lambda` を指定すると、警告とともに無効化されます（λ を持たない OPLoRA は駆動できません。OPLoRA のつまみは射影ランクです）。
+
+</details>
+
+### Configuration / 設定
+
+- `--adaptive_lambda` (flag, default off): enable the controller.
+- `--adaptive_lambda_ema` (default `0.99`): EMA decay for smoothing the loss ratio.
+- `--adaptive_lambda_base` (default `1.0`): base multiplier; `1.0` keeps the penalty near its configured strength at start.
+- `--adaptive_lambda_min` / `--adaptive_lambda_max` (default `0.0` / `10.0`): clamp range for the coefficient.
+
+Example (full fine-tuning, distillation with adaptive strength):
+
+```bash
+accelerate launch --mixed_precision bf16 flux_train.py \
+  --pretrained_model_name_or_path model.safetensors \
+  --dataset_config config.toml \
+  --output_dir output --output_name my_model \
+  --distillation_weight_high 1.0 --distillation_weight_low 0.0 \
+  --adaptive_lambda
+```
+
+<details>
+<summary>日本語</summary>
+
+- `--adaptive_lambda`（フラグ、既定オフ）: コントローラを有効化。
+- `--adaptive_lambda_ema`（既定 `0.99`）: 損失比平滑化の EMA 減衰。
+- `--adaptive_lambda_base`（既定 `1.0`）: ベース倍率。`1.0` は開始時にペナルティを設定値付近に保ちます。
+- `--adaptive_lambda_min` / `--adaptive_lambda_max`（既定 `0.0` / `10.0`）: 係数のクランプ範囲。
 
 </details>

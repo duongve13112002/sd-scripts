@@ -34,6 +34,7 @@ import library.optimizer as optimizer_util
 import library.logging_util as logging_util
 import library.loss as loss_util
 import library.distillation as distillation
+import library.anti_forgetting as anti_forgetting
 import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
 
@@ -396,6 +397,7 @@ def train(args):
     # distillation teacher (frozen base) for full fine-tune output distillation
     distill_teacher = None
     distill_teacher_swapping = False
+    adaptive_lambda_controller = anti_forgetting.create_adaptive_lambda_controller(args)
     if distillation.is_enabled(args):
         teacher_sd = load_safetensors(distillation.teacher_path(args), "cpu", args.disable_mmap_load_safetensors, model_dtype)
         distill_teacher = sd3_utils.load_mmdit(teacher_sd, model_dtype, "cpu")
@@ -890,7 +892,8 @@ def train(args):
                         teacher_pred = distill_teacher(noisy_model_input, timesteps, context=context, y=lg_pooled)
                     teacher_pred = teacher_pred * (-sigmas) + noisy_model_input
                     noise_level = distillation.normalized_noise_level_from_sigmas(sigmas)
-                    loss = loss + distillation.distillation_loss(model_pred, teacher_pred, noise_level, loss_weights, args, huber_c)
+                    distill_term = distillation.distillation_loss(model_pred, teacher_pred, noise_level, loss_weights, args, huber_c)
+                    loss = anti_forgetting.add_adaptive_penalty(loss, distill_term, adaptive_lambda_controller, accelerator)
 
                 accelerator.backward(loss)
 

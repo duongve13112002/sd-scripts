@@ -100,6 +100,11 @@ def main():
         default=0,
         help="Exercise the full-FT teacher block-swap path (full fine-tune case only)",
     )
+    parser.add_argument(
+        "--adaptive_lambda",
+        action="store_true",
+        help="Also enable adaptive lambda (auto-tunes the distillation strength from the preserve/task ratio)",
+    )
     parser.add_argument("--timeout", type=int, default=600, help="Timeout per test in seconds")
     args = parser.parse_args()
 
@@ -138,6 +143,8 @@ def main():
         "--distillation_weight_low", "0.0",
         "--loss_type", args.loss_type,
     ]
+    if args.adaptive_lambda:
+        common += ["--adaptive_lambda"]
     if args.t5_tokenizer_path:
         common += ["--t5_tokenizer_path", args.t5_tokenizer_path]
 

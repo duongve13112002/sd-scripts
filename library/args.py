@@ -704,6 +704,40 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "(transformer models only; ignored otherwise). (default: 0, no swap)",
     )
 
+    # Adaptive lambda: a thermostat that scales a soft penalty (distillation / EWC) over time
+    parser.add_argument(
+        "--adaptive_lambda",
+        action="store_true",
+        help="Auto-tune the soft-penalty strength (output distillation, and later Rank-1 EWC) from the "
+        "preservation/task loss ratio: stronger when forgetting grows, weaker when the new task is hard. "
+        "Requires an active soft penalty; otherwise it is disabled.",
+    )
+    parser.add_argument(
+        "--adaptive_lambda_ema",
+        type=float,
+        default=0.99,
+        help="EMA decay for the adaptive-lambda loss-ratio smoothing. (default: 0.99)",
+    )
+    parser.add_argument(
+        "--adaptive_lambda_base",
+        type=float,
+        default=1.0,
+        help="Base multiplier for adaptive lambda; the coefficient is base * EMA(preserve/task), clamped. "
+        "1.0 keeps the penalty near its configured strength at start. (default: 1.0)",
+    )
+    parser.add_argument(
+        "--adaptive_lambda_min",
+        type=float,
+        default=0.0,
+        help="Lower clamp for the adaptive-lambda coefficient. (default: 0.0)",
+    )
+    parser.add_argument(
+        "--adaptive_lambda_max",
+        type=float,
+        default=10.0,
+        help="Upper clamp for the adaptive-lambda coefficient. (default: 10.0)",
+    )
+
 
 def add_masked_loss_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
@@ -964,6 +998,11 @@ def verify_training_args(args: argparse.Namespace):
             "sample_every_n_steps is less than or equal to 0, so it will be disabled / sample_every_n_stepsに0以下の値が指定されたため無効になります"
         )
         args.sample_every_n_steps = None
+
+    # resolve conflicts between the anti-forgetting methods (replay / distillation / EWC / OPLoRA)
+    from library.anti_forgetting import verify_anti_forgetting_args
+
+    verify_anti_forgetting_args(args)
 
 
 def add_dataset_arguments(

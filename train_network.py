@@ -38,6 +38,7 @@ from library.model_io import SS_METADATA_MINIMUM_KEYS
 import library.logging_util as logging_util
 import library.loss as loss_util
 import library.distillation as distillation
+import library.anti_forgetting as anti_forgetting
 import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
 import library.config_util as config_util
@@ -68,6 +69,8 @@ class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
+        self.adaptive_lambda_controller = None
+        self._adaptive_lambda_ready = False
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -630,9 +633,13 @@ class NetworkTrainer:
 
         loss = loss.mean()
         if teacher_pred is not None:
-            loss = loss + distillation.distillation_loss(
+            if not self._adaptive_lambda_ready:
+                self.adaptive_lambda_controller = anti_forgetting.create_adaptive_lambda_controller(args)
+                self._adaptive_lambda_ready = True
+            distill_term = distillation.distillation_loss(
                 noise_pred, teacher_pred, distill_noise_level, batch["loss_weights"], args, huber_c
             )
+            loss = anti_forgetting.add_adaptive_penalty(loss, distill_term, self.adaptive_lambda_controller, accelerator)
         return loss
 
     def cast_text_encoder(self, args):
