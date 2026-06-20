@@ -115,7 +115,9 @@ coeff   = clamp(base * r_bar, min, max)
 
 The coefficient **multiplies the existing penalty**, so the noise profile from `--distillation_weight_high/low` is preserved; the controller only modulates the overall strength over time. When forgetting grows (preservation loss rises relative to the task), `coeff` rises to protect the base; when the new task is hard (task loss large), `coeff` falls to give the model room to learn. The two loss scalars are averaged across ranks before the ratio is computed, so every process applies the same coefficient (DDP-consistent).
 
-Adaptive λ needs an active soft penalty to scale. It currently drives **output distillation** (and, in a later step, Rank-1 EWC). If `--adaptive_lambda` is set with no soft penalty active, it is disabled with a warning (e.g. it cannot drive OPLoRA, which has no λ — its knob is the projection rank).
+Adaptive λ needs an active soft penalty to scale. It drives **output distillation** or **Rank-1 EWC**. If `--adaptive_lambda` is set with no soft penalty active, it is disabled with a warning (e.g. it cannot drive OPLoRA, which has no λ — its knob is the projection rank).
+
+Unlike the other three methods, adaptive λ is a lightweight heuristic controller (EMA-smoothed loss-ratio feedback), not a specific published method; it is off by default, and a well-chosen fixed weight is a perfectly good alternative.
 
 <details>
 <summary>日本語</summary>
@@ -130,7 +132,9 @@ coeff   = clamp(base * r_bar, min, max)
 
 係数は **既存のペナルティに乗算** されるため、`--distillation_weight_high/low` によるノイズプロファイルは保持され、全体強度のみを時間方向に調整します。忘却が進む（保存損失がタスクに対して上昇）と `coeff` が上がってベースを保護し、新タスクが難しい（タスク損失が大きい）と `coeff` が下がって学習の余地を与えます。2 つの損失スカラーは比の計算前にランク間で平均されるため、全プロセスが同じ係数を適用します（DDP 一貫）。
 
-Adaptive λ はスケール対象のソフトペナルティが必要です。現在は **出力蒸留**（および後のステップで Rank-1 EWC）を駆動します。ソフトペナルティが無効なまま `--adaptive_lambda` を指定すると、警告とともに無効化されます（λ を持たない OPLoRA は駆動できません。OPLoRA のつまみは射影ランクです）。
+Adaptive λ はスケール対象のソフトペナルティが必要です。**出力蒸留** または **Rank-1 EWC** を駆動します。ソフトペナルティが無効なまま `--adaptive_lambda` を指定すると、警告とともに無効化されます（λ を持たない OPLoRA は駆動できません。OPLoRA のつまみは射影ランクです）。
+
+他の 3 手法と異なり、adaptive λ は軽量なヒューリスティック制御（EMA で平滑化した損失比フィードバック）であり、特定の論文手法ではありません。既定でオフであり、適切に選んだ固定重みでも十分に代替できます。
 
 </details>
 
@@ -250,7 +254,7 @@ up'  = up   - U_k (U_k^T up)
 down' = down - (down V_k) V_k^T
 ```
 
-After projection `U_k^T up' = 0` and `down' V_k = 0`, so `W + ΔW'` keeps `W`'s top-k singular triples **exactly** unchanged — a hard mathematical guarantee, unlike the soft pull of distillation. There is **no teacher and no extra forward pass**: the bases `U_k`, `V_k` are computed once by SVD of each base weight at startup (before the adapter is attached), and the per-step projection is a few small matmuls.
+After projection `U_k^T up' = 0` and `down' V_k = 0`, so `W + ΔW'` keeps `W`'s top-k singular triples **exactly** unchanged — a hard mathematical guarantee, unlike the soft pull of distillation. Note the precise claim: this preserves the **top-k singular subspace of each weight**, not a guarantee that the model's full behaviour is unchanged — the adapter still freely changes outputs in the orthogonal complement (that is where it learns the new task). There is **no teacher and no extra forward pass**: the bases `U_k`, `V_k` are computed once by SVD of each base weight at startup (before the adapter is attached), and the per-step projection is a few small matmuls.
 
 OPLoRA is **LoRA/network training only** (it operates on the LoRA factors); its arguments are not registered by the full fine-tune scripts, so passing them there is rejected. It has no `λ` to tune — its knob is the subspace size `--oplora_rank` — so adaptive λ does not apply to it. When both OPLoRA and output distillation are enabled, **OPLoRA supersedes distillation** (hard guarantee, no teacher forward) and distillation is disabled with a warning.
 
@@ -270,7 +274,7 @@ up'  = up   - U_k (U_k^T up)
 down' = down - (down V_k) V_k^T
 ```
 
-射影後は `U_k^T up' = 0`、`down' V_k = 0` となり、`W + ΔW'` は `W` の上位 k 特異三つ組を **厳密に** 保持します（蒸留のソフトな引き戻しと異なり、ハードな数学的保証）。**teacher も追加 forward も不要** で、基底 `U_k`, `V_k` は起動時（アダプター接続前）に各ベース重みの SVD で一度だけ計算し、毎ステップの射影は小さな行列積数回です。
+射影後は `U_k^T up' = 0`、`down' V_k = 0` となり、`W + ΔW'` は `W` の上位 k 特異三つ組を **厳密に** 保持します（蒸留のソフトな引き戻しと異なり、ハードな数学的保証）。正確には、これは各重みの **上位 k 特異部分空間** を保持するもので、モデルの振る舞い全体が不変であることの保証ではありません。アダプターは直交補空間で出力を自由に変えます（そこで新タスクを学習します）。**teacher も追加 forward も不要** で、基底 `U_k`, `V_k` は起動時（アダプター接続前）に各ベース重みの SVD で一度だけ計算し、毎ステップの射影は小さな行列積数回です。
 
 OPLoRA は **LoRA/ネットワーク学習専用** です（LoRA 因子に作用するため）。引数はフルファインチューニングのスクリプトには登録されないため、そこへ渡すと拒否されます。調整する `λ` はなく、つまみは部分空間サイズ `--oplora_rank` なので、adaptive λ は適用されません。OPLoRA と出力蒸留を同時に有効にした場合は **OPLoRA が蒸留より優先**（ハード保証、teacher forward 不要）され、蒸留は警告とともに無効化されます。
 
@@ -285,6 +289,7 @@ OPLoRA は **LoRA/ネットワーク学習専用** です（LoRA 因子に作用
 Notes:
 
 - The one-time SVD of every target weight at startup adds some startup time on large models; randomized SVD (the default) keeps it fast.
+- The bases `U_k` (out×k) and `V_k` (in×k) are kept resident for the per-step projection. Per module this is small, but it scales with the number of target layers and `--oplora_rank`, so on very large models (many layers, high rank) it is not free — still well below a teacher copy, but budget for it.
 - Split-qkv LoRA modules (FLUX, when `split_dims` is used) cannot be projected exactly and are left unprojected (logged at startup).
 - Works on single and multi-GPU (standard DDP): the projection is applied identically on every rank after the synchronized optimizer step. The bases come from the unchanging base weights, so it is also safe across resume.
 

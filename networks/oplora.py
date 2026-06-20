@@ -1,10 +1,12 @@
 """OPLoRA: orthogonal-projection LoRA for anti catastrophic-forgetting (LoRA training only).
 
 Confines each LoRA update to the orthogonal complement of the base weight's top-k singular
-subspace, so the base model's dominant directions are provably preserved while the adapter
-learns in the remaining subspace. There is no teacher and no extra forward pass: the basis is
-computed once from each base weight (SVD), and after every optimizer step the up/down factors
-are projected back into the orthogonal complement.
+subspace, so each weight's top-k singular triples are provably preserved (the adapter cannot
+move along them) while it learns in the remaining subspace. This preserves the top-k singular
+subspace of each weight, not the model's full behaviour: the adapter still changes outputs in
+the orthogonal complement (which is the point). There is no teacher and no extra forward pass:
+the basis is computed once from each base weight (SVD), and after every optimizer step the
+up/down factors are projected back into the orthogonal complement.
 
 For a base weight W = U S V^T with top-k U_k (out x k) and V_k (in x k), and a LoRA delta
 dW = up @ down, the projected delta is P_L dW P_R with P_L = I - U_k U_k^T and P_R = I - V_k V_k^T.
