@@ -183,13 +183,13 @@ class EWCRegularizer:
             # (buffer_dtype) loses nothing while halving VRAM for bf16/fp16 weights; the penalty
             # difference is still computed in fp32 (see penalty()).
             self.theta_star[n] = p.detach().to(dev, dtype=self.buffer_dtype, copy=True)
-            # u accumulates gradients in fp32 (a bf16 running sum would swamp small gradients over
-            # hundreds of micro-batches). When the final buffers are reduced precision on GPU, keep
-            # this fp32 accumulator on CPU during the Fisher phase so it does not cost full-fp32 VRAM;
-            # finalize moves it to the storage device at buffer_dtype. That CPU transfer is one-time
-            # (the Fisher phase), unlike --ewc_buffers_on_cpu which transfers every training step.
-            accum_dev = torch.device("cpu") if (self.store_on_cpu or self.buffer_dtype != torch.float32) else dev
-            self.u[n] = torch.zeros(self.theta_star[n].shape, dtype=torch.float32, device=accum_dev)
+            # u is accumulated and stored at buffer_dtype on theta*'s device: fast and low-VRAM.
+            # With bf16/fp16 the running sum slightly underestimates u's magnitude over many
+            # micro-batches (swamping), but EWC's gradients are near-collinear so u's *direction*
+            # is preserved and lambda absorbs the magnitude; the per-step penalty difference is still
+            # computed in fp32 (penalty()), which is the precision that matters most. Use fp32 buffers
+            # for strict fp32 accumulation (more VRAM), or --ewc_buffers_on_cpu to keep them off GPU.
+            self.u[n] = torch.zeros_like(self.theta_star[n])
         self.count = 0
         self.collecting = self.num_fisher_samples > 0
         self.ready = False
@@ -210,7 +210,7 @@ class EWCRegularizer:
         ``backward`` and before ``zero_grad`` during the Fisher phase."""
         for n, p in self.params:
             if p.grad is not None:
-                self.u[n] += p.grad.detach().to(self.u[n].device, dtype=torch.float32)
+                self.u[n] += p.grad.detach().to(self.u[n].device, dtype=self.buffer_dtype)
         self.count += 1
         if self._log_enabled and self.collecting and self.count < self.num_fisher_samples and self.count % self._log_every == 0:
             logger.info(f"Rank-1 EWC: Fisher phase {self.count}/{self.num_fisher_samples} micro-batches")
