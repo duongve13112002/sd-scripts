@@ -203,6 +203,58 @@ def test_ewc_fisher_logging_gated_to_main_process():
     assert reg2._log_enabled is False
 
 
+def test_ewc_buffer_dtype_bf16_stores_bf16_but_accumulates_and_computes_in_fp32():
+    m = nn.Linear(1, 1, bias=False).to(torch.bfloat16)
+    with torch.no_grad():
+        m.weight.fill_(0.0)
+    reg = anti_forgetting.EWCRegularizer(
+        m.named_parameters(), lam=1.0, num_fisher_samples=2, store_on_cpu=True, buffer_dtype=torch.bfloat16
+    )
+    # theta* stored at buffer dtype; u accumulates in fp32 during the Fisher phase
+    assert reg.theta_star["weight"].dtype == torch.bfloat16
+    assert reg.u["weight"].dtype == torch.float32
+    m.weight.grad = torch.tensor([[2.0]], dtype=torch.bfloat16)
+    reg.accumulate()
+    m.weight.grad = torch.tensor([[4.0]], dtype=torch.bfloat16)
+    reg.accumulate()
+    assert reg.maybe_finalize()
+    # after finalize u is downcast to the buffer dtype, value averaged in fp32 (= 3.0)
+    assert reg.u["weight"].dtype == torch.bfloat16
+    assert reg.u["weight"].float().item() == pytest.approx(3.0, abs=1e-2)
+    # penalty upcasts to fp32: drift the weight, penalty becomes positive and differentiable
+    with torch.no_grad():
+        m.weight += 1.0
+    pen = reg.penalty()
+    assert pen.item() > 0.0
+
+
+def test_create_ewc_regularizer_maps_buffer_dtype_and_warns_for_fp32_weights(caplog):
+    import logging
+
+    on_bf16 = argparse.Namespace(
+        ewc_lambda=0.5, ewc_fisher_samples=10, ewc_buffers_on_cpu=True, ewc_buffer_dtype="bf16"
+    )
+    # bf16 weights -> no warning, buffers are bf16
+    mbf16 = nn.Linear(2, 2).to(torch.bfloat16)
+    with caplog.at_level(logging.WARNING, logger="library.anti_forgetting"):
+        reg = anti_forgetting.create_ewc_regularizer(on_bf16, [mbf16])
+    assert reg.buffer_dtype == torch.bfloat16
+    assert not any("reduced precision" in r.getMessage() for r in caplog.records)
+    # fp32 weights + bf16 buffers -> warn about losing drift resolution
+    caplog.clear()
+    mfp32 = nn.Linear(2, 2)  # fp32 weights
+    with caplog.at_level(logging.WARNING, logger="library.anti_forgetting"):
+        anti_forgetting.create_ewc_regularizer(on_bf16, [mfp32])
+    assert any("fp32" in r.getMessage() for r in caplog.records)
+
+
+def test_ewc_default_buffer_dtype_is_fp32():
+    on = argparse.Namespace(ewc_lambda=0.5, ewc_fisher_samples=10, ewc_buffers_on_cpu=True)  # no ewc_buffer_dtype
+    reg = anti_forgetting.create_ewc_regularizer(on, [nn.Linear(2, 2)])
+    assert reg.buffer_dtype == torch.float32
+    assert reg.theta_star[next(iter(reg.theta_star))].dtype == torch.float32
+
+
 def test_ewc_fisher_phase_emits_start_progress_and_done_logs(caplog):
     import logging
 

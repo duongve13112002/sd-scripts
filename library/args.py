@@ -760,6 +760,15 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="Store the EWC reference weights and Fisher vector on CPU to save VRAM (adds a per-step "
         "host-device transfer). Recommended for very large models.",
     )
+    parser.add_argument(
+        "--ewc_buffer_dtype",
+        type=str,
+        default="fp32",
+        choices=["fp32", "bf16", "fp16"],
+        help="dtype of the EWC reference buffers (theta* and u). fp32 (default) is always safe. bf16/fp16 "
+        "halve the EWC VRAM and are safe when the trainable weights are already bf16/fp16 (e.g. --full_bf16), "
+        "since the penalty difference is still computed in fp32; avoid them when the training weights are fp32.",
+    )
 
 
 def add_masked_loss_arguments(parser: argparse.ArgumentParser):

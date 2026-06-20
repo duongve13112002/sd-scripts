@@ -204,10 +204,11 @@ EWC は **フルファインチューニング専用** です（ベース重み�
 - `--ewc_lambda` (float, default `0.0` = off): EWC penalty weight (full fine-tuning only).
 - `--ewc_fisher_samples` (int, default `100`): number of micro-batches used to estimate the Fisher direction before training. Must be smaller than your total steps so the Fisher phase finishes.
 - `--ewc_buffers_on_cpu` (flag, default off): store the reference weights (`theta*`) and Fisher vector (`u`) on CPU to save VRAM. This adds a per-step host-device transfer, so it is slower; recommended only for very large models.
+- `--ewc_buffer_dtype` (`fp32`|`bf16`|`fp16`, default `fp32`): precision of the `theta*` and `u` buffers. `fp32` is always safe. `bf16`/`fp16` halve the EWC VRAM and are safe when the trainable weights are already bf16/fp16 (e.g. `--full_bf16`), because `theta*` is a snapshot of the (already low-precision) weight and the penalty difference is still computed in fp32. Avoid reduced precision for fp32 weights — it can quantize away small drift.
 
 Memory and compatibility notes:
 
-- EWC keeps two extra fp32 buffers the size of the trainable weights (`theta*` and `u`). On GPU (default) this costs roughly 2× the parameter memory but every step is cheap; on CPU it frees VRAM but transfers those buffers each step. This is comfortable for SDXL/SD3/Lumina and heavy for FLUX.1 (12B).
+- EWC keeps two extra buffers the size of the trainable weights (`theta*` and `u`). With `--ewc_buffer_dtype fp32` (default) this costs roughly 2× the parameter memory; with `bf16`/`fp16` (safe for bf16/fp16 training) it is about 1× (the buffers are halved). On GPU every step is cheap; on CPU it frees VRAM but transfers those buffers each step. This is comfortable for SDXL/SD3/Lumina and heavier for FLUX.1 (12B) — there, prefer bf16 buffers (when training in bf16) or `--ewc_buffers_on_cpu`.
 - EWC is **incompatible with `--fused_backward_pass` / `--blockwise_fused_optimizers`** (the optimizer steps inside the backward hook, which would update weights during the Fisher phase); enabling both raises an error.
 - Works on single and multi-GPU (standard DDP). The Fisher direction `u` is averaged across ranks, so every process applies the same penalty.
 - On resume, the Fisher phase re-runs and re-anchors `theta*` to the resumed weights (the EWC state is not checkpointed), so for a strict anchor to the original base, run EWC in a single training run.
@@ -228,10 +229,11 @@ accelerate launch --mixed_precision bf16 flux_train.py \
 - `--ewc_lambda`（float、既定 `0.0` = 無効）: EWC ペナルティ重み（フルファインチューニング専用）。
 - `--ewc_fisher_samples`（int、既定 `100`）: 学習前に Fisher 方向を推定するマイクロバッチ数。Fisher フェーズが終わるよう、総ステップ数より小さくしてください。
 - `--ewc_buffers_on_cpu`（フラグ、既定オフ）: 参照重み（`theta*`）と Fisher ベクトル（`u`）を CPU に置いて VRAM を節約します。毎ステップの転送が増えるため遅くなります。非常に大きいモデルにのみ推奨。
+- `--ewc_buffer_dtype`（`fp32`|`bf16`|`fp16`、既定 `fp32`）: `theta*` と `u` バッファの精度。`fp32` は常に安全。`bf16`/`fp16` は EWC の VRAM を半減し、学習重みが既に bf16/fp16 の場合（例: `--full_bf16`）は安全です（`theta*` は低精度重みのスナップショットで、ペナルティの差分は fp32 で計算されるため）。fp32 重みでは小さなドリフトが量子化で失われるため避けてください。
 
 メモリ・互換性:
 
-- EWC は学習対象重みと同サイズの fp32 バッファを 2 つ（`theta*` と `u`）保持します。GPU（既定）ではおよそパラメータ 2 倍のメモリですが毎ステップは軽量、CPU では VRAM を解放する代わりに毎ステップ転送が発生します。SDXL/SD3/Lumina では余裕があり、FLUX.1（12B）では重くなります。
+- EWC は学習対象重みと同サイズのバッファを 2 つ（`theta*` と `u`）保持します。`--ewc_buffer_dtype fp32`（既定）ではおよそパラメータ 2 倍、`bf16`/`fp16`（bf16/fp16 学習で安全）では約 1 倍（バッファ半減）です。GPU では毎ステップ軽量、CPU では VRAM を解放する代わりに毎ステップ転送が発生します。SDXL/SD3/Lumina は余裕があり、FLUX.1（12B）では重いため、bf16 バッファ（bf16 学習時）か `--ewc_buffers_on_cpu` を推奨します。
 - EWC は **`--fused_backward_pass` / `--blockwise_fused_optimizers` と非互換** です（オプティマイザが backward フック内でステップし、Fisher フェーズ中に重みを更新してしまうため）。同時指定はエラーになります。
 - シングル/マルチ GPU 対応: `u` はランク間で平均されるため、全プロセスが同じペナルティを適用します（DDP 一貫）。
 

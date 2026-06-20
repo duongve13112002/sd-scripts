@@ -168,17 +168,24 @@ class EWCRegularizer:
     per-step host-device transfer.
     """
 
-    def __init__(self, named_params, lam: float, num_fisher_samples: int, store_on_cpu: bool, accelerator=None):
+    def __init__(self, named_params, lam: float, num_fisher_samples: int, store_on_cpu: bool,
+                 accelerator=None, buffer_dtype: torch.dtype = torch.float32):
         self.lam = float(lam)
         self.num_fisher_samples = int(num_fisher_samples)
         self.store_on_cpu = bool(store_on_cpu)
+        self.buffer_dtype = buffer_dtype
         self.params = [(n, p) for n, p in named_params if p.requires_grad]
         self.theta_star = {}
         self.u = {}
         for n, p in self.params:
             dev = torch.device("cpu") if self.store_on_cpu else p.device
-            self.theta_star[n] = p.detach().to(dev, dtype=torch.float32, copy=True)
-            self.u[n] = torch.zeros_like(self.theta_star[n])
+            # theta* is a snapshot of the live weight, so storing it at the weight's own precision
+            # (buffer_dtype) loses nothing while halving VRAM for bf16/fp16 weights; the penalty
+            # difference is still computed in fp32 (see penalty()).
+            self.theta_star[n] = p.detach().to(dev, dtype=self.buffer_dtype, copy=True)
+            # u accumulates gradients in fp32 during the Fisher phase for a stable sum, then is
+            # downcast to buffer_dtype on finalize so the long training phase stays low-memory.
+            self.u[n] = torch.zeros(self.theta_star[n].shape, dtype=torch.float32, device=dev)
         self.count = 0
         self.collecting = self.num_fisher_samples > 0
         self.ready = False
@@ -190,8 +197,8 @@ class EWCRegularizer:
         if self.collecting and self._log_enabled:
             logger.info(
                 f"Rank-1 EWC: Fisher phase started, estimating the dominant gradient direction over "
-                f"{self.num_fisher_samples} micro-batches per process. Weights stay frozen and the progress "
-                f"bar does not advance until this finishes."
+                f"{self.num_fisher_samples} micro-batches per process (reference buffers in {self.buffer_dtype}). "
+                f"Weights stay frozen and the progress bar does not advance until this finishes."
             )
 
     def accumulate(self) -> None:
@@ -211,10 +218,12 @@ class EWCRegularizer:
             return False
         multi = accelerator is not None and accelerator.num_processes > 1
         for n in self.u:
-            self.u[n] /= self.count
+            avg = self.u[n] / self.count
             if multi:
-                reduced = accelerator.reduce(self.u[n].to(accelerator.device), reduction="mean")
-                self.u[n] = reduced.to("cpu") if self.store_on_cpu else reduced
+                avg = accelerator.reduce(avg.to(accelerator.device), reduction="mean")
+            # store the finalized direction back on the buffer device at buffer_dtype (the fp32
+            # accumulator is dropped here, freeing the extra Fisher-phase memory)
+            self.u[n] = avg.to(device=self.theta_star[n].device, dtype=self.buffer_dtype)
         self.collecting = False
         self.ready = True
         if self._log_enabled:
@@ -236,6 +245,9 @@ class EWCRegularizer:
         return self.lam * (s * s)
 
 
+_EWC_BUFFER_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+
+
 def create_ewc_regularizer(args: argparse.Namespace, models, accelerator=None) -> Optional[EWCRegularizer]:
     """Build the EWC regularizer over the trainable params of ``models`` (the denoiser, and
     any other fine-tuned modules). Snapshot ``theta*`` here, before any optimizer step."""
@@ -244,4 +256,16 @@ def create_ewc_regularizer(args: argparse.Namespace, models, accelerator=None) -
     named = []
     for m in models:
         named.extend(m.named_parameters())
-    return EWCRegularizer(named, args.ewc_lambda, args.ewc_fisher_samples, getattr(args, "ewc_buffers_on_cpu", False), accelerator)
+    buffer_dtype = _EWC_BUFFER_DTYPES[getattr(args, "ewc_buffer_dtype", "fp32")]
+    if buffer_dtype != torch.float32:
+        trainable = next((p for _, p in named if p.requires_grad), None)
+        if trainable is not None and trainable.dtype == torch.float32:
+            logger.warning(
+                "--ewc_buffer_dtype is reduced precision but the trainable weights are fp32; this can "
+                "quantize away small weight drift and weaken EWC. Use fp32 buffers when training in fp32; "
+                "reduced-precision buffers are intended for bf16/fp16 weights (e.g. --full_bf16)."
+            )
+    return EWCRegularizer(
+        named, args.ewc_lambda, args.ewc_fisher_samples,
+        getattr(args, "ewc_buffers_on_cpu", False), accelerator, buffer_dtype,
+    )
