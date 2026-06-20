@@ -1,8 +1,14 @@
 """GPU validation: does Rank-1 EWC retain old knowledge on a real image diffusion model?
 
 Self-contained, single-file, run-and-go on a single GPU (tuned for a Colab T4, ~16 GB).
-It trains a custom UNet noise-prediction diffusion model on a REAL dataset (CIFAR-10, auto
-downloaded) and exercises the actual shipped anti-forgetting code paths:
+It trains a custom UNet diffusion model on a REAL dataset (CIFAR-10, auto downloaded) and
+exercises the actual shipped anti-forgetting code paths. Two objectives are supported:
+
+    --objective flow   rectified-flow / flow matching (FLUX, SD3, Anima, Lumina) -- DEFAULT
+    --objective ddpm   DDPM noise prediction (SD1.5, SDXL)
+
+The flow path follows the repo convention exactly: x_t = (1-sigma) x0 + sigma noise, target =
+noise - x0 (velocity), and the distillation noise level is sigma. The shipped code used:
 
     library.anti_forgetting.create_ewc_regularizer / EWCRegularizer   (Rank-1 EWC)
     library.anti_forgetting.create_adaptive_lambda_controller          (adaptive lambda)
@@ -152,9 +158,40 @@ def make_schedule(steps: int, device: torch.device) -> torch.Tensor:
     return torch.cumprod(1.0 - betas, dim=0)  # abar
 
 
-def add_noise(x0, t, noise, abar):
-    ab = abar[t].view(-1, 1, 1, 1)
-    return ab.sqrt() * x0 + (1 - ab).sqrt() * noise
+def diffuse(objective: str, x0: torch.Tensor, abar: torch.Tensor, generator=None):
+    """Build (model_input, model_time, target, noise_level[B in 0..1]) for one batch.
+
+    objective="ddpm": DDPM noise prediction (SD1.5/SDXL family). x_t = sqrt(abar) x0 +
+    sqrt(1-abar) noise; target = noise; noise level = t / num_timesteps.
+
+    objective="flow": rectified-flow / flow matching (FLUX, SD3, Anima, Lumina). x_t =
+    (1-sigma) x0 + sigma noise with sigma ~ U(0,1); target = noise - x0 (velocity); noise
+    level = sigma. This mirrors flux_train_utils.get_noisy_model_input_and_timesteps and
+    ``target = noise - latents`` exactly. The distillation noise level uses the shipped
+    ``normalized_noise_level_from_*`` helpers, so both families exercise the real code.
+    """
+    device = x0.device
+    b = x0.shape[0]
+    num_timesteps = abar.shape[0]
+    noise = torch.randn_like(x0) if generator is None else torch.randn(x0.shape, generator=generator, device=device)
+    if objective == "ddpm":
+        if generator is None:
+            t = torch.randint(0, num_timesteps, (b,), device=device)
+        else:
+            t = torch.randint(0, num_timesteps, (b,), generator=generator, device=device)
+        ab = abar[t].view(-1, 1, 1, 1)
+        x_t = ab.sqrt() * x0 + (1 - ab).sqrt() * noise
+        target = noise
+        level = distillation.normalized_noise_level_from_timesteps(t, num_timesteps)
+        t_model = t.float()
+    else:
+        sigma = torch.rand(b, device=device) if generator is None else torch.rand(b, generator=generator, device=device)
+        s = sigma.view(-1, 1, 1, 1)
+        x_t = (1 - s) * x0 + s * noise
+        target = noise - x0
+        level = distillation.normalized_noise_level_from_sigmas(s)
+        t_model = sigma * num_timesteps
+    return x_t, t_model, target, level
 
 
 def infinite_images(loader):
@@ -212,15 +249,14 @@ def build_args_namespace(args, ewc_lambda=0.0, distill_high=0.0, distill_low=0.0
     )
 
 
-def fisher_phase(model, reg, loader, abar, device):
+def fisher_phase(model, reg, loader, abar, objective, device):
     """Estimate u over the first num_fisher_samples micro-batches at theta* (fp32, no optimizer step)."""
     model.train()
     for _ in range(reg.num_fisher_samples):
         x0 = next(loader).to(device)
-        t = torch.randint(0, abar.shape[0], (x0.shape[0],), device=device)
-        noise = torch.randn_like(x0)
+        x_t, t_model, target, _ = diffuse(objective, x0, abar)
         model.zero_grad(set_to_none=True)
-        F.mse_loss(model(add_noise(x0, t, noise, abar), t), noise).backward()
+        F.mse_loss(model(x_t, t_model), target).backward()
         reg.accumulate()
         if reg.maybe_finalize():
             break
@@ -228,14 +264,13 @@ def fisher_phase(model, reg, loader, abar, device):
 
 
 @torch.no_grad()
-def evaluate(model, x0, abar, reps, device, seed):
+def evaluate(model, x0, abar, objective, reps, device, seed):
     model.eval()
     gen = torch.Generator(device=device).manual_seed(seed)
     total = 0.0
     for _ in range(reps):
-        t = torch.randint(0, abar.shape[0], (x0.shape[0],), generator=gen, device=device)
-        noise = torch.randn(x0.shape, generator=gen, device=device)
-        total += float(F.mse_loss(model(add_noise(x0, t, noise, abar), t), noise))
+        x_t, t_model, target, _ = diffuse(objective, x0, abar, generator=gen)
+        total += float(F.mse_loss(model(x_t, t_model), target))
     model.train()
     return total / reps
 
@@ -263,7 +298,7 @@ def train_config(cfg, theta_star, args, new_loader, abar, device, reg_ref, old_e
     na = cfg["args"]
     if na.ewc_lambda > 0.0:
         reg = create_ewc_regularizer(na, [model], accelerator=None)
-        fisher_phase(model, reg, new_loader, abar, device)
+        fisher_phase(model, reg, new_loader, abar, args.objective, device)
     if distillation.is_enabled(na):
         teacher = UNet(args.base_channels).to(device)
         teacher.load_state_dict(theta_star)
@@ -278,20 +313,17 @@ def train_config(cfg, theta_star, args, new_loader, abar, device, reg_ref, old_e
     model.train()
     for _ in range(args.finetune_steps):
         x0 = next(new_loader).to(device)
-        t = torch.randint(0, abar.shape[0], (x0.shape[0],), device=device)
-        noise = torch.randn_like(x0)
-        x_t = add_noise(x0, t, noise, abar)
+        x_t, t_model, target, level = diffuse(args.objective, x0, abar)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=use_amp):
-            pred = model(x_t, t)
-            task = F.mse_loss(pred, noise)
+            pred = model(x_t, t_model)
+            task = F.mse_loss(pred, target)
         total = task.float()
         if reg is not None:
             total = total + reg.penalty()
         elif teacher is not None:
             with torch.no_grad(), torch.autocast(device_type=device.type, enabled=use_amp):
-                teacher_pred = teacher(x_t, t)
-            level = (1 - abar[t]).float()
+                teacher_pred = teacher(x_t, t_model)
             weights = torch.ones(x0.shape[0], device=device)
             dterm = distillation.distillation_loss(pred.float(), teacher_pred.float(), level, weights, na)
             total = add_adaptive_penalty(task.float(), dterm, controller, accelerator=None)
@@ -299,14 +331,21 @@ def train_config(cfg, theta_star, args, new_loader, abar, device, reg_ref, old_e
         scaler.step(optimizer)
         scaler.update()
 
-    old_loss = evaluate(model, old_eval, abar, args.eval_reps, device, args.seed + 50)
-    new_loss = evaluate(model, new_eval, abar, args.eval_reps, device, args.seed + 50)
+    old_loss = evaluate(model, old_eval, abar, args.objective, args.eval_reps, device, args.seed + 50)
+    new_loss = evaluate(model, new_eval, abar, args.objective, args.eval_reps, device, args.seed + 50)
     along, perp = drift_geometry(model, reg_ref)
     return new_loss, old_loss, along, perp
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--objective",
+        choices=["flow", "ddpm"],
+        default="flow",
+        help="training objective: 'flow' = rectified-flow / flow matching (FLUX, SD3, Anima, Lumina); "
+        "'ddpm' = noise prediction (SD1.5, SDXL). (default: flow)",
+    )
     parser.add_argument("--data_dir", default="./data", help="where CIFAR-10 is downloaded/cached")
     parser.add_argument("--old_class", type=int, default=1, help="CIFAR-10 class index pre-trained as 'old' (1=automobile)")
     parser.add_argument("--new_class", type=int, default=7, help="CIFAR-10 class index fine-tuned as 'new' (7=horse)")
@@ -349,6 +388,8 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"device = {device}  ({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'cpu'})")
     print(f"UNet base_channels={args.base_channels}  parameters = {n_params/1e6:.2f}M")
+    target_kind = "velocity (noise - x0)" if args.objective == "flow" else "noise (epsilon)"
+    print(f"objective = {args.objective}   target = {target_kind}")
     print(f"old class = {args.old_class}   new class = {args.new_class}   timesteps = {args.timesteps}")
 
     # Pre-train on the old class -> theta*.
@@ -359,25 +400,24 @@ def main():
     model.train()
     for step in range(args.pretrain_steps):
         x0 = next(old_loader).to(device)
-        t = torch.randint(0, abar.shape[0], (x0.shape[0],), device=device)
-        noise = torch.randn_like(x0)
+        x_t, t_model, target, _ = diffuse(args.objective, x0, abar)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=use_amp):
-            loss = F.mse_loss(model(add_noise(x0, t, noise, abar), t), noise)
+            loss = F.mse_loss(model(x_t, t_model), target)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
     theta_star = {k: v.detach().clone() for k, v in model.state_dict().items()}
     print(f"pre-train done in {time.time()-t0:.0f}s")
 
-    old0 = evaluate(model, old_eval, abar, args.eval_reps, device, args.seed + 50)
-    new0 = evaluate(model, new_eval, abar, args.eval_reps, device, args.seed + 50)
+    old0 = evaluate(model, old_eval, abar, args.objective, args.eval_reps, device, args.seed + 50)
+    new0 = evaluate(model, new_eval, abar, args.objective, args.eval_reps, device, args.seed + 50)
 
     # Reference u (new-task Fisher at theta*), reused to project every run's drift.
     ref = UNet(args.base_channels).to(device)
     ref.load_state_dict(theta_star)
     reg_ref = create_ewc_regularizer(build_args_namespace(args, ewc_lambda=1.0), [ref], accelerator=None)
-    fisher_phase(ref, reg_ref, new_loader, abar, device)
+    fisher_phase(ref, reg_ref, new_loader, abar, args.objective, device)
 
     configs = [{"name": "baseline (none)", "args": build_args_namespace(args)}]
     for lam in args.ewc_lambdas:
