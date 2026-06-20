@@ -168,7 +168,7 @@ class EWCRegularizer:
     per-step host-device transfer.
     """
 
-    def __init__(self, named_params, lam: float, num_fisher_samples: int, store_on_cpu: bool):
+    def __init__(self, named_params, lam: float, num_fisher_samples: int, store_on_cpu: bool, accelerator=None):
         self.lam = float(lam)
         self.num_fisher_samples = int(num_fisher_samples)
         self.store_on_cpu = bool(store_on_cpu)
@@ -182,6 +182,17 @@ class EWCRegularizer:
         self.count = 0
         self.collecting = self.num_fisher_samples > 0
         self.ready = False
+        # The Fisher phase runs no optimizer step, so nothing else logs while it collects u.
+        # Announce it (main process only, so a multi-GPU run does not repeat the line per rank)
+        # and report progress, so a silent multi-minute phase is not mistaken for a hang.
+        self._log_enabled = accelerator is None or accelerator.is_main_process
+        self._log_every = max(1, self.num_fisher_samples // 10)
+        if self.collecting and self._log_enabled:
+            logger.info(
+                f"Rank-1 EWC: Fisher phase started, estimating the dominant gradient direction over "
+                f"{self.num_fisher_samples} micro-batches per process. Weights stay frozen and the progress "
+                f"bar does not advance until this finishes."
+            )
 
     def accumulate(self) -> None:
         """Add the current per-batch gradients into the running Fisher sum. Call after
@@ -190,6 +201,8 @@ class EWCRegularizer:
             if p.grad is not None:
                 self.u[n] += p.grad.detach().to(self.u[n].device, dtype=torch.float32)
         self.count += 1
+        if self._log_enabled and self.collecting and self.count < self.num_fisher_samples and self.count % self._log_every == 0:
+            logger.info(f"Rank-1 EWC: Fisher phase {self.count}/{self.num_fisher_samples} micro-batches")
 
     def maybe_finalize(self, accelerator=None) -> bool:
         """Once enough samples are collected, average the Fisher sum, reduce it across ranks,
@@ -204,6 +217,11 @@ class EWCRegularizer:
                 self.u[n] = reduced.to("cpu") if self.store_on_cpu else reduced
         self.collecting = False
         self.ready = True
+        if self._log_enabled:
+            logger.info(
+                f"Rank-1 EWC: Fisher phase done, u estimated over {self.num_fisher_samples} micro-batches "
+                f"per process; training and the progress bar start now."
+            )
         return True
 
     def penalty(self):
@@ -226,4 +244,4 @@ def create_ewc_regularizer(args: argparse.Namespace, models, accelerator=None) -
     named = []
     for m in models:
         named.extend(m.named_parameters())
-    return EWCRegularizer(named, args.ewc_lambda, args.ewc_fisher_samples, getattr(args, "ewc_buffers_on_cpu", False))
+    return EWCRegularizer(named, args.ewc_lambda, args.ewc_fisher_samples, getattr(args, "ewc_buffers_on_cpu", False), accelerator)

@@ -187,6 +187,38 @@ def test_create_ewc_regularizer_respects_enable_and_spans_models():
     assert len(reg.params) == len(list(m1.parameters())) + len(list(m2.parameters()))
 
 
+def test_ewc_fisher_logging_gated_to_main_process():
+    import types
+
+    m = nn.Linear(2, 2)
+    # No accelerator (single process / CPU) -> the Fisher-phase log is enabled.
+    reg = anti_forgetting.EWCRegularizer(m.named_parameters(), lam=1.0, num_fisher_samples=40, store_on_cpu=True)
+    assert reg._log_enabled is True
+    assert reg._log_every == 4  # max(1, 40 // 10)
+    # Non-main rank of a multi-GPU run -> suppressed so the line is not repeated once per rank.
+    non_main = types.SimpleNamespace(is_main_process=False, num_processes=4)
+    reg2 = anti_forgetting.EWCRegularizer(
+        m.named_parameters(), lam=1.0, num_fisher_samples=40, store_on_cpu=True, accelerator=non_main
+    )
+    assert reg2._log_enabled is False
+
+
+def test_ewc_fisher_phase_emits_start_progress_and_done_logs(caplog):
+    import logging
+
+    m = nn.Linear(1, 1, bias=False)
+    with caplog.at_level(logging.INFO, logger="library.anti_forgetting"):
+        reg = anti_forgetting.EWCRegularizer(m.named_parameters(), lam=1.0, num_fisher_samples=2, store_on_cpu=True)
+        for _ in range(2):
+            m.weight.grad = torch.tensor([[1.0]])
+            reg.accumulate()
+        assert reg.maybe_finalize()
+    msgs = " ".join(r.getMessage() for r in caplog.records)
+    assert "Fisher phase started" in msgs
+    assert "Fisher phase 1/2" in msgs  # progress line before the final micro-batch
+    assert "Fisher phase done" in msgs
+
+
 def test_is_ewc_enabled():
     assert anti_forgetting.is_ewc_enabled(argparse.Namespace()) is False
     assert anti_forgetting.is_ewc_enabled(argparse.Namespace(ewc_lambda=0.0)) is False
