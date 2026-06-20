@@ -228,6 +228,23 @@ def test_ewc_buffer_dtype_bf16_stores_bf16_but_accumulates_and_computes_in_fp32(
     assert pen.item() > 0.0
 
 
+def test_ewc_bf16_buffer_keeps_fp32_accumulator_on_cpu_during_fisher():
+    # With reduced-precision buffers, the fp32 Fisher accumulator stays on CPU so it does not
+    # cost full-fp32 VRAM during the Fisher phase; the finalized u lands at the buffer dtype.
+    m = nn.Linear(2, 2).to(torch.bfloat16)
+    reg = anti_forgetting.EWCRegularizer(
+        m.named_parameters(), lam=1.0, num_fisher_samples=2, store_on_cpu=False, buffer_dtype=torch.bfloat16
+    )
+    for u in reg.u.values():
+        assert u.dtype == torch.float32 and u.device.type == "cpu"  # fp32 accumulator off the param device
+    m.weight.grad = torch.ones_like(m.weight)
+    reg.accumulate()
+    reg.accumulate()
+    assert reg.maybe_finalize()
+    for u in reg.u.values():
+        assert u.dtype == torch.bfloat16  # finalized at buffer dtype on the storage device
+
+
 def test_create_ewc_regularizer_maps_buffer_dtype_and_warns_for_fp32_weights(caplog):
     import logging
 

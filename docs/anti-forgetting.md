@@ -208,7 +208,7 @@ EWC は **フルファインチューニング専用** です（ベース重み�
 
 Memory and compatibility notes:
 
-- EWC keeps two extra buffers the size of the trainable weights (`theta*` and `u`). With `--ewc_buffer_dtype fp32` (default) this costs roughly 2× the parameter memory; with `bf16`/`fp16` (safe for bf16/fp16 training) it is about 1× (the buffers are halved). On GPU every step is cheap; on CPU it frees VRAM but transfers those buffers each step. This is comfortable for SDXL/SD3/Lumina and heavier for FLUX.1 (12B) — there, prefer bf16 buffers (when training in bf16) or `--ewc_buffers_on_cpu`.
+- EWC keeps two extra buffers the size of the trainable weights (`theta*` and `u`). With `--ewc_buffer_dtype fp32` (default) this costs roughly 2× the parameter memory; with `bf16`/`fp16` (safe for bf16/fp16 training) it is about 1× (the buffers are halved). On GPU every step is cheap; on CPU it frees VRAM but transfers those buffers each step. This is comfortable for SDXL/SD3/Lumina and heavier for FLUX.1 (12B) — there, prefer bf16 buffers (when training in bf16) or `--ewc_buffers_on_cpu`. With reduced-precision buffers the fp32 Fisher accumulator is held on CPU during the (one-time) Fisher phase, so that phase needs no extra VRAM either; this is a one-time transfer, not the per-step transfer of `--ewc_buffers_on_cpu`.
 - EWC is **incompatible with `--fused_backward_pass` / `--blockwise_fused_optimizers`** (the optimizer steps inside the backward hook, which would update weights during the Fisher phase); enabling both raises an error.
 - Works on single and multi-GPU (standard DDP). The Fisher direction `u` is averaged across ranks, so every process applies the same penalty.
 - On resume, the Fisher phase re-runs and re-anchors `theta*` to the resumed weights (the EWC state is not checkpointed), so for a strict anchor to the original base, run EWC in a single training run.
@@ -233,7 +233,7 @@ accelerate launch --mixed_precision bf16 flux_train.py \
 
 メモリ・互換性:
 
-- EWC は学習対象重みと同サイズのバッファを 2 つ（`theta*` と `u`）保持します。`--ewc_buffer_dtype fp32`（既定）ではおよそパラメータ 2 倍、`bf16`/`fp16`（bf16/fp16 学習で安全）では約 1 倍（バッファ半減）です。GPU では毎ステップ軽量、CPU では VRAM を解放する代わりに毎ステップ転送が発生します。SDXL/SD3/Lumina は余裕があり、FLUX.1（12B）では重いため、bf16 バッファ（bf16 学習時）か `--ewc_buffers_on_cpu` を推奨します。
+- EWC は学習対象重みと同サイズのバッファを 2 つ（`theta*` と `u`）保持します。`--ewc_buffer_dtype fp32`（既定）ではおよそパラメータ 2 倍、`bf16`/`fp16`（bf16/fp16 学習で安全）では約 1 倍（バッファ半減）です。GPU では毎ステップ軽量、CPU では VRAM を解放する代わりに毎ステップ転送が発生します。SDXL/SD3/Lumina は余裕があり、FLUX.1（12B）では重いため、bf16 バッファ（bf16 学習時）か `--ewc_buffers_on_cpu` を推奨します。低精度バッファの場合、fp32 の Fisher アキュムレータは（一度きりの）Fisher フェーズ中だけ CPU に置くため、そのフェーズでも追加 VRAM は不要です（`--ewc_buffers_on_cpu` の毎ステップ転送とは異なり一度きりの転送です）。
 - EWC は **`--fused_backward_pass` / `--blockwise_fused_optimizers` と非互換** です（オプティマイザが backward フック内でステップし、Fisher フェーズ中に重みを更新してしまうため）。同時指定はエラーになります。
 - シングル/マルチ GPU 対応: `u` はランク間で平均されるため、全プロセスが同じペナルティを適用します（DDP 一貫）。
 

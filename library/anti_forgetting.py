@@ -183,9 +183,13 @@ class EWCRegularizer:
             # (buffer_dtype) loses nothing while halving VRAM for bf16/fp16 weights; the penalty
             # difference is still computed in fp32 (see penalty()).
             self.theta_star[n] = p.detach().to(dev, dtype=self.buffer_dtype, copy=True)
-            # u accumulates gradients in fp32 during the Fisher phase for a stable sum, then is
-            # downcast to buffer_dtype on finalize so the long training phase stays low-memory.
-            self.u[n] = torch.zeros(self.theta_star[n].shape, dtype=torch.float32, device=dev)
+            # u accumulates gradients in fp32 (a bf16 running sum would swamp small gradients over
+            # hundreds of micro-batches). When the final buffers are reduced precision on GPU, keep
+            # this fp32 accumulator on CPU during the Fisher phase so it does not cost full-fp32 VRAM;
+            # finalize moves it to the storage device at buffer_dtype. That CPU transfer is one-time
+            # (the Fisher phase), unlike --ewc_buffers_on_cpu which transfers every training step.
+            accum_dev = torch.device("cpu") if (self.store_on_cpu or self.buffer_dtype != torch.float32) else dev
+            self.u[n] = torch.zeros(self.theta_star[n].shape, dtype=torch.float32, device=accum_dev)
         self.count = 0
         self.collecting = self.num_fisher_samples > 0
         self.ready = False
