@@ -239,11 +239,20 @@ class EWCRegularizer:
 
     def penalty(self):
         """Global EWC penalty tensor ``lambda * (u^T (theta - theta*))^2`` on the param device,
-        differentiable through the live weights."""
+        differentiable through the live weights.
+
+        ``p.float()`` makes the ``theta - theta*`` difference fp32 (so bf16/fp16 buffers do not lose
+        it to cancellation), and that fp32 result promotes ``u`` in the product. ``u`` and ``theta*``
+        are therefore left at the buffer dtype: upcasting them to fp32 would only allocate a full
+        fp32 copy of the model every step (slow) without changing the result. They are only moved
+        when the buffers live on CPU (``--ewc_buffers_on_cpu``)."""
         s = None
         for n, p in self.params:
-            u = self.u[n].to(device=p.device, dtype=torch.float32)
-            theta_star = self.theta_star[n].to(device=p.device, dtype=torch.float32)
+            u = self.u[n]
+            theta_star = self.theta_star[n]
+            if theta_star.device != p.device:
+                u = u.to(p.device)
+                theta_star = theta_star.to(p.device)
             term = torch.sum(u * (p.float() - theta_star))
             s = term if s is None else s + term
         return self.lam * (s * s)
