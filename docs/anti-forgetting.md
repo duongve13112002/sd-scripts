@@ -180,6 +180,8 @@ where `theta*` is a snapshot of the initial weights. Unlike output distillation,
 
 `u` is estimated up front during a short **Fisher phase**: the first `--ewc_fisher_samples` micro-batches run the normal training loss and backward, their gradients are averaged (and reduced across ranks), and no optimizer step is taken (so `theta*` stays at the initial weights). After that, training proceeds normally with the EWC penalty added to the loss each step.
 
+By default `theta*` is the model you are training, anchored to its own initial weights. With `--ewc_reference_model_path` you can instead anchor `theta*` to a **separate** checkpoint of the same architecture — useful when you continue fine-tuning a model B (itself derived from a base A) but want to stay close to A. The reference is loaded once on CPU, snapshotted into `theta*`, then freed, so it adds **no resident memory** during training; the Fisher direction `u` is still estimated on the trained model. Anchoring to a different model makes the penalty **nonzero from the first step** (it pulls the weights toward the reference along `u` instead of merely resisting drift), so start with a moderate `--ewc_lambda`.
+
 EWC is **full fine-tuning only** — it lives in base-weight space, whereas LoRA optimizes a separate low-rank delta, so passing `--ewc_lambda` to LoRA/network training raises an error. When both EWC and output distillation are enabled, **EWC supersedes distillation** (parameter-space penalty with no resident teacher), and distillation is disabled with a warning. Adaptive λ (`--adaptive_lambda`) can drive the EWC strength over time, just as it does for distillation.
 
 <details>
@@ -195,6 +197,8 @@ L_ewc = lambda * (u^T (theta - theta*))^2
 
 `u` は学習開始前の短い **Fisher フェーズ** で推定します。最初の `--ewc_fisher_samples` 個のマイクロバッチで通常の学習損失と backward を行い、その勾配を平均（ランク間でも平均）し、オプティマイザのステップは踏みません（`theta*` は初期重みのまま）。以降は通常学習に EWC ペナルティを毎ステップ加えます。
 
+既定では `theta*` は学習中のモデル自身（その初期重み）に固定されます。`--ewc_reference_model_path` を指定すると、同一アーキテクチャの**別の**チェックポイントに `theta*` を固定できます（ベース A から派生したモデル B をさらに学習しつつ A に近づけたい場合に有用）。参照モデルは CPU に一度だけ読み込み、`theta*` にスナップショットした後に解放するため、学習中の**常駐メモリは増えません**（Fisher 方向 `u` は学習対象モデルで推定します）。別モデルに固定するとペナルティは**最初のステップから非ゼロ**になり（単にドリフトを抑えるのではなく `u` 方向に参照へ引き寄せる）、`--ewc_lambda` は控えめから始めてください。
+
 EWC は **フルファインチューニング専用** です（ベース重み空間で動作するため）。LoRA/ネットワーク学習に `--ewc_lambda` を渡すとエラーになります。EWC と出力蒸留を同時に有効にした場合は **EWC が蒸留より優先**（teacher 常駐不要のパラメータ空間ペナルティ）され、蒸留は警告とともに無効化されます。Adaptive λ（`--adaptive_lambda`）は蒸留と同様に EWC の強度も時間方向に調整できます。
 
 </details>
@@ -205,13 +209,14 @@ EWC は **フルファインチューニング専用** です（ベース重み�
 - `--ewc_fisher_samples` (int, default `100`): number of micro-batches used to estimate the Fisher direction before training. Must be smaller than your total steps so the Fisher phase finishes.
 - `--ewc_buffers_on_cpu` (flag, default off): store the reference weights (`theta*`) and Fisher vector (`u`) on CPU to save VRAM. This adds a per-step host-device transfer, so it is slower; recommended only for very large models.
 - `--ewc_buffer_dtype` (`fp32`|`bf16`|`fp16`, default `fp32`): precision of the `theta*` and `u` buffers. `fp32` is always safe. `bf16`/`fp16` halve the EWC VRAM and are safe when the trainable weights are already bf16/fp16 (e.g. `--full_bf16`), because `theta*` is a snapshot of the (already low-precision) weight and the penalty difference is still computed in fp32. Avoid reduced precision for fp32 weights — it can quantize away small drift.
+- `--ewc_reference_model_path` (str, default unset): anchor `theta*` to this checkpoint (which must share the trained model's architecture) instead of the trained model's own initial weights. Loaded once on CPU and freed after snapshotting, so it adds no resident VRAM. It covers the **denoiser**; if you also train the text encoders, omit it — a clear error is raised when a trained parameter is missing from the reference. Because it anchors to a different model, the penalty is nonzero from step 0 and actively pulls the trained weights toward the reference along `u`.
 
 Memory and compatibility notes:
 
 - EWC keeps two extra buffers the size of the trainable weights (`theta*` and `u`). With `--ewc_buffer_dtype fp32` (default) this costs roughly 2× the parameter memory; with `bf16`/`fp16` (safe for bf16/fp16 training) it is about 1× (the buffers are halved). On GPU every step is cheap; on CPU it frees VRAM but transfers those buffers each step. This is comfortable for SDXL/SD3/Lumina and heavier for FLUX.1 (12B) — there, prefer bf16 buffers (when training in bf16) or `--ewc_buffers_on_cpu`. With reduced-precision buffers `u` is also accumulated at that precision, which slightly underestimates its magnitude over many micro-batches (swamping); this is harmless for EWC because the gradients are near-collinear (the *direction* of `u` is preserved and `lambda` absorbs the magnitude) and the per-step penalty difference is still computed in fp32. Use fp32 buffers if you want strict fp32 accumulation.
 - EWC is **incompatible with `--fused_backward_pass` / `--blockwise_fused_optimizers`** (the optimizer steps inside the backward hook, which would update weights during the Fisher phase); enabling both raises an error.
 - Works on single and multi-GPU (standard DDP). The Fisher direction `u` is averaged across ranks, so every process applies the same penalty.
-- On resume, the Fisher phase re-runs and re-anchors `theta*` to the resumed weights (the EWC state is not checkpointed), so for a strict anchor to the original base, run EWC in a single training run.
+- On resume, the Fisher phase re-runs and re-anchors `theta*` to the resumed weights (the EWC state is not checkpointed). To anchor to a fixed base regardless of the weights you load or resume from, pass `--ewc_reference_model_path` pointing at that base.
 
 Example (FLUX.1 full fine-tuning with EWC):
 
@@ -223,6 +228,17 @@ accelerate launch --mixed_precision bf16 flux_train.py \
   --ewc_lambda 0.1 --ewc_fisher_samples 100 --ewc_buffers_on_cpu
 ```
 
+Continue fine-tuning a derived model B while staying anchored to the original base A:
+
+```bash
+accelerate launch --mixed_precision bf16 flux_train.py \
+  --pretrained_model_name_or_path model_B.safetensors \
+  --ewc_reference_model_path model_A.safetensors \
+  --dataset_config config.toml \
+  --output_dir output --output_name my_model \
+  --ewc_lambda 0.1 --ewc_fisher_samples 100 --ewc_buffer_dtype bf16
+```
+
 <details>
 <summary>日本語</summary>
 
@@ -230,6 +246,7 @@ accelerate launch --mixed_precision bf16 flux_train.py \
 - `--ewc_fisher_samples`（int、既定 `100`）: 学習前に Fisher 方向を推定するマイクロバッチ数。Fisher フェーズが終わるよう、総ステップ数より小さくしてください。
 - `--ewc_buffers_on_cpu`（フラグ、既定オフ）: 参照重み（`theta*`）と Fisher ベクトル（`u`）を CPU に置いて VRAM を節約します。毎ステップの転送が増えるため遅くなります。非常に大きいモデルにのみ推奨。
 - `--ewc_buffer_dtype`（`fp32`|`bf16`|`fp16`、既定 `fp32`）: `theta*` と `u` バッファの精度。`fp32` は常に安全。`bf16`/`fp16` は EWC の VRAM を半減し、学習重みが既に bf16/fp16 の場合（例: `--full_bf16`）は安全です（`theta*` は低精度重みのスナップショットで、ペナルティの差分は fp32 で計算されるため）。fp32 重みでは小さなドリフトが量子化で失われるため避けてください。
+- `--ewc_reference_model_path`（str、既定なし）: 学習対象自身の初期重みではなく、このチェックポイント（学習対象と同一アーキテクチャ必須）に `theta*` を固定します。CPU に一度読み込み、スナップショット後に解放するため常駐 VRAM は増えません。**denoiser** を対象とし、テキストエンコーダも学習する場合は指定しないでください（参照に無い学習パラメータがあると明確なエラーになります）。別モデルに固定するためペナルティは step 0 から非ゼロで、`u` 方向に参照へ引き寄せます。
 
 メモリ・互換性:
 

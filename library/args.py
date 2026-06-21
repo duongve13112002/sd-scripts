@@ -769,6 +769,16 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "halve the EWC VRAM and are safe when the trainable weights are already bf16/fp16 (e.g. --full_bf16), "
         "since the penalty difference is still computed in fp32; avoid them when the training weights are fp32.",
     )
+    parser.add_argument(
+        "--ewc_reference_model_path",
+        type=str,
+        default=None,
+        help="Anchor the EWC penalty to the weights of this checkpoint (theta*) instead of the weights being "
+        "trained. Must share the architecture of the trained model. When omitted (default), EWC anchors to the "
+        "initial weights of the model being trained. Use it to keep training close to a separate base model "
+        "(e.g. continue fine-tuning B while staying anchored to the original base A). Loaded once on CPU, "
+        "snapshotted, then freed, so it adds no resident VRAM during training.",
+    )
 
 
 def add_masked_loss_arguments(parser: argparse.ArgumentParser):

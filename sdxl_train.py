@@ -658,8 +658,32 @@ def train(args):
 
     loss_recorder = logging_util.LossRecorder()
 
-    # Rank-1 EWC: snapshot initial weights and prepare the Fisher accumulator before training
-    ewc = anti_forgetting.create_ewc_regularizer(args, training_models, accelerator)
+    # Rank-1 EWC: snapshot initial weights and prepare the Fisher accumulator before training.
+    # An optional reference model anchors theta* to a separate base; it is loaded on CPU, snapshotted
+    # inside create_ewc_regularizer, then freed, so it adds no resident memory during training.
+    ewc_reference_params = None
+    ewc_reference_model = None
+    if anti_forgetting.is_ewc_enabled(args) and args.ewc_reference_model_path is not None:
+        logger.info(f"Loading EWC reference (anchor) model from {args.ewc_reference_model_path}")
+        ewc_reference_model_dtype = sdxl_train_util.match_mixed_precision(args, weight_dtype)
+        ewc_reference_models = sdxl_train_util._load_target_model(
+            args.ewc_reference_model_path,
+            args.vae,
+            "sdxl",
+            weight_dtype,
+            accelerator.device if args.lowram else "cpu",
+            ewc_reference_model_dtype,
+            args.disable_mmap_load_safetensors,
+        )
+        ewc_reference_model = ewc_reference_models[4]  # (sd_format, te1, te2, vae, unet, logit_scale, ckpt_info)
+        del ewc_reference_models
+        ewc_reference_params = list(ewc_reference_model.named_parameters())
+    ewc = anti_forgetting.create_ewc_regularizer(
+        args, training_models, accelerator, reference_named_params=ewc_reference_params
+    )
+    if ewc_reference_model is not None:
+        del ewc_reference_model, ewc_reference_params
+        clean_memory_on_device(accelerator.device)
 
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")

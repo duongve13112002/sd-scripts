@@ -362,3 +362,86 @@ def test_adaptive_lambda_args_registered():
     assert defaults.adaptive_lambda_max == 10.0
     on = parser.parse_args(["--adaptive_lambda", "--adaptive_lambda_max", "5.0"])
     assert on.adaptive_lambda is True and on.adaptive_lambda_max == 5.0
+
+
+def test_ewc_reference_model_anchors_theta_star_to_separate_model():
+    # The trained weight starts at 2.0 but theta* must be the reference weight (5.0), so the penalty
+    # measures the distance to the reference, not to the trained model's own starting point.
+    trained = nn.Linear(1, 1, bias=False)
+    reference = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        trained.weight.fill_(2.0)
+        reference.weight.fill_(5.0)
+    reg = anti_forgetting.EWCRegularizer(
+        trained.named_parameters(), lam=1.0, num_fisher_samples=1, store_on_cpu=True,
+        reference_params=list(reference.named_parameters()),
+    )
+    assert reg.theta_star["weight"].item() == pytest.approx(5.0)
+    # estimate u = 1, then penalty = (u^T (theta - theta*))^2 = (1 * (2 - 5))^2 = 9, evaluated at the
+    # trained start weight (2.0): nonzero from the first step because the anchor is a different model
+    trained.weight.grad = torch.tensor([[1.0]])
+    reg.accumulate()
+    assert reg.maybe_finalize()
+    assert reg.penalty().item() == pytest.approx(9.0, abs=1e-4)
+
+
+def test_ewc_reference_missing_parameter_raises():
+    trained = nn.Linear(2, 2)  # has weight and bias
+    reference = nn.Linear(2, 2)
+    ref_without_bias = [(n, p) for n, p in reference.named_parameters() if n != "bias"]
+    with pytest.raises(ValueError, match="missing the trained parameter"):
+        anti_forgetting.EWCRegularizer(
+            trained.named_parameters(), lam=1.0, num_fisher_samples=1, store_on_cpu=True,
+            reference_params=ref_without_bias,
+        )
+
+
+def test_ewc_reference_shape_mismatch_raises():
+    trained = nn.Linear(2, 2)
+    reference = nn.Linear(3, 3)  # same param names, different shapes
+    with pytest.raises(ValueError, match="does not match"):
+        anti_forgetting.EWCRegularizer(
+            trained.named_parameters(), lam=1.0, num_fisher_samples=1, store_on_cpu=True,
+            reference_params=list(reference.named_parameters()),
+        )
+
+
+def test_create_ewc_regularizer_uses_reference_named_params():
+    trained = nn.Linear(1, 1, bias=False)
+    reference = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        trained.weight.fill_(2.0)
+        reference.weight.fill_(7.0)
+    args = argparse.Namespace(
+        ewc_lambda=0.5, ewc_fisher_samples=10, ewc_buffers_on_cpu=True,
+        ewc_reference_model_path="/path/to/base_A.safetensors",
+    )
+    reg = anti_forgetting.create_ewc_regularizer(
+        args, [trained], reference_named_params=list(reference.named_parameters())
+    )
+    assert reg.theta_star["weight"].item() == pytest.approx(7.0)
+
+
+def test_ewc_reference_model_arg_registered():
+    import library.args as args_util
+
+    parser = argparse.ArgumentParser()
+    args_util.add_training_arguments(parser, False)
+    assert parser.parse_args([]).ewc_reference_model_path is None
+    on = parser.parse_args(["--ewc_reference_model_path", "/models/base_A.safetensors"])
+    assert on.ewc_reference_model_path == "/models/base_A.safetensors"
+
+
+def test_validator_warns_when_reference_set_without_ewc(caplog):
+    import logging
+
+    args = argparse.Namespace(
+        ewc_lambda=0.0,
+        ewc_reference_model_path="/models/base_A.safetensors",
+        distillation_weight_high=0.0,
+        distillation_weight_low=0.0,
+        adaptive_lambda=False,
+    )
+    with caplog.at_level(logging.WARNING, logger="library.anti_forgetting"):
+        anti_forgetting.verify_anti_forgetting_args(args)
+    assert any("reference model is ignored" in r.getMessage() for r in caplog.records)

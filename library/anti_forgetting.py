@@ -64,6 +64,11 @@ def verify_anti_forgetting_args(args: argparse.Namespace) -> None:
                 "Rank-1 EWC is incompatible with --blocks_to_swap: block swapping leaves the trainable weights "
                 "split across CPU and GPU, so the EWC penalty cannot be summed across them. Disable one of them."
             )
+    elif getattr(args, "ewc_reference_model_path", None):
+        logger.warning(
+            "--ewc_reference_model_path is set but Rank-1 EWC is disabled (--ewc_lambda is 0), so the reference "
+            "model is ignored. Set --ewc_lambda > 0 to anchor training to it."
+        )
 
     # Quality conflict: full fine-tune EWC supersedes distillation (parameter-space, no
     # resident GPU teacher), so keep EWC and disable distillation.
@@ -169,20 +174,40 @@ class EWCRegularizer:
     """
 
     def __init__(self, named_params, lam: float, num_fisher_samples: int, store_on_cpu: bool,
-                 accelerator=None, buffer_dtype: torch.dtype = torch.float32):
+                 accelerator=None, buffer_dtype: torch.dtype = torch.float32, reference_params=None):
         self.lam = float(lam)
         self.num_fisher_samples = int(num_fisher_samples)
         self.store_on_cpu = bool(store_on_cpu)
         self.buffer_dtype = buffer_dtype
         self.params = [(n, p) for n, p in named_params if p.requires_grad]
+        # theta* defaults to the trained weights themselves. When reference_params is given it is the
+        # weights of a separate model (matched by name), so the penalty anchors training to that model
+        # instead of the initial weights (e.g. continue fine-tuning B while staying anchored to base A).
+        reference = {n: p for n, p in reference_params} if reference_params is not None else None
         self.theta_star = {}
         self.u = {}
         for n, p in self.params:
             dev = torch.device("cpu") if self.store_on_cpu else p.device
-            # theta* is a snapshot of the live weight, so storing it at the weight's own precision
+            if reference is not None:
+                if n not in reference:
+                    raise ValueError(
+                        f"--ewc_reference_model_path is missing the trained parameter '{n}'. The reference model "
+                        f"must share the architecture of the trained model; it anchors the denoiser, so disable "
+                        f"text-encoder training or omit --ewc_reference_model_path."
+                    )
+                src = reference[n]
+                if src.shape != p.shape:
+                    raise ValueError(
+                        f"--ewc_reference_model_path parameter '{n}' has shape {tuple(src.shape)} but the trained "
+                        f"parameter has shape {tuple(p.shape)}; the reference model architecture does not match."
+                    )
+            else:
+                src = p
+            # theta* is a snapshot of the anchor weight, so storing it at the weight's own precision
             # (buffer_dtype) loses nothing while halving VRAM for bf16/fp16 weights; the penalty
-            # difference is still computed in fp32 (see penalty()).
-            self.theta_star[n] = p.detach().to(dev, dtype=self.buffer_dtype, copy=True)
+            # difference is still computed in fp32 (see penalty()). It is placed on the trained
+            # parameter's device so the per-step penalty needs no extra transfer.
+            self.theta_star[n] = src.detach().to(dev, dtype=self.buffer_dtype, copy=True)
             # u is accumulated and stored at buffer_dtype on theta*'s device: fast and low-VRAM.
             # With bf16/fp16 the running sum slightly underestimates u's magnitude over many
             # micro-batches (swamping), but EWC's gradients are near-collinear so u's *direction*
@@ -261,9 +286,14 @@ class EWCRegularizer:
 _EWC_BUFFER_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
 
-def create_ewc_regularizer(args: argparse.Namespace, models, accelerator=None) -> Optional[EWCRegularizer]:
+def create_ewc_regularizer(args: argparse.Namespace, models, accelerator=None,
+                           reference_named_params=None) -> Optional[EWCRegularizer]:
     """Build the EWC regularizer over the trainable params of ``models`` (the denoiser, and
-    any other fine-tuned modules). Snapshot ``theta*`` here, before any optimizer step."""
+    any other fine-tuned modules). Snapshot ``theta*`` here, before any optimizer step.
+
+    ``reference_named_params`` optionally provides the (name, param) pairs of a separate anchor
+    model loaded by the caller (``--ewc_reference_model_path``); when given, ``theta*`` is taken
+    from it instead of the trained weights, so the penalty pulls training toward that model."""
     if not is_ewc_enabled(args):
         return None
     named = []
@@ -278,7 +308,13 @@ def create_ewc_regularizer(args: argparse.Namespace, models, accelerator=None) -
                 "quantize away small weight drift and weaken EWC. Use fp32 buffers when training in fp32; "
                 "reduced-precision buffers are intended for bf16/fp16 weights (e.g. --full_bf16)."
             )
+    if reference_named_params is not None and (accelerator is None or accelerator.is_main_process):
+        logger.info(
+            f"Rank-1 EWC: anchoring theta* to the reference model at {args.ewc_reference_model_path} "
+            f"(instead of the initial trained weights)."
+        )
     return EWCRegularizer(
         named, args.ewc_lambda, args.ewc_fisher_samples,
         getattr(args, "ewc_buffers_on_cpu", False), accelerator, buffer_dtype,
+        reference_named_params,
     )
