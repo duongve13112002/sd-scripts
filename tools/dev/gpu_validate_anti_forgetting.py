@@ -232,13 +232,15 @@ def get_data(args, device):
     return old_loader, new_loader, old_eval, new_eval
 
 
-def build_args_namespace(args, ewc_lambda=0.0, distill_high=0.0, distill_low=0.0, adaptive=False):
+def build_args_namespace(args, ewc_lambda=0.0, distill_high=0.0, distill_low=0.0, adaptive=False,
+                         ewc_reference_model_path=None):
     """Mirror the real training args the shipped helpers read, with the repo defaults."""
     return SimpleNamespace(
         loss_type="l2",
         ewc_lambda=ewc_lambda,
         ewc_fisher_samples=args.fisher_samples,
         ewc_buffers_on_cpu=args.ewc_buffers_on_cpu,
+        ewc_reference_model_path=ewc_reference_model_path,
         distillation_weight_high=distill_high,
         distillation_weight_low=distill_low,
         adaptive_lambda=adaptive,
@@ -337,6 +339,75 @@ def train_config(cfg, theta_star, args, new_loader, abar, device, reg_ref, old_e
     return new_loss, old_loss, along, perp
 
 
+def validate_reference_anchor(args, theta_star, new_loader, abar, device):
+    """Exercise the --ewc_reference_model_path path on the GPU end to end: anchor theta* to a
+    separate model (not the trained start), then confirm the penalty pulls the trained weights
+    toward that reference. Also checks the name/shape guards that protect against a mismatched
+    reference. This validates the device/dtype/backward path the CPU unit tests cannot."""
+    print()
+    print("=== reference-anchor validation (--ewc_reference_model_path) ===")
+
+    trained = UNet(args.base_channels).to(device)
+    trained.load_state_dict(theta_star)  # the model being fine-tuned (B), at its start
+
+    # A distinct reference model (A): fresh init, so theta* clearly differs from the trained start.
+    torch.manual_seed(args.seed + 999)
+    reference = UNet(args.base_channels).to(device)
+    ref_params = list(reference.named_parameters())
+
+    na = build_args_namespace(args, ewc_lambda=1.0, ewc_reference_model_path="<reference-model>")
+    reg = create_ewc_regularizer(na, [trained], accelerator=None, reference_named_params=ref_params)
+
+    ref_by_name = dict(ref_params)
+    anchored_to_reference = all(
+        torch.allclose(reg.theta_star[n].to(device).float(), ref_by_name[n].detach().float(), atol=1e-5)
+        for n in reg.theta_star
+    )
+    print(f"theta* sourced from the reference model (not the trained start): {'OK' if anchored_to_reference else 'FAIL'}")
+
+    fisher_phase(trained, reg, new_loader, abar, args.objective, device)
+    pen_start = float(reg.penalty().detach())
+    along_start, _ = drift_geometry(trained, reg)  # |u^T (theta - reference)| at the start
+    print(f"penalty nonzero at the trained start: {pen_start:.4f} ({'OK' if pen_start > 0 else 'FAIL'})")
+
+    # A few real fine-tune steps with only the reference penalty: it should pull the trained weights
+    # toward the reference along u, shrinking |u^T (theta - reference)|.
+    optimizer = torch.optim.Adam(trained.parameters(), lr=args.lr)
+    steps = 4 if args.smoke else 80
+    trained.train()
+    for _ in range(steps):
+        x0 = next(new_loader).to(device)
+        x_t, t_model, target, _ = diffuse(args.objective, x0, abar)
+        optimizer.zero_grad(set_to_none=True)
+        loss = F.mse_loss(trained(x_t, t_model), target).float() + reg.penalty()
+        loss.backward()
+        optimizer.step()
+    along_end, _ = drift_geometry(trained, reg)
+    pulled = along_end < along_start
+    print(f"|drift_T u| toward reference: start={along_start:.4f} -> after {steps} steps={along_end:.4f} "
+          f"({'OK (penalty pulls toward A)' if pulled else 'FAIL'})")
+
+    missing_ok = False
+    try:
+        create_ewc_regularizer(na, [trained], accelerator=None, reference_named_params=ref_params[:-1])
+    except ValueError:
+        missing_ok = True
+    print(f"guard: a reference missing a trained parameter raises ValueError: {'OK' if missing_ok else 'FAIL'}")
+
+    name0, p0 = ref_params[0]
+    wrong_shape = [(name0, torch.zeros((p0.shape[0] + 1,) + tuple(p0.shape[1:]), device=device))] + ref_params[1:]
+    shape_ok = False
+    try:
+        create_ewc_regularizer(na, [trained], accelerator=None, reference_named_params=wrong_shape)
+    except ValueError:
+        shape_ok = True
+    print(f"guard: a shape-mismatched reference raises ValueError: {'OK' if shape_ok else 'FAIL'}")
+
+    passed = anchored_to_reference and pen_start > 0 and pulled and missing_ok and shape_ok
+    print(f"reference-anchor path {'validated' if passed else 'FAILED'}.")
+    return passed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -418,6 +489,8 @@ def main():
     ref.load_state_dict(theta_star)
     reg_ref = create_ewc_regularizer(build_args_namespace(args, ewc_lambda=1.0), [ref], accelerator=None)
     fisher_phase(ref, reg_ref, new_loader, abar, args.objective, device)
+
+    validate_reference_anchor(args, theta_star, new_loader, abar, device)
 
     configs = [{"name": "baseline (none)", "args": build_args_namespace(args)}]
     for lam in args.ewc_lambdas:
