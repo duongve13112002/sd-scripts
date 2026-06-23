@@ -137,3 +137,143 @@ def test_registry_has_all_supported_models():
     for mt in ["sd", "sdxl", "sd3", "flux", "lumina", "anima", "hunyuan_image"]:
         assert mt in extract_lora.MODEL_REGISTRY
         assert extract_lora.MODEL_REGISTRY[mt].network_module.startswith("networks.")
+
+
+# --- orthogonal-to-base projection ---
+
+def test_orthogonalize_diff_is_orthogonal_to_base_topk():
+    from networks.oplora import _compute_basis
+
+    torch.manual_seed(0)
+    w_org = torch.randn(8, 8)
+    diff = torch.randn(8, 8)
+    proj = extract_lora.orthogonalize_diff(diff, w_org, rank=2, full_svd=True)
+
+    u_k, v_k = _compute_basis(w_org, 2, use_lowrank_svd=False)
+    # the projected difference must not move along the base's top-k left/right singular directions
+    assert torch.allclose(u_k.t() @ proj, torch.zeros(2, 8), atol=1e-4)
+    assert torch.allclose(proj @ v_k, torch.zeros(8, 2), atol=1e-4)
+    # and it must actually change the diff (it dropped the top-k component)
+    assert not torch.allclose(proj, diff, atol=1e-3)
+
+
+# --- LoKr (nearest Kronecker product) extraction ---
+
+def _kron(w1, w2):
+    return torch.kron(w1, w2)
+
+
+def test_lokr_linear_full_reconstructs_kron():
+    from networks.lokr import factorization
+
+    out_dim, in_dim = 8, 8
+    out_l, out_k = factorization(out_dim, -1)  # (2, 4)
+    in_m, in_n = factorization(in_dim, -1)     # (2, 4)
+    torch.manual_seed(1)
+    w1 = torch.randn(out_l, in_m)
+    w2 = torch.randn(out_k, in_n)
+    diff = _kron(w1, w2)  # exactly a Kronecker product
+
+    keys = extract_lora.extract_lokr_keys(diff, factor=-1, dim=4)  # dim>=2 -> full w2
+    assert ".lokr_w1" in keys and ".lokr_w2" in keys
+    recon = _kron(keys[".lokr_w1"], keys[".lokr_w2"])
+    assert torch.allclose(recon, diff, atol=1e-4)
+
+
+def test_lokr_linear_lowrank_reconstructs_kron():
+    from networks.lokr import factorization
+
+    out_dim, in_dim = 8, 8
+    out_l, out_k = factorization(out_dim, -1)
+    in_m, in_n = factorization(in_dim, -1)
+    torch.manual_seed(2)
+    w1 = torch.randn(out_l, in_m)
+    # rank-1 w2 so the low-rank (dim=1) extraction is exact
+    w2 = torch.randn(out_k, 1) @ torch.randn(1, in_n)
+    diff = _kron(w1, w2)
+
+    keys = extract_lora.extract_lokr_keys(diff, factor=-1, dim=1)  # dim<2 -> low-rank w2
+    assert ".lokr_w2_a" in keys and ".lokr_w2_b" in keys
+    assert int(keys[".alpha"].item()) == 1  # scale = alpha / lora_dim = 1
+    recon = _kron(keys[".lokr_w1"], keys[".lokr_w2_a"] @ keys[".lokr_w2_b"])
+    assert torch.allclose(recon, diff, atol=1e-4)
+
+
+def test_lokr_conv1x1_reconstructs():
+    from networks.lokr import factorization
+
+    out_dim, in_dim = 8, 8
+    out_l, out_k = factorization(out_dim, -1)
+    in_m, in_n = factorization(in_dim, -1)
+    torch.manual_seed(3)
+    w1 = torch.randn(out_l, in_m)
+    w2 = torch.randn(out_k, in_n)
+    diff2d = _kron(w1, w2)
+    diff = diff2d.unsqueeze(-1).unsqueeze(-1)  # (out, in, 1, 1)
+
+    keys = extract_lora.extract_lokr_keys(diff, factor=-1, dim=4)
+    recon = _kron(keys[".lokr_w1"], keys[".lokr_w2"])  # 2D, module re-expands to conv at load
+    assert torch.allclose(recon, diff2d, atol=1e-4)
+
+
+def test_lokr_conv3x3_flat_reconstructs():
+    from networks.lokr import factorization
+
+    out_dim, in_ch, k = 8, 8, 3
+    out_l, out_k = factorization(out_dim, -1)
+    in_m, in_n = factorization(in_ch, -1)
+    kprod = k * k
+    torch.manual_seed(4)
+    w1 = torch.randn(out_l, in_m)
+    # rank-2 w2 (out_k, in_n*kprod) so dim=2 low-rank extraction is exact
+    w2 = torch.randn(out_k, 2) @ torch.randn(2, in_n * kprod)
+    diff_2d = _kron(w1, w2)  # (out_dim, in_ch*kprod)
+    diff = diff_2d.reshape(out_dim, in_ch, k, k)
+
+    keys = extract_lora.extract_lokr_keys(diff, factor=-1, dim=2)
+    assert ".lokr_w2_a" in keys and ".lokr_w2_b" in keys
+    recon_2d = _kron(keys[".lokr_w1"], keys[".lokr_w2_a"] @ keys[".lokr_w2_b"])
+    recon = recon_2d.reshape(out_dim, in_ch, k, k)
+    assert torch.allclose(recon, diff, atol=1e-4)
+
+
+# --- build_state_dict dispatch ---
+
+def _build_args(**kw):
+    base = dict(
+        extract_as="lora", dim=4, conv_dim=None, clamp_quantile=0.99, device=None,
+        orthogonal_to_base=False, orthogonal_rank=16, orthogonal_full_svd=False, lokr_factor=-1,
+    )
+    base.update(kw)
+    return types.SimpleNamespace(**base)
+
+
+def test_build_state_dict_lokr_keys():
+    w_org = torch.zeros(8, 8)
+    w_tuned = torch.randn(8, 8)
+    sd = extract_lora.build_state_dict(_build_args(extract_as="lokr", dim=4), [("lora_unet_fc", w_org, w_tuned)], None)
+    assert "lora_unet_fc.lokr_w1" in sd
+    assert "lora_unet_fc.lokr_w2" in sd or "lora_unet_fc.lokr_w2_a" in sd
+    assert "lora_unet_fc.alpha" in sd
+
+
+def test_build_state_dict_lora_orthogonal_keys_and_property():
+    from networks.oplora import _compute_basis
+
+    torch.manual_seed(5)
+    w_org = torch.randn(8, 8)
+    w_tuned = w_org + torch.randn(8, 8)
+    sd = extract_lora.build_state_dict(
+        _build_args(extract_as="lora", dim=8, orthogonal_to_base=True, orthogonal_rank=2, orthogonal_full_svd=True),
+        [("lora_unet_fc", w_org, w_tuned)], None,
+    )
+    up = sd["lora_unet_fc.lora_up.weight"]
+    down = sd["lora_unet_fc.lora_down.weight"]
+    recon = up @ down  # the extracted delta
+    u_k, _ = _compute_basis(w_org, 2, use_lowrank_svd=False)
+    # the extracted delta is (nearly) orthogonal to the base's top-k left subspace: its top-k
+    # component is far smaller than that of the raw difference. (SVD outlier clamping keeps it
+    # approximate rather than exactly zero.)
+    proj_component = (u_k.t() @ recon).norm()
+    raw_component = (u_k.t() @ (w_tuned - w_org)).norm()
+    assert proj_component < 0.1 * raw_component

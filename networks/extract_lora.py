@@ -264,6 +264,124 @@ def build_lora_state_dict(
     return lora_sd
 
 
+def orthogonalize_diff(diff: torch.Tensor, w_org: torch.Tensor, rank: int, full_svd: bool) -> torch.Tensor:
+    """Project a weight difference onto the orthogonal complement of the base weight's top-k singular
+    subspace (OPLoRA-style): the result keeps only the part of ΔW that does NOT move along the base's
+    most important directions. This is lossy by design (it drops the top-k component), so the extracted
+    LoRA preserves the base's top-k singular triples. Reuses oplora's basis computation."""
+    from networks.oplora import _compute_basis
+
+    basis = _compute_basis(w_org, rank, use_lowrank_svd=not full_svd)
+    if basis is None:
+        return diff
+    u_k, v_k = basis  # (out, k), (in_flat, k), orthonormal columns
+    shape = diff.shape
+    d = diff.reshape(shape[0], -1).to(torch.float)
+    u_k = u_k.to(d.dtype)
+    v_k = v_k.to(d.dtype)
+    # P_L d P_R with P_L = I - u_k u_k^T, P_R = I - v_k v_k^T, computed without forming full projectors
+    ut_d = u_k.t() @ d            # (k, in_flat)
+    d_v = d @ v_k                 # (out, k)
+    ut_d_v = ut_d @ v_k           # (k, k)
+    proj = d - u_k @ ut_d - d_v @ v_k.t() + u_k @ (ut_d_v @ v_k.t())
+    return proj.reshape(shape)
+
+
+def _nearest_kron(mat: torch.Tensor, out_l: int, out_k: int, c1: int, c2: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Best rank-1 nearest-Kronecker-product factorization (Van Loan–Pitsianis): find w1 (out_l, c1)
+    and w2 (out_k, c2) minimizing ||mat - kron(w1, w2)||, where mat is (out_l*out_k, c1*c2) laid out
+    in torch.kron order. Returns (w1, w2)."""
+    rearranged = mat.reshape(out_l, out_k, c1, c2).permute(0, 2, 1, 3).reshape(out_l * c1, out_k * c2)
+    U, S, Vh = torch.linalg.svd(rearranged, full_matrices=False)
+    s = torch.sqrt(S[0])
+    w1 = (U[:, 0] * s).reshape(out_l, c1)
+    w2 = (Vh[0, :] * s).reshape(out_k, c2)
+    return w1, w2
+
+
+def _low_rank(mat: torch.Tensor, rank: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Factor mat (a, b) into a@b with inner dim rank (balanced sqrt-singular split)."""
+    U, S, Vh = torch.linalg.svd(mat, full_matrices=False)
+    rank = min(rank, S.shape[0])
+    sqrt_s = torch.sqrt(S[:rank])
+    a = U[:, :rank] * sqrt_s  # (a, rank)
+    b = sqrt_s.unsqueeze(1) * Vh[:rank, :]  # (rank, b)
+    return a, b
+
+
+def extract_lokr_keys(diff: torch.Tensor, factor: int, dim: int) -> Dict[str, torch.Tensor]:
+    """Extract LoKr factors (suffix-keyed, e.g. '.lokr_w1') from a single weight difference by
+    nearest-Kronecker-product, with low-rank w2 when the rank is small. Covers Linear, conv-1x1, and
+    conv-3x3 'flat' mode (the LoKr default). conv tucker / full-conv-w2 are not produced here."""
+    from networks.lokr import factorization
+
+    is_conv = diff.dim() == 4
+    out_dim = diff.shape[0]
+    if is_conv:
+        in_ch, k1, k2 = diff.shape[1], diff.shape[2], diff.shape[3]
+        conv1x1 = k1 == 1 and k2 == 1
+        kprod = k1 * k2
+    else:
+        in_ch = diff.shape[1]
+        conv1x1 = False
+        kprod = 1
+
+    in_m, in_n = factorization(in_ch, factor)
+    out_l, out_k = factorization(out_dim, factor)
+    diff = diff.to(torch.float)
+    keys: Dict[str, torch.Tensor] = {}
+
+    if (not is_conv) or conv1x1:
+        # Linear and conv-1x1: 2D Kronecker (conv-1x1 squeezes; the module re-expands at load)
+        mat = diff.reshape(out_dim, in_ch)
+        w1, w2 = _nearest_kron(mat, out_l, out_k, in_m, in_n)
+        keys[".lokr_w1"] = w1
+        if dim < max(out_k, in_n) / 2:
+            d = min(dim, out_k, in_n)
+            w2a, w2b = _low_rank(w2, d)
+            keys[".lokr_w2_a"] = w2a
+            keys[".lokr_w2_b"] = w2b
+            keys[".alpha"] = torch.tensor(float(d))  # scale = alpha / lora_dim = 1
+        else:
+            keys[".lokr_w2"] = w2  # full w2: the module forces scale = 1
+            keys[".alpha"] = torch.tensor(float(min(out_k, in_n)))
+    else:
+        # conv-3x3 'flat': fold the kernel into w2's columns, factor, then low-rank w2
+        mat = diff.reshape(out_dim, in_ch * kprod)
+        w1, w2 = _nearest_kron(mat, out_l, out_k, in_m, in_n * kprod)
+        d = min(dim, out_k, in_n * kprod)
+        w2a, w2b = _low_rank(w2, d)
+        keys[".lokr_w1"] = w1
+        keys[".lokr_w2_a"] = w2a
+        keys[".lokr_w2_b"] = w2b
+        keys[".alpha"] = torch.tensor(float(d))
+    return keys
+
+
+def build_state_dict(args, weight_pairs, save_dtype) -> Dict[str, torch.Tensor]:
+    """Assemble the adapter state dict from (lora_name, W_org, W_tuned) triples, honoring
+    --extract_as (lora|lokr) and --orthogonal_to_base."""
+    sd: Dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        for lora_name, w_org, w_tuned in tqdm(weight_pairs):
+            diff = w_tuned.to(torch.float) - w_org.to(torch.float)
+            if args.orthogonal_to_base:
+                diff = orthogonalize_diff(diff, w_org, args.orthogonal_rank, args.orthogonal_full_svd)
+
+            if args.extract_as == "lokr":
+                for suffix, tensor in extract_lokr_keys(diff, args.lokr_factor, args.dim).items():
+                    out = tensor if suffix == ".alpha" else tensor.to("cpu", dtype=save_dtype)
+                    sd[lora_name + suffix] = out.contiguous() if torch.is_tensor(out) else out
+            else:
+                conv2d_3x3 = diff.dim() == 4 and tuple(diff.size()[2:4]) != (1, 1)
+                rank = args.conv_dim if (conv2d_3x3 and args.conv_dim is not None) else args.dim
+                up, down = extract_up_down(diff, rank, args.clamp_quantile, args.device, save_dtype)
+                sd[lora_name + ".lora_up.weight"] = up
+                sd[lora_name + ".lora_down.weight"] = down
+                sd[lora_name + ".alpha"] = torch.tensor(down.size()[0]).to(torch.float)
+    return sd
+
+
 def svd(args):
     if args.model_type not in MODEL_REGISTRY:
         raise ValueError(f"unknown --model_type {args.model_type}; choices: {', '.join(MODEL_REGISTRY)}")
@@ -275,19 +393,34 @@ def svd(args):
             f"for this family (its text encoders are shared/frozen)."
         )
 
+    if args.extract_as == "lokr" and args.orthogonal_to_base:
+        raise ValueError(
+            "--orthogonal_to_base cannot be combined with --extract_as lokr: the orthogonal projection "
+            "breaks the Kronecker structure (it does not factor into w1 x w2). Use --extract_as lora with "
+            "--orthogonal_to_base, or drop --orthogonal_to_base for LoKr."
+        )
+
     save_dtype = str_to_dtype(args.save_precision)
 
     weight_pairs, network_module = collect_weight_pairs(args, args.dim, with_te)
-    logger.info(f"calculating LoRA by svd for {len(weight_pairs)} modules (rank={args.dim}, conv_dim={args.conv_dim})")
-    lora_sd = build_lora_state_dict(weight_pairs, args.dim, args.conv_dim, args.clamp_quantile, args.device, save_dtype)
+    logger.info(
+        f"extracting {args.extract_as} for {len(weight_pairs)} modules "
+        f"(rank={args.dim}, conv_dim={args.conv_dim}, orthogonal_to_base={args.orthogonal_to_base})"
+    )
+    state_dict = build_state_dict(args, weight_pairs, save_dtype)
 
-    # minimum metadata so the LoRA loads in the matching trainer / inference
-    net_kwargs = {}
-    if args.conv_dim is not None:
-        net_kwargs["conv_dim"] = str(args.conv_dim)
-        net_kwargs["conv_alpha"] = str(args.conv_dim)
+    # minimum metadata so the adapter loads in the matching trainer / inference
+    if args.extract_as == "lokr":
+        ss_network_module = "networks.lokr"
+        net_kwargs = {"factor": str(args.lokr_factor)}
+    else:
+        ss_network_module = network_module
+        net_kwargs = {}
+        if args.conv_dim is not None:
+            net_kwargs["conv_dim"] = str(args.conv_dim)
+            net_kwargs["conv_alpha"] = str(args.conv_dim)
     metadata = {
-        "ss_network_module": network_module,
+        "ss_network_module": ss_network_module,
         "ss_network_dim": str(args.dim),
         "ss_network_alpha": str(float(args.dim)),
         "ss_network_args": json.dumps(net_kwargs),
@@ -295,17 +428,17 @@ def svd(args):
     if not args.no_metadata:
         title = os.path.splitext(os.path.basename(args.save_to))[0]
         sai_metadata = sai_model_spec.build_metadata(
-            lora_sd, False, False, False, True, False, time.time(), title, None
+            state_dict, False, False, False, True, False, time.time(), title, None
         )
         metadata.update(sai_metadata)
 
     if save_dtype is not None:
-        for key in list(lora_sd.keys()):
-            lora_sd[key] = lora_sd[key].to(save_dtype)
+        for key in list(state_dict.keys()):
+            state_dict[key] = state_dict[key].to(save_dtype)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.save_to)), exist_ok=True)
-    save_file(lora_sd, args.save_to, metadata=metadata)
-    logger.info(f"LoRA weights saved to {args.save_to} ({len(weight_pairs)} modules)")
+    save_file(state_dict, args.save_to, metadata=metadata)
+    logger.info(f"{args.extract_as} weights saved to {args.save_to} ({len(weight_pairs)} modules)")
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -320,7 +453,30 @@ def setup_parser() -> argparse.ArgumentParser:
         help="tuned model; the LoRA is the difference org -> tuned / 派生モデル（LoRAは元→派生の差分）",
     )
     parser.add_argument("--save_to", type=str, required=True, help="destination .safetensors file / 保存先")
-    parser.add_argument("--dim", type=int, default=4, help="rank of the extracted LoRA (default 4) / LoRAのランク")
+    parser.add_argument(
+        "--extract_as", type=str, default="lora", choices=["lora", "lokr"],
+        help="adapter format to extract: 'lora' (SVD of the difference) or 'lokr' (Kronecker, smaller file) / "
+        "抽出する形式: lora か lokr",
+    )
+    parser.add_argument("--dim", type=int, default=4, help="rank of the extracted adapter (default 4) / ランク")
+    parser.add_argument(
+        "--lokr_factor", type=int, default=-1,
+        help="LoKr Kronecker factorization factor (-1 = balanced, as in training) / LoKrの分解factor（-1で自動）",
+    )
+    parser.add_argument(
+        "--orthogonal_to_base", action="store_true",
+        help="(lora only) project the extracted LoRA onto the orthogonal complement of the base model's top-k "
+        "singular subspace (OPLoRA-style), keeping only the part that does not overwrite the base. Lossy by "
+        "design / (loraのみ) ベースのtop-k特異部分空間の直交補空間へ射影（OPLoRA流）。base上書き部分を捨てる",
+    )
+    parser.add_argument(
+        "--orthogonal_rank", type=int, default=16,
+        help="top-k of the base weight protected by --orthogonal_to_base (default 16) / 保護するtop-k",
+    )
+    parser.add_argument(
+        "--orthogonal_full_svd", action="store_true",
+        help="use full SVD (not randomized) when computing the base top-k basis for --orthogonal_to_base / 直交基底に完全SVDを使う",
+    )
     parser.add_argument(
         "--conv_dim", type=int, default=None,
         help="rank for conv (3x3) layers; when set, conv layers are also extracted (SD/SDXL only have conv). "
