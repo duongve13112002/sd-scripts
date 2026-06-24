@@ -15,11 +15,17 @@ import json
 import os
 import time
 import importlib
+import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from safetensors.torch import save_file
 from tqdm import tqdm
+
+# Allow running directly as `python networks/extract_lora.py` from the repo root: put the repo root
+# (the parent of this file's directory) on sys.path so `library` and `networks` import. Without this,
+# running a script that lives in networks/ puts only networks/ on the path, not the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from library import sai_model_spec
 from library.utils import setup_logging
