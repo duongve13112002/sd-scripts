@@ -83,9 +83,18 @@ python networks/extract_lora.py --model_type anima \
   Only SD/SDXL have conv layers; the DiT families are Linear-only, so this is usually irrelevant for them.
 - `--include_text_encoder` (flag): also extract a LoRA for the text encoder(s). **SD/SDXL only** — for the
   DiT families the text encoders are shared/frozen, so only the denoiser is extracted and this flag is ignored.
-- `--device` (e.g. `cuda`): device for the SVD; the difference is always computed in float for precision.
+- `--device` (e.g. `cuda`): device for the computation (SVD / projection for all of LoRA, LoKr, and
+  `--orthogonal_to_base`); the difference is always computed in float for precision. Defaults to
+  `--load_device` when that is non-CPU, otherwise CPU.
+- `--load_device` (default `cpu`): where the two models are loaded.
+  - `cpu` (default) — models stay in RAM; with `--device cuda` each layer's difference is moved to the GPU
+    for the SVD. **Memory-safe for big models** (FLUX 12B): the GPU only ever holds one layer at a time.
+  - `cuda` — keep the weights on the GPU (no per-layer transfer, fastest), but this costs **~2× the model
+    size in VRAM** (both models resident). Only for models that fit (e.g. Anima on a 16 GB+ GPU); a 12 B
+    model will OOM. Setting `--load_device cuda` alone makes the compute run on the GPU too. Pair with
+    `--load_precision bf16` to halve the load VRAM.
 - `--load_precision` (`float`|`fp16`|`bf16`, default `float`): precision the two models are loaded in.
-  Use `bf16` for very large models (e.g. FLUX 12B) to halve load memory.
+  Use `bf16` for very large models (e.g. FLUX 12B) or when `--load_device cuda` to halve load memory.
 - `--save_precision` (`float`|`fp16`|`bf16`): precision of the saved LoRA.
 - `--clamp_quantile` (default 0.99): clamps SVD outliers for numerical stability.
 - `--no_metadata`: write only the minimal `ss_` metadata (skip SAI model-spec tags).
@@ -145,7 +154,9 @@ python networks/extract_lora.py --model_type anima \
 ```
 
 主なオプション: `--dim`（ランク）、`--conv_dim`（conv-3×3 のランク。SD/SDXL のみ）、`--include_text_encoder`
-（SD/SDXL のみ。DiT 系では無視）、`--device`、`--load_precision`（大規模モデルは `bf16` 推奨）、`--save_precision`、
+（SD/SDXL のみ。DiT 系では無視）、`--device`（計算デバイス）、`--load_device`（モデルを読み込むデバイス。既定 cpu。
+`cuda` にするとモデルを GPU 常駐＝転送なしで最速だがモデル約2倍の VRAM が必要。大規模モデル（FLUX）は cpu のまま
+`--device cuda` を推奨）、`--load_precision`（大規模や `--load_device cuda` 時は `bf16` 推奨）、`--save_precision`、
 `--clamp_quantile`、`--no_metadata`、および各トレーナー由来の読み込みオプション
 （`--v2`、`--disable_mmap_load_safetensors`、`--attn_mode`/`--split_attn`、`--use_flash_attn`）。
 

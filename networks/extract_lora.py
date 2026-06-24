@@ -52,7 +52,9 @@ def str_to_dtype(p: Optional[str]) -> Optional[torch.dtype]:
 def _load_sd(args, path: str, dtype: Optional[torch.dtype], with_te: bool):
     from library import model_util
 
-    text_encoder, _, unet = model_util.load_models_from_stable_diffusion_checkpoint(args.v2, path, device="cpu", dtype=dtype)
+    text_encoder, _, unet = model_util.load_models_from_stable_diffusion_checkpoint(
+        args.v2, path, device=args.load_device, dtype=dtype
+    )
     return unet, ([text_encoder] if with_te else [])
 
 
@@ -60,7 +62,7 @@ def _load_sdxl(args, path: str, dtype: Optional[torch.dtype], with_te: bool):
     from library import sdxl_model_util
 
     te1, te2, _, unet, _, _ = sdxl_model_util.load_models_from_sdxl_checkpoint(
-        sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, path, "cpu", dtype=dtype, disable_mmap=args.disable_mmap_load_safetensors
+        sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, path, args.load_device, dtype=dtype, disable_mmap=args.disable_mmap_load_safetensors
     )
     return unet, ([te1, te2] if with_te else [])
 
@@ -68,7 +70,7 @@ def _load_sdxl(args, path: str, dtype: Optional[torch.dtype], with_te: bool):
 def _load_flux(args, path: str, dtype: Optional[torch.dtype], with_te: bool):
     from library import flux_utils
 
-    _, model = flux_utils.load_flow_model(path, dtype, "cpu", args.disable_mmap_load_safetensors, model_type="flux")
+    _, model = flux_utils.load_flow_model(path, dtype, args.load_device, args.disable_mmap_load_safetensors, model_type="flux")
     return model, []
 
 
@@ -76,8 +78,8 @@ def _load_sd3(args, path: str, dtype: Optional[torch.dtype], with_te: bool):
     from library import sd3_utils
     from library.safetensors_utils import load_safetensors
 
-    state_dict = load_safetensors(path, "cpu", args.disable_mmap_load_safetensors, dtype)
-    mmdit = sd3_utils.load_mmdit(state_dict, dtype, "cpu")
+    state_dict = load_safetensors(path, args.load_device, args.disable_mmap_load_safetensors, dtype)
+    mmdit = sd3_utils.load_mmdit(state_dict, dtype, args.load_device)
     return mmdit, []
 
 
@@ -85,7 +87,7 @@ def _load_lumina(args, path: str, dtype: Optional[torch.dtype], with_te: bool):
     from library import lumina_util
 
     lumina = lumina_util.load_lumina_model(
-        path, dtype, torch.device("cpu"), disable_mmap=args.disable_mmap_load_safetensors, use_flash_attn=args.use_flash_attn
+        path, dtype, torch.device(args.load_device), disable_mmap=args.disable_mmap_load_safetensors, use_flash_attn=args.use_flash_attn
     )
     return lumina, []
 
@@ -93,7 +95,9 @@ def _load_lumina(args, path: str, dtype: Optional[torch.dtype], with_te: bool):
 def _load_anima(args, path: str, dtype: Optional[torch.dtype], with_te: bool):
     from library import anima_utils
 
-    dit = anima_utils.load_anima_model("cpu", path, args.attn_mode, args.split_attn, "cpu", dit_weight_dtype=dtype)
+    dit = anima_utils.load_anima_model(
+        args.load_device, path, args.attn_mode, args.split_attn, args.load_device, dit_weight_dtype=dtype
+    )
     return dit, []
 
 
@@ -101,7 +105,7 @@ def _load_hunyuan_image(args, path: str, dtype: Optional[torch.dtype], with_te: 
     from library import hunyuan_image_models
 
     dit = hunyuan_image_models.load_hunyuan_image_model(
-        "cpu", path, args.attn_mode, args.split_attn, "cpu", dtype
+        args.load_device, path, args.attn_mode, args.split_attn, args.load_device, dtype
     )
     return dit, []
 
@@ -270,21 +274,35 @@ def build_lora_state_dict(
     return lora_sd
 
 
+def _base_topk_basis(weight: torch.Tensor, rank: int, full_svd: bool):
+    """Top-k left/right singular vectors of a (possibly conv) weight, kept on the weight's own device.
+    Device-aware variant of oplora._compute_basis (which forces CPU), so the projection can run on the
+    same device as the weights. Returns (U_k [out, k], V_k [in_flat, k]) or None if too small."""
+    w = weight.detach().reshape(weight.shape[0], -1).float()
+    k = min(rank, w.shape[0], w.shape[1])
+    if k <= 0:
+        return None
+    if not full_svd:
+        q = min(w.shape[0], w.shape[1], k + 8)  # randomized SVD with a little oversampling
+        u, _, v = torch.svd_lowrank(w, q=q)
+        return u[:, :k].contiguous(), v[:, :k].contiguous()
+    u, _, vh = torch.linalg.svd(w, full_matrices=False)
+    return u[:, :k].contiguous(), vh[:k, :].t().contiguous()
+
+
 def orthogonalize_diff(diff: torch.Tensor, w_org: torch.Tensor, rank: int, full_svd: bool) -> torch.Tensor:
     """Project a weight difference onto the orthogonal complement of the base weight's top-k singular
     subspace (OPLoRA-style): the result keeps only the part of ΔW that does NOT move along the base's
     most important directions. This is lossy by design (it drops the top-k component), so the extracted
-    LoRA preserves the base's top-k singular triples. Reuses oplora's basis computation."""
-    from networks.oplora import _compute_basis
-
-    basis = _compute_basis(w_org, rank, use_lowrank_svd=not full_svd)
+    LoRA preserves the base's top-k singular triples. Runs on whatever device ``diff`` / ``w_org`` are on."""
+    basis = _base_topk_basis(w_org, rank, full_svd)
     if basis is None:
         return diff
     u_k, v_k = basis  # (out, k), (in_flat, k), orthonormal columns
     shape = diff.shape
     d = diff.reshape(shape[0], -1).to(torch.float)
-    u_k = u_k.to(d.dtype)
-    v_k = v_k.to(d.dtype)
+    u_k = u_k.to(device=d.device, dtype=d.dtype)
+    v_k = v_k.to(device=d.device, dtype=d.dtype)
     # P_L d P_R with P_L = I - u_k u_k^T, P_R = I - v_k v_k^T, computed without forming full projectors
     ut_d = u_k.t() @ d            # (k, in_flat)
     d_v = d @ v_k                 # (out, k)
@@ -364,24 +382,40 @@ def extract_lokr_keys(diff: torch.Tensor, factor: int, dim: int) -> Dict[str, to
     return keys
 
 
+def resolve_compute_device(args) -> Optional[str]:
+    """The device every SVD / projection runs on. Explicit --device wins; otherwise, if the models are
+    loaded on a non-CPU device, compute there (the weights are already resident, no transfer)."""
+    if args.device:
+        return args.device
+    if getattr(args, "load_device", "cpu") not in (None, "cpu"):
+        return args.load_device
+    return None
+
+
 def build_state_dict(args, weight_pairs, save_dtype) -> Dict[str, torch.Tensor]:
     """Assemble the adapter state dict from (lora_name, W_org, W_tuned) triples, honoring
-    --extract_as (lora|lokr) and --orthogonal_to_base."""
+    --extract_as (lora|lokr) and --orthogonal_to_base. All compute runs on resolve_compute_device(args);
+    results are moved back to CPU for saving."""
+    compute_device = resolve_compute_device(args)
     sd: Dict[str, torch.Tensor] = {}
     with torch.no_grad():
         for lora_name, w_org, w_tuned in tqdm(weight_pairs):
-            diff = w_tuned.to(torch.float) - w_org.to(torch.float)
+            w_org_c = w_org.to(compute_device) if compute_device else w_org
+            w_tuned_c = w_tuned.to(compute_device) if compute_device else w_tuned
+            diff = w_tuned_c.to(torch.float) - w_org_c.to(torch.float)
             if args.orthogonal_to_base:
-                diff = orthogonalize_diff(diff, w_org, args.orthogonal_rank, args.orthogonal_full_svd)
+                diff = orthogonalize_diff(diff, w_org_c, args.orthogonal_rank, args.orthogonal_full_svd)
 
             if args.extract_as == "lokr":
+                # diff is already on compute_device, so the LoKr SVDs run there; results go back to CPU
                 for suffix, tensor in extract_lokr_keys(diff, args.lokr_factor, args.dim).items():
                     out = tensor if suffix == ".alpha" else tensor.to("cpu", dtype=save_dtype)
                     sd[lora_name + suffix] = out.contiguous() if torch.is_tensor(out) else out
             else:
                 conv2d_3x3 = diff.dim() == 4 and tuple(diff.size()[2:4]) != (1, 1)
                 rank = args.conv_dim if (conv2d_3x3 and args.conv_dim is not None) else args.dim
-                up, down = extract_up_down(diff, rank, args.clamp_quantile, args.device, save_dtype)
+                # diff already on compute_device; extract_up_down returns CPU tensors
+                up, down = extract_up_down(diff, rank, args.clamp_quantile, None, save_dtype)
                 sd[lora_name + ".lora_up.weight"] = up
                 sd[lora_name + ".lora_down.weight"] = down
                 sd[lora_name + ".alpha"] = torch.tensor(down.size()[0]).to(torch.float)
@@ -411,7 +445,8 @@ def svd(args):
     weight_pairs, network_module = collect_weight_pairs(args, args.dim, with_te)
     logger.info(
         f"extracting {args.extract_as} for {len(weight_pairs)} modules "
-        f"(rank={args.dim}, conv_dim={args.conv_dim}, orthogonal_to_base={args.orthogonal_to_base})"
+        f"(rank={args.dim}, conv_dim={args.conv_dim}, orthogonal_to_base={args.orthogonal_to_base}, "
+        f"load_device={args.load_device}, compute_device={resolve_compute_device(args) or 'cpu'})"
     )
     state_dict = build_state_dict(args, weight_pairs, save_dtype)
 
@@ -493,7 +528,17 @@ def setup_parser() -> argparse.ArgumentParser:
         help="also extract a LoRA for the text encoder(s) (SD/SDXL only; ignored for DiT families) / "
         "テキストエンコーダのLoRAも抽出（SD/SDXLのみ）",
     )
-    parser.add_argument("--device", type=str, default=None, help="device for the SVD, e.g. cuda / SVDの計算デバイス")
+    parser.add_argument(
+        "--device", type=str, default=None,
+        help="device for the computation (SVD / projection), e.g. cuda. Defaults to --load_device when that "
+        "is non-CPU, else CPU. The difference is computed in float on this device / 計算（SVD等）のデバイス",
+    )
+    parser.add_argument(
+        "--load_device", type=str, default="cpu",
+        help="device the two models are loaded on (default: cpu). Set to cuda to keep the weights on the GPU "
+        "(no per-layer transfer) at the cost of ~2x model VRAM; too large for big models (e.g. FLUX) -- keep "
+        "cpu and set --device cuda there. Pair with --load_precision bf16 to halve the load memory / モデルを読み込むデバイス",
+    )
     parser.add_argument(
         "--load_precision", type=str, default="float", choices=["float", "fp16", "bf16"],
         help="precision to load the models in; the difference is always computed in float (default: float) / 読み込み精度",

@@ -85,7 +85,7 @@ class _TinyDenoiser(nn.Module):
 def _make_args(**kw):
     base = dict(
         model_type="faketype", model_org="ORG", model_tuned="TUNED",
-        conv_dim=None, load_precision="float", include_text_encoder=False,
+        conv_dim=None, load_precision="float", include_text_encoder=False, load_device="cpu", device=None,
     )
     base.update(kw)
     return types.SimpleNamespace(**base)
@@ -241,11 +241,20 @@ def test_lokr_conv3x3_flat_reconstructs():
 
 def _build_args(**kw):
     base = dict(
-        extract_as="lora", dim=4, conv_dim=None, clamp_quantile=0.99, device=None,
+        extract_as="lora", dim=4, conv_dim=None, clamp_quantile=0.99, device=None, load_device="cpu",
         orthogonal_to_base=False, orthogonal_rank=16, orthogonal_full_svd=False, lokr_factor=-1,
     )
     base.update(kw)
     return types.SimpleNamespace(**base)
+
+
+def test_resolve_compute_device():
+    # explicit --device wins
+    assert extract_lora.resolve_compute_device(_build_args(device="cuda", load_device="cpu")) == "cuda"
+    # no --device but models loaded on cuda -> compute there (weights already resident)
+    assert extract_lora.resolve_compute_device(_build_args(device=None, load_device="cuda")) == "cuda"
+    # both cpu -> None (plain CPU compute)
+    assert extract_lora.resolve_compute_device(_build_args(device=None, load_device="cpu")) is None
 
 
 def test_build_state_dict_lokr_keys():
